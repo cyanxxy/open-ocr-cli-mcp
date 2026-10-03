@@ -22,6 +22,12 @@ export interface AgentFunctionCall {
  */
 export interface AgentMemoryUpdate {
   extractedFields?: Record<string, AgentMemory['extractedFields'][string]>;
+  /** Runtime review of the selected values, applied after candidate merging. */
+  fieldReviews?: Record<string, {
+    value: string;
+    isValid: boolean;
+    validationMessage?: string;
+  }>;
   documentAnalysis?: Partial<AgentMemory['documentAnalysis']>;
   confidence?: number;
   lastUpdated?: number;

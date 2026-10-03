@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -71,6 +71,42 @@ afterEach(async () => {
 });
 
 describe('CLI input discovery', () => {
+  it('honors cancellation before local directory or glob discovery', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('Discovery cancelled'));
+    await expect(discoverInputs(['.'], options, controller.signal)).rejects.toThrow('Discovery cancelled');
+    await expect(discoverInputs(['**/*.png'], options, controller.signal)).rejects.toThrow('Discovery cancelled');
+  });
+
+  it('matches brace and extglob patterns without following symbolic links', async () => {
+    await mkdir(path.join(directory, 'source'));
+    await writeFile(path.join(directory, 'source', 'scan.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'source', 'photo.jpg'), JPEG_BYTES);
+    await symlink(path.join(directory, 'source'), path.join(directory, 'linked'), 'dir');
+    await symlink(path.join(directory, 'source', 'scan.png'), path.join(directory, 'alias.png'));
+    const brace = await discoverInputs(['**/*.{png,jpg}'], options);
+    const extglob = await discoverInputs(['**/*.@(png|jpg)'], options);
+    expect(brace.map((input) => input.relativePath)).toEqual([
+      path.join('source', 'photo.jpg'), path.join('source', 'scan.png'),
+    ]);
+    expect(extglob.map((input) => input.relativePath)).toEqual(brace.map((input) => input.relativePath));
+  });
+
+  it('stops oversized glob discovery before inspecting invalid document contents', async () => {
+    await writeFile(path.join(directory, 'first.unknown'), 'invalid');
+    await writeFile(path.join(directory, 'second.unknown'), 'invalid');
+    await expect(discoverInputs(['*.unknown'], { ...options, maxFiles: 1 }))
+      .rejects.toThrow('exceeding --max-files 1');
+  });
+
+  it('scans repeated input directories once, including skipped-entry counts', async () => {
+    await writeFile(path.join(directory, 'scan.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'notes.txt'), 'notes');
+    const found = await discoverInputSet(['.', '.'], options);
+    expect(found.inputs).toHaveLength(1);
+    expect(found.skipped.unsupported.count).toBe(1);
+  });
+
   it('destroys a blocked document stdin stream when aborted', async () => {
     const input = new PassThrough();
     const abortController = new AbortController();

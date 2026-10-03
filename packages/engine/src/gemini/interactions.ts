@@ -553,7 +553,7 @@ export async function runModelInteraction({
           completedOutputText = terminalOutputText;
         }
         if (Array.isArray(event.interaction.steps)) {
-          completedSteps = event.interaction.steps as InteractionStep[];
+          completedSteps = event.interaction.steps;
         }
         continue;
       }

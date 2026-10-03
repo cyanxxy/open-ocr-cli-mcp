@@ -29,9 +29,12 @@ This is an npm workspace with two packages and no web app:
 
 ## Local Setup
 
+Use Node.js 20.19+, 22.13+, or 24+; Node 24 is used for release builds.
+The root `packageManager` field pins the npm version used by the release gate.
+
 ```bash
-git clone https://github.com/cyanxxy/open-ocr-cli.git
-cd open-ocr-cli
+git clone https://github.com/cyanxxy/open-ocr-cli-mcp.git
+cd open-ocr-cli-mcp
 npm ci
 npm run cli -- --help
 ```
@@ -76,6 +79,12 @@ tests in the same change.
 - Do not commit private or sensitive documents to `evals/corpus/`.
 - Do not commit `evals/cache/`; use `npm run evals:setup` to reproduce public subsets.
 - Keep checked-in reports under `evals/reports/` readable and deterministic.
+- Preserve historical reports unless you ran the corresponding live evaluation;
+  validation and Markdown rendering do not produce new model-quality evidence.
+
+See [evals/README.md](evals/README.md) for provider configuration, optional public
+dataset setup, repetitions, matrix runs, and cost reporting. Live evals use
+environment settings rather than `.open-ocr-cli.json`.
 
 ## Discussions
 
@@ -92,7 +101,8 @@ Some files are excluded from the repo on purpose via `.gitignore`, so don't be s
 - `ROADMAP.md`, `docs/2026-agentic-ocr-evals-plan.md`, and `docs/launch-playbook.md` — internal planning notes that are not maintained as public docs.
 - `evals/reports/runs/` and `evals/reports/matrix*` — local benchmark artifacts.
 
-You can keep your own copies of these locally, but they will never be committed. Use GitHub Issues and Discussions (not a tracked `ROADMAP.md`) for roadmap and planning conversations.
+Keep these local files out of commits. Use GitHub Issues and Discussions for
+roadmap and planning conversations.
 
 ## Releases
 
@@ -100,8 +110,9 @@ Releases are created from matching semantic version tags after the release
 checklist in [docs/releasing.md](docs/releasing.md) is complete:
 
 ```bash
-git tag v3.0.0
-git push origin v3.0.0
+VERSION=$(node -p "require('./packages/cli/package.json').version")
+git tag "v$VERSION"
+git push origin "v$VERSION"
 ```
 
 The release workflow repeats the quality and security gates, publishes the npm

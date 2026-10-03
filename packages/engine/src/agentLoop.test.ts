@@ -12,7 +12,7 @@ vi.mock('./agentGemini', () => ({
 }));
 
 import { agentLoop } from './agentLoop';
-import type { AgentMemory, AgentStep } from './agentTypes';
+import type { AgentClientConfig, AgentMemory, AgentStep } from './agentTypes';
 import { GeminiCostLimitError } from './gemini/requestPolicy';
 
 async function drainLoop(generator: AsyncGenerator<AgentStep, AgentMemory>) {
@@ -85,6 +85,42 @@ describe('agentLoop', () => {
     expect(memory.stopReason).toBe('partial');
     expect(steps.some((s) => s.type === 'result' && /partial/i.test(s.content))).toBe(true);
     expect(steps.some((s) => s.content === 'Document processing completed successfully')).toBe(false);
+  });
+
+  it('continues refining existing fields while confidence improves', async () => {
+    const confidences = [0.4, 0.6, 0.9];
+    mockExecuteAgentTurn.mockImplementation((...args: unknown[]) => {
+      const memory = args[7] as AgentMemory;
+      const confidence = confidences[memory.currentIteration - 1];
+      memory.extractedFields.note = { value: 'hello', confidence, isValid: true };
+      memory.confidence = confidence;
+      return Promise.resolve({ finished: true, steps: [] });
+    });
+    const { memory } = await drainLoop(agentLoop(
+      FIXTURE_FILE(), FIXTURE_DATA,
+      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { maxIterations: 3, ...BASE_CONFIG },
+    ));
+    expect(mockExecuteAgentTurn).toHaveBeenCalledTimes(3);
+    expect(memory.stopReason).toBe('succeeded');
+  });
+
+  it('stops when existing fields are unchanged even if their extraction timestamps change', async () => {
+    mockExecuteAgentTurn.mockImplementation((...args: unknown[]) => {
+      const memory = args[7] as AgentMemory;
+      memory.extractedFields.note = {
+        value: 'hello', confidence: 0.4, isValid: true, extractedAt: memory.currentIteration,
+      };
+      memory.confidence = 0.4;
+      return Promise.resolve({ finished: true, steps: [] });
+    });
+    const { memory } = await drainLoop(agentLoop(
+      FIXTURE_FILE(), FIXTURE_DATA,
+      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { maxIterations: 3, ...BASE_CONFIG },
+    ));
+    expect(mockExecuteAgentTurn).toHaveBeenCalledTimes(2);
+    expect(memory.stopReason).toBe('partial');
   });
 
   it('finalizes instead of looping when the inner tool-call rounds are exhausted', async () => {
@@ -177,5 +213,33 @@ describe('agentLoop', () => {
     expect(mockExecuteAgentTurn).not.toHaveBeenCalled();
     expect(steps.some((s) => s.type === 'error')).toBe(false);
     expect(memory.extractedFields).toEqual({});
+  });
+
+  it('aborts an active turn at its document deadline and retains partial memory', async () => {
+    vi.useFakeTimers();
+    try {
+      mockExecuteAgentTurn.mockImplementation((...args: unknown[]) => {
+        const memory = args[7] as AgentMemory;
+        const signal = (args[8] as AgentClientConfig).abortSignal!;
+        memory.extractedFields.note = { value: 'partial', confidence: 0.4 };
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('Request aborted')), { once: true });
+        });
+      });
+      const pending = drainLoop(agentLoop(
+        FIXTURE_FILE(), FIXTURE_DATA,
+        { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+        { maxIterations: 3, ...BASE_CONFIG, maxDurationMs: 25, throwOnFailure: true },
+      ));
+      await vi.advanceTimersByTimeAsync(25);
+      const { memory, steps } = await pending;
+      expect(memory.stopReason).toBe('budget_exhausted');
+      expect(memory.extractedFields.note.value).toBe('partial');
+      expect(steps.some((step) => step.type === 'result' && step.content.includes('time budget'))).toBe(true);
+      expect(mockExecuteAgentTurn).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

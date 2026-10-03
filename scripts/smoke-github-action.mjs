@@ -9,7 +9,7 @@ const temporary = mkdtempSync(path.join(tmpdir(), 'open-ocr-action-'));
 function run(command, args, cwd = root, env = process.env) {
   return execFileSync(command, args, {
     cwd,
-    env,
+    env: { ...env, NPM_CONFIG_CACHE: path.join(temporary, 'npm-cache') },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
   });

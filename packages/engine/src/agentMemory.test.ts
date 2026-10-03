@@ -70,6 +70,22 @@ function createMemory(): AgentMemory {
 }
 
 describe('applyMemoryUpdate', () => {
+  it('retains direct prototype-named fields as own data properties without changing the prototype', () => {
+    const memory = createInitialMemory('s', 'doc.pdf');
+    const names = ['constructor', '__proto__', 'toString'];
+    const fields = Object.fromEntries(names.map((name) => [name, {
+      value: name, confidence: 0.9, isValid: false,
+    }]));
+    applyMemoryUpdate(memory, { extractedFields: fields });
+    expect(Object.getPrototypeOf(memory.extractedFields)).toBe(Object.prototype);
+    expect(Object.keys(memory.extractedFields)).toEqual(names);
+    for (const name of names) {
+      expect(Object.hasOwn(memory.extractedFields, name)).toBe(true);
+      expect(memory.extractedFields[name]).toEqual(fields[name]);
+    }
+    expect(JSON.parse(JSON.stringify(memory.extractedFields)) as unknown).toEqual(fields);
+  });
+
   it('inserts new fields and merges colliding ones by the deterministic ordering', () => {
     const memory = createInitialMemory('s', 'doc.pdf');
     memory.extractedFields.total = field({ value: '10', confidence: 0.5, isValid: true });

@@ -15,6 +15,73 @@ function response(message: Record<string, unknown>): Response {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('provider agent loop', () => {
+  it('aborts an active compatible request when the document time budget expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener('abort', () => reject(new Error('Request aborted')), { once: true });
+      }));
+      vi.stubGlobal('fetch', fetchMock);
+      const generator = providerAgentLoop(
+        { name: 'form.png', type: 'image/png' }, 'data:image/png;base64,AA==',
+        {
+          provider: 'openrouter', gateway: 'direct', apiKey: 'secret', apiKeyEnv: 'OPENROUTER_API_KEY',
+          model: 'vendor/current-model', baseUrl: 'https://openrouter.ai/api/v1',
+          thinkingConfig: { level: 'HIGH', includeThoughts: false }, progress: 'off',
+        },
+        { maxIterations: 3, confidenceThreshold: 0.8, maxTokens: 1024, maxDurationMs: 25, throwOnFailure: true },
+        () => Promise.resolve({ dataUrl: 'data:image/png;base64,AA==', mimeType: 'image/png', width: 1, height: 1 }),
+      );
+      const pending = (async () => {
+        let state = await generator.next();
+        while (!state.done) state = await generator.next();
+        return state.value;
+      })();
+      await vi.advanceTimersByTimeAsync(25);
+      expect((await pending).stopReason).toBe('budget_exhausted');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { confidences: [0.4, 0.6, 0.9], expected: 'succeeded', requests: 6 },
+    { confidences: [0.4, 0.4], expected: 'partial', requests: 4 },
+  ])('handles repeated field refinements: $expected', async ({ confidences, expected, requests }) => {
+    const fetchMock = vi.fn();
+    for (const [index, confidence] of confidences.entries()) {
+      fetchMock.mockResolvedValueOnce(response({
+        role: 'assistant',
+        tool_calls: [{
+          id: `fields-${index}`,
+          type: 'function',
+          function: {
+            name: 'extract_fields_batch',
+            arguments: JSON.stringify({ fields: [{ field_name: 'note', field_value: 'hello', confidence }] }),
+          },
+        }],
+      })).mockResolvedValueOnce(response({ role: 'assistant', content: 'Pass complete.' }));
+    }
+    vi.stubGlobal('fetch', fetchMock);
+    const generator = providerAgentLoop(
+      { name: 'form.png', type: 'image/png' }, 'data:image/png;base64,AA==',
+      {
+        provider: 'openrouter', gateway: 'direct', apiKey: 'secret', apiKeyEnv: 'OPENROUTER_API_KEY',
+        model: 'vendor/current-model', baseUrl: 'https://openrouter.ai/api/v1',
+        thinkingConfig: { level: 'HIGH', includeThoughts: false }, progress: 'off',
+      },
+      { maxIterations: 3, confidenceThreshold: 0.8, maxTokens: 1024 },
+      () => Promise.resolve({ dataUrl: 'data:image/png;base64,AA==', mimeType: 'image/png', width: 1, height: 1 }),
+    );
+    let state = await generator.next();
+    while (!state.done) state = await generator.next();
+    expect(state.value.stopReason).toBe(expected);
+    expect(fetchMock).toHaveBeenCalledTimes(requests);
+  });
+
   it('rethrows typed provider failures for machine-facing callers', async () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({
       error: { message: 'Invalid provider credential', code: 'invalid_api_key' },
@@ -102,13 +169,13 @@ describe('provider agent loop', () => {
     expect(firstReasoning.map((step) => step.content)).toEqual(['inspect ', 'layout']);
     expect(firstReasoning.every((step) => step.delta)).toBe(true);
     expect(steps).toContainEqual(expect.objectContaining({
-      id: expect.stringMatching(/:completion-1-1:model_output$/u),
+      id: expect.stringMatching(/:completion-1-1:model_output$/u) as unknown,
       source: 'model_output',
       content: 'Need tools.',
       delta: true,
     }));
     expect(steps).toContainEqual(expect.objectContaining({
-      id: expect.stringMatching(/:completion-1-2:reasoning$/u),
+      id: expect.stringMatching(/:completion-1-2:reasoning$/u) as unknown,
       content: 'still checking',
       delta: true,
     }));
@@ -198,7 +265,7 @@ describe('provider agent loop', () => {
     expect(steps).toEqual(expect.arrayContaining([
       expect.objectContaining({
         source: 'tool_result',
-        functionCall: expect.objectContaining({ id: 'analysis-1', name: 'analyze_document_structure' }),
+        functionCall: expect.objectContaining({ id: 'analysis-1', name: 'analyze_document_structure' }) as unknown,
       }),
     ]));
     const secondInit = fetchMock.mock.calls[1]?.[1] as RequestInit | undefined;
@@ -273,7 +340,7 @@ describe('provider agent loop', () => {
       apiKeyEnv: 'OPENROUTER_API_KEY',
       model: 'moonshotai/kimi-k2.6',
       baseUrl: 'https://openrouter.ai/api/v1',
-      thinkingConfig: { level: 'MEDIUM', includeThoughts: false },
+      thinkingConfig: { level: 'HIGH', includeThoughts: false },
       progress: 'standard',
     };
     const generator = providerAgentLoop(
@@ -291,6 +358,7 @@ describe('provider agent loop', () => {
     }
 
     expect(cropper).toHaveBeenCalledWith('data:image/png;base64,AA==', 'image/png', region);
+    expect(steps.filter((step) => step.functionResult?.success === false)).toEqual([]);
     expect(state.value.stopReason).toBe('succeeded');
     expect(state.value.extractedFields.account_number).toMatchObject({
       value: 'AC-42',

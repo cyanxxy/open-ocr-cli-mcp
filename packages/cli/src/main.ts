@@ -180,7 +180,7 @@ function assertConfigFlagsDoNotConflict(command: Command): void {
       code: 'CONFIG_INVALID',
       category: 'configuration',
       retryable: false,
-      hint: 'Choose either an explicit configuration file or a hermetic run.',
+      hint: 'Choose either an explicit configuration file or --no-config.',
     });
   }
 }
@@ -206,7 +206,7 @@ function addExtractOptions(command: Command): Command {
   return addProviderOptions(command)
     .argument('<inputs...>', 'files, directories, globs, or - for stdin')
     .option('--config <path>', 'explicit JSON configuration file')
-    .option('--no-config', 'ignore config files and .env for a hermetic run')
+    .option('--no-config', 'skip config files and .env; environment overrides still apply')
     .addOption(new Option('--mode <mode>', 'OCR mode').choices(['simple', 'template', 'agentic']))
     .option('--preset <id>', 'structured extraction preset (implies template mode)')
     .option('--schema <path>', 'JSON Schema for custom structured extraction')
@@ -286,7 +286,7 @@ Environment:
   OPEN_OCR_GATEWAY        Default gateway override (direct or cloudflare)
   OPEN_OCR_MODEL          Default model override
   OPEN_OCR_THINKING       Default thinking level override
-  OPEN_OCR_NO_CONFIG      Set to 1 for a hermetic run without config files or .env
+  OPEN_OCR_NO_CONFIG      Set to 1 to skip ambient config and .env; --config still applies
   OPEN_OCR_MCP_CONFIRM    Set to 1 to require confirmation before a billed mcp run
   OPEN_OCR_DEBUG          Set to 1 to add a stack trace to fatal errors on stderr
   CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_AI_GATEWAY_ID / CLOUDFLARE_AI_GATEWAY_TOKEN
@@ -461,7 +461,7 @@ then CLI flags. Later sources win.
     .description('execute a versioned OCR request for coding agents and automation')
     .requiredOption('--request <path>', 'request JSON file, or - to read the request from stdin')
     .addOption(new Option('--response-format <format>', 'machine response format').choices(['json', 'jsonl']).default('json'))
-    .option('--no-config', 'ignore config files and .env for a hermetic run')
+    .option('--no-config', 'skip config files and .env; environment overrides still apply')
     .action(async (flags: { request: string; responseFormat: 'json' | 'jsonl'; config?: boolean }) => {
       const runId = randomUUID();
       let lastSequence = -1;
@@ -573,7 +573,7 @@ then CLI flags. Later sources win.
     .argument('[urls...]', 'up to 20 public HTTP(S) URLs')
     .option('--file <path>', 'read URLs from a text file, one per line')
     .option('--config <path>', 'explicit JSON configuration file')
-    .option('--no-config', 'ignore config files and .env for a hermetic run')
+    .option('--no-config', 'skip config files and .env; environment overrides still apply')
     .addOption(new Option('--analysis <mode>', 'URL analysis mode').choices([...WEB_ANALYSIS_MODES]).default('individual'))
     .addOption(new Option('--format <format>', 'output format').choices(['markdown', 'json']))
     .option('-o, --output <path>', 'write output to a file instead of stdout')
@@ -725,7 +725,7 @@ then CLI flags. Later sources win.
   program.command('doctor')
     .description('check local CLI configuration and optionally probe provider credentials')
     .option('--config <path>', 'explicit JSON configuration file')
-    .option('--no-config', 'ignore config files and .env for a hermetic diagnosis')
+    .option('--no-config', 'skip config files and .env; environment overrides still apply')
     .option('--check-credentials', 'make a minimal provider request to validate endpoint access')
     .option('--json', 'emit machine-readable JSON')
     .action(async (flags: {

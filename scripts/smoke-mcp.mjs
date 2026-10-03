@@ -1,91 +1,83 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
-// Run against an installed tarball, so workspace imports cannot hide packaging
-// mistakes in the lazily loaded MCP entry point.
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+
+// The client comes from the workspace dev dependency; the server executable
+// must come from the installed tarball so workspace imports cannot hide a
+// missing production dependency in its lazy MCP entry point.
 const executable = process.argv[2];
 if (!executable) throw new Error('Supply the installed CLI executable');
-const child = spawn(executable, ['mcp'], {
-  stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, OPEN_OCR_NO_CONFIG: '1', NODE_ENV: 'development' },
+const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-sdk-smoke-'));
+const transport = new StdioClientTransport({
+  command: executable,
+  args: ['mcp'],
+  cwd: directory,
+  env: { ...process.env, OPEN_OCR_NO_CONFIG: '1', OPEN_OCR_MCP_CONFIRM: '0', NODE_ENV: 'development' },
+  stderr: 'pipe',
+  maxBufferSize: 1024 * 1024,
 });
-const pending = new Map();
-let buffered = '';
+const client = new Client({ name: 'open-ocr-smoke', version: '1' }, {
+  versionNegotiation: { mode: { pin: '2026-07-28' } },
+});
 let diagnostics = '';
-let nextId = 0;
-const exit = new Promise((resolve) => child.once('close', (code) => resolve(code)));
-const fail = (error) => {
-  for (const { reject } of pending.values()) reject(error);
-  pending.clear();
-};
-child.once('error', fail);
-child.once('close', () => fail(new Error(`MCP closed before replying: ${diagnostics}`)));
-child.stderr.setEncoding('utf8');
-child.stderr.on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-8192); });
-child.stdout.setEncoding('utf8');
-child.stdout.on('data', (chunk) => {
-  buffered += chunk;
-  if (buffered.length > 1024 * 1024) {
-    fail(new Error('MCP response exceeded smoke-test bound'));
-    child.kill();
-    return;
-  }
-  let newline;
-  while ((newline = buffered.indexOf('\n')) >= 0) {
-    const line = buffered.slice(0, newline);
-    buffered = buffered.slice(newline + 1);
-    try {
-      const message = JSON.parse(line);
-      const waiting = pending.get(message.id);
-      if (waiting) {
-        pending.delete(message.id);
-        waiting.resolve(message);
-      }
-    } catch (error) {
-      fail(error);
-      child.kill();
-    }
-  }
-});
+transport.stderr?.on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-8192); });
+const errors = [];
+client.onerror = (error) => errors.push(error);
 const deadline = setTimeout(() => {
-  fail(new Error('MCP smoke timed out'));
-  child.kill('SIGKILL');
-}, 15000);
-
-function request(method, params = {}) {
-  const id = ++nextId;
-  const response = new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
-  child.stdin.write(JSON.stringify({
-    jsonrpc: '2.0', id, method,
-    params: {
-      ...params,
-      _meta: {
-        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
-        'io.modelcontextprotocol/clientInfo': { name: 'open-ocr-smoke', version: '1' },
-        'io.modelcontextprotocol/clientCapabilities': {},
-      },
-    },
-  }) + '\n');
-  return response;
-}
+  if (transport.pid) process.kill(transport.pid, 'SIGKILL');
+}, 20_000);
 
 try {
-  const discovery = await request('server/discover');
-  assert.deepEqual(discovery.result.supportedVersions, ['2026-07-28']);
-  assert.equal(discovery.result.cacheScope, 'private');
-  const catalog = await request('tools/list');
-  assert.ok(catalog.result.tools.some((tool) => tool.name === 'ocr_extract'));
-  const capabilities = await request('tools/call', { name: 'ocr_capabilities', arguments: {} });
-  assert.equal(capabilities.result.structuredContent.capabilities.protocolVersion, 2);
-  const invalid = await request('tools/call', {
+  await writeFile(path.join(directory, 'scan.jpg'), new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]));
+  await writeFile(path.join(directory, 'invalid.png'), 'not an image');
+  await client.connect(transport);
+  assert.equal(client.getNegotiatedProtocolVersion(), '2026-07-28');
+  assert.equal(client.getServerVersion()?.name, 'open-ocr-cli-mcp');
+  const discovery = await client.discover();
+  assert.deepEqual(discovery.supportedVersions, ['2026-07-28']);
+  assert.equal(discovery.cacheScope, 'private');
+  const catalog = await client.listTools();
+  assert.ok(catalog.tools.some((tool) => tool.name === 'ocr_extract'));
+  assert.ok(catalog.tools.some((tool) => tool.name === 'ocr_read_artifact'));
+  const capabilities = await client.callTool({ name: 'ocr_capabilities', arguments: {} });
+  assert.equal(capabilities.structuredContent.capabilities.protocolVersion, 2);
+
+  const progress = [];
+  const dryRun = await client.callTool({
+    name: 'ocr_extract',
+    arguments: { inputs: [{ type: 'path', path: 'scan.jpg' }], dryRun: true, noConfig: true },
+  }, { onprogress: (event) => progress.push(event) });
+  assert.equal(dryRun.structuredContent.status, 'validated');
+  assert.equal(dryRun.structuredContent.documents.length, 1);
+  assert.ok(progress.length > 0);
+  assert.equal(progress.at(-1).progress, 1);
+  for (let index = 1; index < progress.length; index++) {
+    assert.ok(progress[index].progress > progress[index - 1].progress);
+  }
+  const invalid = await client.callTool({
     name: 'ocr_extract', arguments: { inputs: [{ type: 'path', path: '-' }], dryRun: true },
   });
-  assert.ok(invalid.error || invalid.result?.isError);
-  child.stdin.end();
-  assert.equal(await exit, 0);
-  process.stdout.write('Packed MCP stdio smoke passed\n');
+  assert.equal(invalid.isError, true);
+  const partial = await client.callTool({
+    name: 'ocr_extract',
+    arguments: { inputs: [{ type: 'path', path: 'scan.jpg' }, { type: 'path', path: 'invalid.png' }], dryRun: true, noConfig: true },
+  });
+  assert.equal(partial.isError, true);
+  assert.equal(partial.structuredContent.status, 'partial');
+  assert.equal(partial.structuredContent.documents.length, 2);
+  const forbidden = await client.callTool({ name: 'ocr_read_artifact', arguments: { uri: 'file:///etc/passwd' } });
+  assert.equal(forbidden.isError, true);
+  assert.deepEqual(errors, [], diagnostics);
+  // SDK close ends stdin first, exercising the portable EOF shutdown path.
+  await client.close();
+  assert.equal(transport.pid, null, diagnostics);
+  process.stdout.write('Packed MCP SDK stdio smoke passed\n');
 } finally {
-  child.kill('SIGKILL');
-  await exit;
   clearTimeout(deadline);
+  await client.close();
+  await rm(directory, { recursive: true, force: true });
 }

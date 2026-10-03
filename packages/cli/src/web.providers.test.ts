@@ -27,7 +27,7 @@ function options(): ResolvedCliOptions {
     model: 'moonshotai/kimi-k2.6',
     baseUrl: 'https://openrouter.ai/api/v1',
     cloudflareByok: false,
-    thinking: 'MEDIUM',
+    thinking: 'HIGH',
     includeThoughts: false,
     progress: 'standard',
     mode: 'simple',
@@ -97,7 +97,7 @@ describe('compatible-provider Web OCR', () => {
       usage: { requests: 1, totalTokens: 15 },
       documents: [{
         status: 'succeeded',
-        content: { markdown: expect.stringContaining('Revenue 42') },
+        content: { markdown: expect.stringContaining('Revenue 42') as unknown },
       }],
     });
     expect(events).toEqual([
@@ -153,7 +153,7 @@ describe('compatible-provider Web OCR', () => {
       new AbortController().signal,
     )).rejects.toMatchObject({
       code: 'INPUT_INVALID',
-      message: expect.stringContaining('not image/heic'),
+      message: expect.stringContaining('not image/heic') as unknown,
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -174,7 +174,7 @@ describe('compatible-provider Web OCR', () => {
       new AbortController().signal,
     )).rejects.toMatchObject({
       code: 'INPUT_INVALID',
-      message: expect.stringContaining('does not match its declared type'),
+      message: expect.stringContaining('does not match its declared type') as unknown,
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });

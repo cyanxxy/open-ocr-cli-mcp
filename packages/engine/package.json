@@ -1,13 +1,13 @@
 {
   "name": "@open-ocr/engine",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "Shared provider-neutral multimodal OCR engine consumed by the open-ocr-cli package and the evals harness.",
   "license": "MIT",
   "private": true,
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cyanxxy/open-ocr-cli.git",
+    "url": "git+https://github.com/cyanxxy/open-ocr-cli-mcp.git",
     "directory": "packages/engine"
   },
   "engines": {

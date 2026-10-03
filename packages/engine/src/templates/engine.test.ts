@@ -185,13 +185,20 @@ describe('template engine helpers', () => {
         responseJsonSchema: expect.objectContaining({
           type: 'object',
           required: ['documentType', 'summary', 'fields', 'warnings'],
-        }),
-      }),
+        }) as unknown,
+      }) as unknown,
     }));
   });
 });
 
 describe('normalizeFieldValue number/currency parsing', () => {
+  it('rejects nested and non-finite values instead of fabricating scalar text', () => {
+    expect(() => normalizeFieldValue({ amount: 42 }, 'currency')).toThrow(/expected schema/);
+    expect(() => normalizeFieldValue([{ text: 'item' }], 'list')).toThrow(/expected schema/);
+    expect(() => normalizeFieldValue(Infinity, 'number')).toThrow(/expected schema/);
+    expect(() => normalizeFieldValue(NaN, 'currency')).toThrow(/expected schema/);
+  });
+
   it('parses US-formatted numbers', () => {
     expect(normalizeFieldValue('1,234.56', 'number')).toBe(1234.56);
     expect(normalizeFieldValue('1,234', 'number')).toBe(1234);
@@ -382,7 +389,7 @@ describe('preset normalization contract and validation', () => {
 
   it('rejects a preset stream that ends without terminal STOP', async () => {
     const preset = getExtractionPreset('invoice');
-    async function* chunks() {
+    function* chunks() {
       yield { text: JSON.stringify(mockModelPayload), candidates: [{}] };
     }
     mockTemplateGenerateContentStream.mockResolvedValueOnce(chunks());
@@ -467,6 +474,11 @@ describe('parsePresetPayload schema validation', () => {
     ['fields array', '{"fields":[]}'],
     ['non-numeric confidence', '{"fields":{"total":{"value":"42","confidence":"high"}}}'],
     ['warnings not an array', '{"fields":{},"warnings":"none"}'],
+    ['nested field object', '{"fields":{"total":{"value":{"amount":42},"confidence":0.9}}}'],
+    ['nested list entries', '{"fields":{"items":{"value":[{"name":"item"}],"confidence":0.9}}}'],
+    ['non-finite numeric field', '{"fields":{"total":{"value":1e400,"confidence":0.9}}}'],
+    ['nested row cell', '{"fields":{},"rows":[{"description":{"text":"item"}}]}'],
+    ['malformed row', '{"fields":{},"rows":[42]}'],
   ] as const)('rejects %s', (_label, payload) => {
     expect(() => presetRunResultFromText(payload, preset)).toThrow(schemaError);
   });

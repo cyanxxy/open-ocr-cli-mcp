@@ -18,7 +18,7 @@ describe('streamAgentOperation', () => {
       resolveTurn = resolve;
     });
 
-    const generator = streamAgentOperation(async (onStep) => {
+    const generator = streamAgentOperation((onStep) => {
       // Push a step on the next microtask while the consumer may be arming wake.
       queueMicrotask(() => {
         onStep({
@@ -51,7 +51,7 @@ describe('streamAgentOperation', () => {
         content: 'before fail',
         timestamp: Date.now(),
       });
-      throw new Error('turn failed');
+      return Promise.reject(new Error('turn failed'));
     });
 
     const first = await generator.next();

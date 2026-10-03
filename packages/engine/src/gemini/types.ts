@@ -198,11 +198,18 @@ export interface PresetStreamingCallbacks {
 /**
  * Available Gemini models used by this app.
  */
-export type GeminiModel =
-  | 'gemini-3.1-pro-preview'
-  | 'gemini-3-flash-preview'
-  | 'gemini-3.5-flash'
-  | 'gemini-3.1-flash-lite';
+export const GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.5-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-3.1-pro-preview',
+] as const;
+
+export type GeminiModel = (typeof GEMINI_MODELS)[number];
 
 /**
  * Provider-neutral reasoning effort (uppercase in host config; lowercased at wire).
@@ -213,8 +220,8 @@ export type GeminiModel =
  * - XHIGH / MAX: Compatible-provider efforts; CLI validation keeps them away from Gemini
  *
  * Official support:
- * - Gemini 3.1 Pro: LOW, MEDIUM, HIGH
- * - Gemini 3 Flash / 3.5 Flash / 3.1 Flash-Lite: MINIMAL, LOW, MEDIUM, HIGH
+ * - Gemini 3.8/3.7 Flash and 3.1 Pro: LOW, MEDIUM, HIGH
+ * - Earlier Flash and Flash-Lite: MINIMAL, LOW, MEDIUM, HIGH
  */
 export type ThinkingLevel = 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH' | 'MAX';
 

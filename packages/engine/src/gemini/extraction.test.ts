@@ -15,7 +15,11 @@ const FILE_DATA = 'data:image/png;base64,ZmFrZQ==';
 const CLIENT = { apiKey: 'k', model: 'gemini-3.5-flash' as const };
 
 function mockGenerate(response: unknown) {
-  const generateContent = vi.fn().mockResolvedValue(response);
+  const generateContent = vi.fn<(request: {
+    model: string;
+    contents: Array<{ parts: Array<{ text?: string }> }>;
+    config: Record<string, unknown>;
+  }) => Promise<unknown>>().mockResolvedValue(response);
   mockGetClient.mockReturnValue({ models: { generateContent } });
   return generateContent;
 }
@@ -287,6 +291,7 @@ describe('extractTextFromFile — output contract', () => {
   it('records usage metadata from the final streaming chunk', async () => {
     async function* chunks() {
       await Promise.resolve();
+      await Promise.resolve();
       yield { text: '{"title":"T",' };
       yield {
         text: '"sections":[]}',
@@ -320,6 +325,7 @@ describe('extractTextFromFile — output contract', () => {
 
   it('rejects a streaming result whose final chunk reports MAX_TOKENS', async () => {
     async function* chunks() {
+      await Promise.resolve();
       yield { text: '# Partial document' };
       yield { text: '\ntruncated', candidates: [{ finishReason: 'MAX_TOKENS' }] };
     }
@@ -339,6 +345,7 @@ describe('extractTextFromFile — output contract', () => {
 
   it('rejects a streaming result that ends without a terminal finish reason', async () => {
     async function* chunks() {
+      await Promise.resolve();
       yield { text: '# Possibly truncated', candidates: [{}] };
     }
     mockGetClient.mockReturnValue({

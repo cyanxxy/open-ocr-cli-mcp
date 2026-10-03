@@ -21,10 +21,12 @@ const SUPPORTED_KEYWORDS = new Set([
   'properties', 'additionalProperties', 'required', 'propertyOrdering',
 ]);
 
-const ajv = new Ajv2020({ allErrors: true, strict: true });
-addFormats(ajv);
-ajv.addKeyword({ keyword: 'propertyOrdering', schemaType: 'array' });
-const validators = new WeakMap<Record<string, unknown>, ValidateFunction<unknown>>();
+interface CustomSchemaValidator {
+  ajv: Ajv2020;
+  validate: ValidateFunction<unknown>;
+}
+
+const validators = new WeakMap<Record<string, unknown>, CustomSchemaValidator>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -68,12 +70,19 @@ function assertSupportedSchemaNode(value: unknown, pointer: string, depth: numbe
   }
 }
 
-function compileSchema(schema: Record<string, unknown>): ValidateFunction<unknown> {
+function compileSchema(schema: Record<string, unknown>): CustomSchemaValidator {
   const cached = validators.get(schema);
   if (cached) return cached;
+  // Schemas belong to one extraction request. A shared Ajv registry rejects
+  // repeated $id values and strongly retains every schema in a long-lived MCP
+  // process, even when this outer cache uses weak keys.
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  addFormats(ajv);
+  ajv.addKeyword({ keyword: 'propertyOrdering', schemaType: 'array' });
   const validate = ajv.compile(schema);
-  validators.set(schema, validate);
-  return validate;
+  const compiled = { ajv, validate };
+  validators.set(schema, compiled);
+  return compiled;
 }
 
 /** Validate and normalize an in-memory custom schema for programmatic callers. */
@@ -190,7 +199,7 @@ export function assertCustomSchemaOutput(
   schema: Record<string, unknown>,
   value: unknown,
 ): asserts value is JsonValue {
-  const validate = compileSchema(schema);
+  const { ajv, validate } = compileSchema(schema);
   if (validate(value)) return;
   const details = ajv.errorsText(validate.errors, { separator: '; ' });
   throw new Error(`Schema output validation failed: ${details}`);

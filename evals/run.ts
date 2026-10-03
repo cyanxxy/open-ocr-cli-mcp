@@ -1,5 +1,6 @@
 import process from 'node:process';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { type ExtractedContent, type ThinkingLevel } from '@open-ocr/engine/gemini';
 import { agentLoop } from '@open-ocr/engine/agentLoop';
@@ -17,6 +18,7 @@ import type { AgentMemory } from '@open-ocr/engine/agentTypes';
 import {
   GATEWAY_IDS,
   PROVIDER_IDS,
+  createProviderExecutionContext,
   extractPresetWithProvider,
   extractTextWithProvider,
   getProviderUsage,
@@ -27,10 +29,10 @@ import {
   providerDefaultBaseUrl,
   providerDefaultModel,
   providerRequestHeaders,
-  resetProviderUsage,
   resolveProviderBaseUrl,
   type GatewayId,
   type ProviderId,
+  type ProviderExecutionContext,
   type ProviderRuntimeConfig,
   type ProviderUsageSnapshot,
 } from '@open-ocr/engine/providers';
@@ -185,6 +187,7 @@ async function runAgenticEvalCase(evalCase: EvalCase, clientConfig: ProviderRunt
         : undefined,
       headers: clientConfig.gateway === 'cloudflare' ? providerRequestHeaders(clientConfig) : undefined,
       regionCropper: nodeRegionCropper,
+      runtime: clientConfig.runtime,
     },
     loopConfig,
   ) : providerAgentLoop(file, dataUrl, clientConfig, loopConfig, nodeRegionCropper);
@@ -212,12 +215,13 @@ function estimateCost(usage: ProviderUsageSnapshot): number | undefined {
 }
 
 function executionMetadata(
+  runtime: ProviderExecutionContext,
   startedAt: number,
   extras: Pick<EvalExecutionMetadata, 'iterations' | 'toolCalls'>,
   runtimeError?: string,
   repeatIndex?: number,
 ): EvalExecutionMetadata {
-  const usage = getProviderUsage();
+  const usage = getProviderUsage(runtime);
   return {
     durationMs: performance.now() - startedAt,
     repeatIndex,
@@ -232,30 +236,32 @@ function executionMetadata(
   };
 }
 
-async function runEvalCase(evalCase: EvalCase, clientConfig: ProviderRuntimeConfig, repeatIndex: number): Promise<CompletedEvalCase> {
-  resetProviderUsage();
+export async function runEvalCase(evalCase: EvalCase, clientConfig: ProviderRuntimeConfig, repeatIndex: number): Promise<CompletedEvalCase> {
+  const runtime = createProviderExecutionContext();
+  runtime.configureUsagePricing(clientConfig);
+  const caseConfig = { ...clientConfig, runtime };
   const startedAt = performance.now();
   let output: EvalRunOutput = { markdown: '' };
   let executionExtras: Pick<EvalExecutionMetadata, 'iterations' | 'toolCalls'> = {};
   try {
     if (evalCase.mode === 'template') {
-      output = await runTemplateEvalCase(evalCase, clientConfig);
+      output = await runTemplateEvalCase(evalCase, caseConfig);
     } else if (evalCase.mode === 'agentic') {
-      const agenticResult = await runAgenticEvalCase(evalCase, clientConfig);
+      const agenticResult = await runAgenticEvalCase(evalCase, caseConfig);
       output = agenticResult.output;
       executionExtras = { iterations: agenticResult.iterations, toolCalls: agenticResult.toolCalls };
     } else {
-      output = await runSimpleEvalCase(evalCase, clientConfig);
+      output = await runSimpleEvalCase(evalCase, caseConfig);
     }
     const groundTruth = await loadEvalGroundTruth(evalCase);
-    const execution = executionMetadata(startedAt, executionExtras, undefined, repeatIndex);
+    const execution = executionMetadata(runtime, startedAt, executionExtras, undefined, repeatIndex);
     return {
       result: evaluateEvalCase(evalCase, output, groundTruth, execution),
       artifact: { evalCase, output, repeatIndex },
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const execution = executionMetadata(startedAt, executionExtras, message, repeatIndex);
+    const execution = executionMetadata(runtime, startedAt, executionExtras, message, repeatIndex);
     let groundTruth;
     try {
       groundTruth = await loadEvalGroundTruth(evalCase);
@@ -285,7 +291,27 @@ function resolveThinkingLevel(provider: ProviderId, model: string): ThinkingLeve
   return defaultCliThinkingLevel(provider, model);
 }
 
+export function resolveEvalTokenPrices(
+  env: NodeJS.ProcessEnv,
+): Pick<ProviderRuntimeConfig, 'inputPricePerMillionUsd' | 'outputPricePerMillionUsd'> {
+  const input = env.EVAL_INPUT_USD_PER_MILLION;
+  const output = env.EVAL_OUTPUT_USD_PER_MILLION;
+  if (input === undefined && output === undefined) return {};
+  if (input === undefined || output === undefined) {
+    throw new Error('Set both EVAL_INPUT_USD_PER_MILLION and EVAL_OUTPUT_USD_PER_MILLION to override eval prices');
+  }
+  const inputPricePerMillionUsd = Number(input);
+  const outputPricePerMillionUsd = Number(output);
+  if (!input.trim() || !output.trim()
+    || !Number.isFinite(inputPricePerMillionUsd) || inputPricePerMillionUsd < 0
+    || !Number.isFinite(outputPricePerMillionUsd) || outputPricePerMillionUsd < 0) {
+    throw new Error('EVAL_INPUT_USD_PER_MILLION and EVAL_OUTPUT_USD_PER_MILLION must be finite nonnegative numbers');
+  }
+  return { inputPricePerMillionUsd, outputPricePerMillionUsd };
+}
+
 async function main() {
+  const tokenPrices = resolveEvalTokenPrices(process.env);
   const providerValue = process.env.EVAL_PROVIDER ?? process.env.OPEN_OCR_PROVIDER ?? 'gemini';
   if (!PROVIDER_IDS.includes(providerValue as ProviderId)) throw new Error(`Unsupported EVAL_PROVIDER: ${providerValue}`);
   const provider = providerValue as ProviderId;
@@ -321,8 +347,6 @@ async function main() {
     throw new Error(`No eval cases are installed for the "${suite}" suite.${setupHint}`);
   }
   const suiteConfig = await loadEvalSuiteConfig();
-  const inputPrice = Number(process.env.EVAL_INPUT_USD_PER_MILLION);
-  const outputPrice = Number(process.env.EVAL_OUTPUT_USD_PER_MILLION);
   const clientConfig: ProviderRuntimeConfig = {
     provider,
     gateway,
@@ -341,8 +365,7 @@ async function main() {
     cloudflareByok,
     cloudflareByokAlias: process.env.CLOUDFLARE_AI_GATEWAY_BYOK_ALIAS,
     cloudflareProvider: process.env.CLOUDFLARE_AI_GATEWAY_PROVIDER,
-    inputPricePerMillionUsd: Number.isFinite(inputPrice) ? inputPrice : undefined,
-    outputPricePerMillionUsd: Number.isFinite(outputPrice) ? outputPrice : undefined,
+    ...tokenPrices,
   };
 
   await assertEvalInputsExist(evalCases);
@@ -375,7 +398,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

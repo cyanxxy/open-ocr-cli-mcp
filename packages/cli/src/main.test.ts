@@ -731,7 +731,7 @@ describe('CLI command exit contracts', () => {
       };
       expect(report.credentialProbe).toMatchObject({
         status: 'skipped',
-        error: expect.stringContaining('GEMINI_API_KEY'),
+        error: expect.stringContaining('GEMINI_API_KEY') as unknown,
       });
       expect(process.exitCode).toBe(1);
     } finally {
@@ -885,7 +885,7 @@ describe('agent machine commands', () => {
       expect(mocks.readOcrJobRequest).toHaveBeenCalledWith(
         '-',
         process.cwd(),
-        expect.any(AbortSignal),
+        expect.any(AbortSignal) as unknown,
       );
       expect(process.exitCode).toBe(130);
     } finally {

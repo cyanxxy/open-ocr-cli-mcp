@@ -2,6 +2,7 @@ import { webcrypto } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -16,6 +17,7 @@ import {
   ModernMcpDiagnosticTransport,
 } from './mcp';
 import type { OcrMachineResult } from './protocol';
+import * as machine from './machine';
 
 const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
 
@@ -32,6 +34,7 @@ describe('Open OCR MCP server', () => {
     ));
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it('builds versioned requests through the shared semantic validator', () => {
@@ -197,7 +200,7 @@ describe('Open OCR MCP server', () => {
         );
         return reply;
       };
-      return { request, notifications };
+      return { request, notifications, notify: clientTransport.send.bind(clientTransport) };
     };
 
     it('serves 2026-07-28 discovery, tools, and resources', async () => {
@@ -214,7 +217,7 @@ describe('Open OCR MCP server', () => {
       const tools = await request(2, 'tools/list', { _meta: modernMeta() });
       expect(tools.result).toMatchObject({ ttlMs: 3_600_000, cacheScope: 'public' });
       const listed = tools.result?.tools as Array<{ name: string; inputSchema?: { properties?: { inputs?: { items?: { properties?: Record<string, unknown> } } } }; outputSchema?: { type?: string } }>;
-      expect(listed.map((tool) => tool.name)).toEqual(['ocr_capabilities', 'ocr_extract', 'ocr_run_agentic', 'ocr_web']);
+      expect(listed.map((tool) => tool.name)).toEqual(['ocr_capabilities', 'ocr_read_artifact', 'ocr_extract', 'ocr_run_agentic', 'ocr_web']);
       expect(listed.every((tool) => tool.outputSchema?.type === 'object')).toBe(true);
       expect(listed.find((tool) => tool.name === 'ocr_extract')?.inputSchema?.properties?.inputs?.items?.properties).toMatchObject({
         type: { const: 'path' },
@@ -264,7 +267,7 @@ describe('Open OCR MCP server', () => {
       // Proof the guard is not merely slow: a later request still gets served,
       // so nothing consumed the channel.
       const tools = await request(2, 'tools/list', { _meta: modernMeta() });
-      expect((tools.result?.tools as unknown[]).length).toBe(4);
+      expect((tools.result?.tools as unknown[]).length).toBe(5);
     });
 
     it('refuses an unrecognized tool argument instead of dropping it', async () => {
@@ -279,6 +282,81 @@ describe('Open OCR MCP server', () => {
       });
       expect(reply.result).toMatchObject({ isError: true });
       expect(JSON.stringify(reply.result)).toContain('dryRunn');
+    });
+
+    it('bounds tool input complexity before custom-schema validation and keeps serving', async () => {
+      const { request } = await driveServer(process.cwd());
+      const reply = await request(1, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: { inputs: [{ type: 'path', path: 'scan.png' }], schema: { enum: Array.from({ length: 100_001 }, (_, index) => index) }, dryRun: true },
+        _meta: modernMeta(),
+      });
+      expect(reply.result).toMatchObject({ isError: true });
+      expect(JSON.stringify(reply.result)).toContain('100000');
+      expect((await request(2, 'tools/list', { _meta: modernMeta() })).error).toBeUndefined();
+    });
+
+    it('reads saved output across tool calls and exposes bounded private resources', async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-read-'));
+      cleanupPaths.push(directory);
+      await writeFile(path.join(directory, 'scan.jpg'), JPEG_BYTES);
+      const execution = await machine.executeOcrJobRequest(buildExtractMcpRequest({
+        inputs: [{ type: 'path', path: 'scan.jpg' }], dryRun: true, noConfig: true,
+      }), { cwd: directory, runId: 'artifact-test', abortController: new AbortController() });
+      if (!('documents' in execution.result)) throw new Error('Expected a validated document');
+      execution.result.documents[0].status = 'succeeded';
+      const filename = path.join(directory, 'result.md');
+      await writeFile(filename, 'A😀éZ');
+      const largeFilename = path.join(directory, 'large.md');
+      await writeFile(largeFilename, 'x'.repeat(70_000));
+      execution.result.documents[0].artifacts = [
+        { path: filename, mediaType: 'text/markdown', kind: 'markdown' },
+        { path: largeFilename, mediaType: 'text/markdown', kind: 'markdown' },
+      ];
+      vi.spyOn(machine, 'executeOcrJobRequest').mockResolvedValue(execution);
+      const { request } = await driveServer(directory);
+      const extraction = await request(1, 'tools/call', {
+        name: 'ocr_extract', arguments: { inputs: [{ type: 'path', path: 'scan.jpg' }], noConfig: true }, _meta: modernMeta(),
+      });
+      expect(extraction.result?.isError).toBeUndefined();
+      const uri = pathToFileURL(filename).href;
+      const chunk = await request(2, 'tools/call', {
+        name: 'ocr_read_artifact', arguments: { uri, maxBytes: 4 }, _meta: modernMeta(),
+      });
+      expect(chunk.result?.structuredContent).toMatchObject({ text: 'A', nextOffset: 1, eof: false });
+      const resource = await request(3, 'resources/read', { uri, _meta: modernMeta() });
+      expect(resource.result).toMatchObject({ cacheScope: 'private', ttlMs: 0, contents: [{ text: 'A😀éZ' }] });
+      const unauthorized = await request(4, 'resources/read', {
+        uri: pathToFileURL(path.join(directory, 'scan.jpg')).href, _meta: modernMeta(),
+      });
+      expect(unauthorized.error).toMatchObject({ code: -32602 });
+      const tooLarge = await request(5, 'resources/read', { uri: pathToFileURL(largeFilename).href, _meta: modernMeta() });
+      expect(tooLarge.error?.code).toBe(-32602);
+      expect(tooLarge.error?.message).toContain('ocr_read_artifact');
+    });
+
+    it('cancels the job signal and suppresses late progress while accepting later requests', async () => {
+      let started!: () => void;
+      const didStart = new Promise<void>((resolve) => { started = resolve; });
+      let cancelled!: () => void;
+      const didCancel = new Promise<void>((resolve) => { cancelled = resolve; });
+      vi.spyOn(machine, 'executeOcrJobRequest').mockImplementation(async (_request, options) => {
+        started();
+        await new Promise<void>((resolve) => options.abortController.signal.addEventListener('abort', () => resolve(), { once: true }));
+        await options.eventSink?.({ protocolVersion: 2, type: 'run.started', runId: 'cancelled', sequence: 1, timestamp: new Date().toISOString(), total: 1 });
+        cancelled();
+        throw options.abortController.signal.reason;
+      });
+      const { request, notify, notifications } = await driveServer(process.cwd());
+      void request(1, 'tools/call', {
+        name: 'ocr_extract', arguments: { inputs: [{ type: 'path', path: 'scan.jpg' }], noConfig: true },
+        _meta: { ...modernMeta(), progressToken: 'cancelled-progress' },
+      });
+      await didStart;
+      await notify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1, _meta: modernMeta() } });
+      await didCancel;
+      expect(notifications.filter((notification) => notification.method === 'notifications/progress')).toEqual([]);
+      expect((await request(2, 'tools/list', { _meta: modernMeta() })).error).toBeUndefined();
     });
 
     it('relays lifecycle events as progress notifications when a token is supplied', async () => {
@@ -375,7 +453,7 @@ describe('Open OCR MCP server', () => {
 
       const tools = await request(2, 'tools/list', { _meta: modernMeta() });
       expect(tools.error).toBeUndefined();
-      expect((tools.result?.tools as unknown[]).length).toBe(4);
+      expect((tools.result?.tools as unknown[]).length).toBe(5);
     });
 
     it('pins the reusable server factory to 2026-07-28', async () => {
@@ -699,7 +777,7 @@ describe('Open OCR MCP server', () => {
           source: 'invoice.pdf',
           artifacts: [],
           plannedArtifacts: [],
-          content: { markdown: 'x'.repeat(5000) },
+          content: { markdown: 'x'.repeat(70_000) },
         }],
       } as unknown as OcrMachineResult;
       const built = mcpResult(inline);
@@ -707,7 +785,7 @@ describe('Open OCR MCP server', () => {
       // The body travels once, in structuredContent. Mirroring it into a text
       // block would put the whole corpus on the wire twice in one response.
       const text = (built.content[0] as { text: string }).text;
-      expect(text).not.toContain('x'.repeat(5000));
+      expect(text).not.toContain('x'.repeat(70_000));
       expect(text).toContain('succeeded run r1');
       expect(text).toContain('structuredContent.documents[].content');
       expect(built.structuredContent).toBe(inline as unknown as Record<string, unknown>);
@@ -720,6 +798,16 @@ describe('Open OCR MCP server', () => {
       expect(JSON.parse((built.content[0] as { text: string }).text)).toMatchObject({
         runId: 'r1',
         status: 'succeeded',
+      });
+    });
+
+    it('keeps small inline extraction readable to clients that use only text content', () => {
+      const result = resultWithArtifacts([]);
+      if (!('documents' in result)) throw new Error('Expected a document result');
+      result.documents[0].content = { markdown: 'Invoice total: €14.00' };
+      const built = mcpResult(result);
+      expect(JSON.parse((built.content[0] as { text: string }).text)).toMatchObject({
+        documents: [{ content: { markdown: 'Invoice total: €14.00' } }],
       });
     });
   });

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Content, FunctionDeclaration } from '@google/genai';
+import type { runModelInteraction } from './gemini/interactions';
 
 const {
   mockRunModelInteraction,
@@ -7,7 +8,7 @@ const {
   mockExecuteExtractFieldsBatch,
   mockExecuteReOcrRegion,
 } = vi.hoisted(() => ({
-  mockRunModelInteraction: vi.fn(),
+  mockRunModelInteraction: vi.fn<typeof runModelInteraction>(),
   mockExecuteAnalyzeDocumentStructure: vi.fn(),
   mockExecuteExtractFieldsBatch: vi.fn(),
   mockExecuteReOcrRegion: vi.fn(),
@@ -139,10 +140,10 @@ describe('executeAgentTurn', () => {
       store: true,
       input: [transcript[0]],
       systemInstruction: 'system prompt',
-      tools: expect.any(Array),
+      tools: expect.any(Array) as unknown,
       generationConfig: expect.objectContaining({
         thinking_level: 'medium',
-      }),
+      }) as unknown,
     }));
     expect(mockRunModelInteraction.mock.calls[0]?.[0].generationConfig).not.toHaveProperty('temperature');
     expect(mockRunModelInteraction.mock.calls[0]?.[0]).not.toHaveProperty('previousInteractionId');
@@ -193,8 +194,8 @@ describe('executeAgentTurn', () => {
     expect(mockRunModelInteraction).toHaveBeenNthCalledWith(2, expect.objectContaining({
       model: 'gemini-3.5-flash',
       systemInstruction: 'system prompt',
-      tools: expect.any(Array),
-      generationConfig: expect.objectContaining({ thinking_level: 'medium' }),
+      tools: expect.any(Array) as unknown,
+      generationConfig: expect.objectContaining({ thinking_level: 'medium' }) as unknown,
     }));
 
     const nudge = transcript.find((step) =>
@@ -324,7 +325,7 @@ describe('executeAgentTurn', () => {
       expect.objectContaining({ call_id: 'call-1', name: 'analyze_document_structure', is_error: false }),
     );
     expect((functionResults[0] as { result: unknown }).result).toEqual([
-      expect.objectContaining({ type: 'text', text: expect.any(String) }),
+      expect.objectContaining({ type: 'text', text: expect.any(String) as unknown }),
     ]);
     expect(functionResults.find((r) => (r as { call_id?: string }).call_id === 'call-2')).toEqual(
       expect.objectContaining({
@@ -343,7 +344,7 @@ describe('executeAgentTurn', () => {
     // Stateful chaining sends only incremental results after the initial input.
     expect(mockRunModelInteraction).toHaveBeenNthCalledWith(
       1,
-      expect.not.objectContaining({ previousInteractionId: expect.anything() }),
+      expect.not.objectContaining({ previousInteractionId: expect.anything() as unknown }),
     );
     expect(mockRunModelInteraction.mock.calls[1]?.[0]).toEqual(expect.objectContaining({
       previousInteractionId: 'interaction-1',
@@ -358,8 +359,8 @@ describe('executeAgentTurn', () => {
       expect(request).toEqual(expect.objectContaining({
         model: 'gemini-3.5-flash',
         systemInstruction: 'system prompt',
-        tools: expect.any(Array),
-        generationConfig: expect.objectContaining({ thinking_level: 'medium' }),
+        tools: expect.any(Array) as unknown,
+        generationConfig: expect.objectContaining({ thinking_level: 'medium' }) as unknown,
       }));
       expect(request.generationConfig).not.toHaveProperty('temperature');
     }
@@ -423,11 +424,11 @@ describe('executeAgentTurn', () => {
       is_error: true,
     }));
     expect((queuedResult as { result: unknown }).result).toEqual([
-      expect.objectContaining({ type: 'text', text: expect.stringContaining('Temporary Gemini API failure') }),
+      expect.objectContaining({ type: 'text', text: expect.stringContaining('Temporary Gemini API failure') as unknown }),
     ]);
     expect(emittedSteps).toEqual(expect.arrayContaining([
-      expect.objectContaining({ source: 'tool_call', functionCall: expect.objectContaining({ id: 'call-retry' }) }),
-      expect.objectContaining({ source: 'tool_result', type: 'error', functionCall: expect.objectContaining({ id: 'call-retry' }) }),
+      expect.objectContaining({ source: 'tool_call', functionCall: expect.objectContaining({ id: 'call-retry' }) as unknown }),
+      expect.objectContaining({ source: 'tool_result', type: 'error', functionCall: expect.objectContaining({ id: 'call-retry' }) as unknown }),
     ]));
 
     await executeAgentTurn(

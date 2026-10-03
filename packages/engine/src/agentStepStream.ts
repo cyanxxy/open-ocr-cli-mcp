@@ -1,5 +1,28 @@
 import type { AgentStep, StepCallback } from './agentTypes';
 
+export interface AgentDeadline {
+  signal: AbortSignal;
+  hasExpired: () => boolean;
+  dispose: () => void;
+}
+
+/** One deadline covers active requests, tools, rate waits, and retry backoff. */
+export function createAgentDeadline(durationMs: number, signal?: AbortSignal): AgentDeadline {
+  const controller = new AbortController();
+  const reason = new Error('Agent document time budget exhausted');
+  const expiresAt = Date.now() + durationMs;
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(reason), durationMs);
+  timer.unref();
+  return {
+    signal: combined,
+    hasExpired: () => combined.aborted
+      ? combined.reason === reason
+      : Date.now() >= expiresAt,
+    dispose: () => clearTimeout(timer),
+  };
+}
+
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason

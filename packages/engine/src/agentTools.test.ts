@@ -19,6 +19,8 @@ vi.mock('@google/genai', async () => {
 });
 
 import type { AgentMemory, NormalizedRegion } from './agentTypes';
+import { applyMemoryUpdate } from './agentMemory';
+import { GeminiCostLimitError } from './gemini/requestPolicy';
 import {
   executeAnalyzeDocumentStructure,
   executeExtractFieldsBatch,
@@ -102,6 +104,22 @@ describe('agentTools', () => {
     expect(result.memoryUpdate?.extractedFields?.email_address).toBeUndefined();
   });
 
+  it('retains prototype-named model fields without treating inherited methods as existing values', async () => {
+    const memory = createMemory('unknown');
+    const result = await executeExtractFieldsBatch({
+      fields: ['constructor', '__proto__', 'toString'].map((name) => ({
+        field_name: name, field_value: 'invalid email', confidence: 0.9, validation_rule: 'email',
+      })),
+    }, '', '', memory);
+    expect(result.success).toBe(true);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(Object.getPrototypeOf(memory.extractedFields)).toBe(Object.prototype);
+    for (const name of ['constructor', 'proto', 'tostring']) {
+      expect(Object.hasOwn(memory.extractedFields, name)).toBe(true);
+      expect(memory.extractedFields[name]).toMatchObject({ value: 'invalid email', isValid: false });
+    }
+  });
+
   it('stores typed normalized locations for extracted fields', async () => {
     const result = await executeExtractFieldsBatch(
       {
@@ -121,6 +139,138 @@ describe('agentTools', () => {
 
     expect(result.success).toBe(true);
     expect(result.memoryUpdate?.extractedFields?.total_amount?.location).toEqual(totalRegion);
+  });
+
+  it('accepts a valid lower-confidence correction to an invalid field', async () => {
+    const memory = createMemory('unknown');
+    memory.extractedFields.email = { value: 'invalid', confidence: 0.99, isValid: false };
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'email', field_value: 'person@example.com', confidence: 0.8 }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.email).toMatchObject({
+      value: 'person@example.com', confidence: 0.8, isValid: true,
+    });
+  });
+
+  it('keeps a valid value when a duplicate in the same batch has higher confidence but fails validation', async () => {
+    const memory = createMemory('unknown');
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'email', field_value: 'person@example.com', confidence: 0.8 },
+        { field_name: 'email', field_value: 'invalid', confidence: 0.99 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.email).toMatchObject({ value: 'person@example.com', isValid: true });
+  });
+
+  it('persists arithmetic review results and revalidates them when a related field changes', async () => {
+    const memory = createMemory();
+    const first = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'total_amount', field_value: '120', confidence: 0.95 },
+        { field_name: 'subtotal_amount', field_value: '110', confidence: 0.9 },
+        { field_name: 'item_count', field_value: '2', confidence: 0.9 },
+        { field_name: 'item_1_amount', field_value: '100', confidence: 0.9 },
+        { field_name: 'item_2_amount', field_value: '20', confidence: 0.9 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, first.memoryUpdate);
+    expect(memory.extractedFields.subtotal_amount.isValid).toBe(false);
+    expect(memory.extractedFields.subtotal_amount.validationMessage).toContain('complete item amounts');
+    expect(memory.extractedFields.total_amount.isValid).toBe(true);
+
+    const corrected = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'item_2_amount', field_value: '10', confidence: 0.95 }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, corrected.memoryUpdate);
+    expect(memory.extractedFields.subtotal_amount.isValid).toBe(true);
+    expect(memory.extractedFields.subtotal_amount.validationMessage).not.toContain('does not match');
+  });
+
+  it('does not invalidate legitimate grand totals or incomplete subtotal evidence', async () => {
+    const memory = createMemory();
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'total_amount', field_value: '125', confidence: 0.95 },
+        { field_name: 'subtotal_amount', field_value: '100', confidence: 0.95 },
+        { field_name: 'tax_amount', field_value: '20', confidence: 0.95 },
+        { field_name: 'shipping_amount', field_value: '10', confidence: 0.95 },
+        { field_name: 'discount_amount', field_value: '5', confidence: 0.95 },
+        { field_name: 'item_1_amount', field_value: '60', confidence: 0.95 },
+        { field_name: 'item_1_description', field_value: '2 boxes of 5 parts', confidence: 0.95 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.total_amount.isValid).toBe(true);
+    expect(memory.extractedFields.subtotal_amount.isValid).toBe(true);
+  });
+
+  it.each([
+    ['31/12/2026', true], ['12/31/2026', true], ['31-12-2026 23:59:59', true],
+    ['2028-02-29', true], ['2026-02-29', false], ['31/04/2026', false],
+    ['2026-01-12 24:00', false], ['2026-01-12 12:60', false],
+  ])('validates real calendar dates consistently: %s', async (value, expected) => {
+    const memory = createMemory();
+    delete memory.extractedFields.invoice_date;
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'invoice_date', field_value: value, confidence: 1 }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.invoice_date.isValid).toBe(expected);
+  });
+
+  it.each([
+    ['31/12/2026', '30/12/2026', false],
+    ['12/30/2026', '12/31/2026', true],
+    ['2026-03-15', '04/03/2026', true],
+  ])('cross-checks due dates without guessing numeric date locales', async (invoiceDate, dueDate, expected) => {
+    const memory = createMemory();
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'invoice_date', field_value: invoiceDate, confidence: 1 },
+        { field_name: 'due_date', field_value: dueDate, confidence: 1 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.due_date.isValid).toBe(expected);
+  });
+
+  it('does not assume an unextracted subtotal or tax is zero', async () => {
+    const memory = createMemory();
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'total_amount', field_value: '120', confidence: 0.95 },
+        { field_name: 'tax_amount', field_value: '20', confidence: 0.9 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.total_amount.isValid).toBe(true);
+  });
+
+  it.each([-0.1, 1.1, Infinity, NaN])('rejects invalid field confidence %s', async (confidence) => {
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'note', field_value: 'hello', confidence }],
+    }, '', '', createMemory());
+    expect(result.success).toBe(false);
+    expect(result.memoryUpdate).toBeUndefined();
+  });
+
+  it('propagates region cost-limit errors to the agent loop', async () => {
+    const failure = new GeminiCostLimitError(0.01);
+    await expect(executeReOcrRegion(
+      { region: totalRegion, focus: 'invoice total' },
+      'data:application/pdf;base64,ZmFrZQ==',
+      'application/pdf',
+      createMemory(),
+      {
+        apiKey: 'test-key',
+        model: 'gemini-3-flash-preview',
+        regionCropper: mockRegionCropper,
+        regionStructuredExtractor: () => Promise.reject(failure),
+      },
+    )).rejects.toBe(failure);
   });
 
   it('returns schema guidance from analyze_document_structure', async () => {
@@ -238,8 +388,8 @@ describe('agentTools', () => {
         responseJsonSchema: expect.objectContaining({
           type: 'object',
           required: ['fields'],
-        }),
-      }),
+        }) as unknown,
+      }) as unknown,
     }));
     expect(result.success).toBe(true);
     expect(result.data).toMatchObject({

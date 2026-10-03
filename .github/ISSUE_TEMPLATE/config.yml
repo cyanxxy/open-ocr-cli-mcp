@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://github.com/cyanxxy/open-ocr-cli#readme
+    url: https://github.com/cyanxxy/open-ocr-cli-mcp#readme
     about: Check the README for setup instructions and usage guide
   - name: AI Eval Report
-    url: https://github.com/cyanxxy/open-ocr-cli/blob/main/evals/reports/latest.md
+    url: https://github.com/cyanxxy/open-ocr-cli-mcp/blob/main/evals/reports/latest.md
     about: Review the latest checked-in AI eval results before filing regressions
   - name: Discussions
-    url: https://github.com/cyanxxy/open-ocr-cli/discussions
+    url: https://github.com/cyanxxy/open-ocr-cli-mcp/discussions
     about: Ask questions and share ideas in GitHub Discussions

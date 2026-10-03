@@ -1,17 +1,17 @@
 {
   "name": "open-ocr-cli",
-  "version": "4.0.0",
-  "description": "Agent-first, provider-neutral multimodal OCR CLI for images, PDFs, URLs, JSON schemas, and agentic extraction with Gemini, Kimi, Muse, and OpenRouter.",
+  "version": "4.1.0",
+  "description": "Agent-first OCR CLI and MCP server. Extract images, PDFs, and URLs with Gemini, Kimi, Muse, OpenRouter, or compatible APIs.",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cyanxxy/open-ocr-cli.git",
+    "url": "git+https://github.com/cyanxxy/open-ocr-cli-mcp.git",
     "directory": "packages/cli"
   },
-  "homepage": "https://github.com/cyanxxy/open-ocr-cli#command-line-interface",
+  "homepage": "https://github.com/cyanxxy/open-ocr-cli-mcp#readme",
   "bugs": {
-    "url": "https://github.com/cyanxxy/open-ocr-cli/issues"
+    "url": "https://github.com/cyanxxy/open-ocr-cli-mcp/issues"
   },
   "keywords": [
     "ocr",
@@ -32,7 +32,10 @@
     "command-line-tool",
     "pdf",
     "document-extraction",
-    "batch-ocr"
+    "batch-ocr",
+    "mcp",
+    "codex",
+    "claude-code"
   ],
   "engines": {
     "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
@@ -59,23 +62,23 @@
     ]
   },
   "devDependencies": {
-    "@open-ocr/engine": "4.0.0",
+    "@open-ocr/engine": "4.1.0",
     "@types/html-to-text": "^9.0.4",
     "tsup": "^8.5.1",
     "typescript": "^5.8.3"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "@napi-rs/canvas": "^1.0.2",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "commander": "^14.0.3",
-    "fast-glob": "^3.3.3",
+    "glob": "^13.0.6",
     "html-to-text": "^10.0.1",
     "ipaddr.js": "^2.4.0",
-    "pdfjs-dist": "^6.2.108",
-    "sharp": "^0.35.3",
+    "pdfjs-dist": "5.5.207",
+    "sharp": "^0.35.5",
     "zod": "^4.4.3"
   },
   "publishConfig": {

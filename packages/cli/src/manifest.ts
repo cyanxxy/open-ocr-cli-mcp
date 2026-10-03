@@ -1,6 +1,19 @@
+import { promises as fs } from 'node:fs';
+
 import { batchMetadataError } from './errors';
 import type { CliManifest, ManifestEntry } from './types';
 import { asRecord, isIsoTimestamp } from './jsonValidation';
+
+/** A directory or device at an artifact path cannot satisfy a completed run. */
+export async function artifactFileExists(filePath: string): Promise<boolean> {
+  try {
+    return (await fs.stat(filePath)).isFile();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw error;
+  }
+}
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string');

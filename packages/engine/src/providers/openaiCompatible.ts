@@ -1,4 +1,5 @@
-import { isKimiK3Route, providerRequestHeaders } from './registry';
+import type { ReadableStream } from 'node:stream/web';
+import { isKimiK3Route, knownModelThinkingLevels, providerDefaultThinkingLevel, providerRequestHeaders } from './registry';
 import { waitForProviderRequestSlot } from './requestPolicy';
 import type { ProviderRuntimeConfig } from './types';
 import { recordProviderUsage } from './usage';
@@ -206,7 +207,11 @@ export function isRetryableProviderError(error: unknown): boolean {
 }
 
 function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
-  const level = config.thinkingConfig?.level ?? 'MEDIUM';
+  const level = config.thinkingConfig?.level ?? providerDefaultThinkingLevel(config.provider, config.model);
+  const allowed = knownModelThinkingLevels(config.provider, config.model);
+  if (allowed && !allowed.includes(level) && !isKimiK3Route(config.provider, config.model)) {
+    throw new ProviderApiError(`${config.model} supports reasoning effort ${allowed.map((entry) => entry.toLowerCase()).join(', ')}; received ${level.toLowerCase()}`);
+  }
   const kimiK3Effort = (): 'low' | 'high' | 'max' => {
     if (level === 'MINIMAL' || level === 'LOW') return 'low';
     if (level === 'HIGH') return 'high';
@@ -227,6 +232,12 @@ function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
       : { thinking: { type: 'enabled', keep: 'all' } };
   }
   if (config.provider === 'openrouter') {
+    const routedModel = config.model.split(':')[0];
+    if (/^moonshotai\/kimi-k2\.7-code/u.test(routedModel) || routedModel === 'moonshotai/kimi-k2.6') {
+      // These K2 routes expose a reasoning toggle, not an effort budget. K2.7
+      // always reasons; K2.6 minimal maps to its instant mode explicitly.
+      return { reasoning: { enabled: level !== 'MINIMAL', exclude: false } };
+    }
     return {
       // OpenRouter requires reasoning_details to be replayed unchanged during
       // tool use. Visibility is handled by progress policy, never transport.
@@ -447,8 +458,8 @@ function completionRequestBody(
   };
 }
 
-function assertFinishReason(finishReason: string | undefined, required = false): void {
-  if (required && finishReason === undefined) {
+function assertFinishReason(finishReason: string | undefined): void {
+  if (finishReason === undefined) {
     throw new ProviderApiError('Provider response omitted its terminal finish reason');
   }
   if (finishReason === 'length' || finishReason === 'max_tokens') {
@@ -457,7 +468,7 @@ function assertFinishReason(finishReason: string | undefined, required = false):
   if (finishReason === 'content_filter') {
     throw new ProviderApiError('Provider response was blocked by a content filter');
   }
-  if (finishReason === 'error' || finishReason === 'failed' || finishReason === 'cancelled') {
+  if (finishReason !== 'stop' && finishReason !== 'tool_calls') {
     throw new ProviderApiError(`Provider response ended with finish reason ${finishReason}`);
   }
 }
@@ -474,7 +485,7 @@ async function streamedChatCompletion(
   request: ChatCompletionRequest,
 ): Promise<ChatCompletionResult> {
   if (!response.body) throw new ProviderApiError('Provider returned an empty streaming response');
-  const reader = response.body.getReader();
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
@@ -514,6 +525,9 @@ async function streamedChatCompletion(
     // Kimi reports streaming usage on choices[0], while OpenRouter/OpenAI put
     // it at the chunk root. Support both current wire shapes.
     if (choice.usage !== undefined) usage = choice.usage;
+    if (isRecord(choice.error)) {
+      throw providerErrorFromRecord(choice.error, 'Provider reported a streaming completion error');
+    }
     if (typeof choice.finish_reason === 'string') finishReason = choice.finish_reason;
     if (!isRecord(choice.delta)) return;
     const delta = choice.delta;
@@ -538,7 +552,7 @@ async function streamedChatCompletion(
       // OpenRouter returns reusable PDF parser annotations on the assistant
       // message. Preserve streamed chunks so later tool turns do not pay to
       // parse the same document again.
-      annotations.push(...delta.annotations);
+      annotations.push(...delta.annotations as unknown[]);
     }
     if (Array.isArray(delta.tool_calls)) {
       for (const entry of delta.tool_calls) {
@@ -646,7 +660,10 @@ async function streamedChatCompletion(
     ...(usage !== undefined ? { usage } : {}),
   };
   if (usage === undefined) recordProviderUsage(raw, config, config.runtime);
-  assertFinishReason(finishReason, true);
+  assertFinishReason(finishReason);
+  if (finishReason === 'tool_calls' && completedToolCalls.length === 0) {
+    throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
+  }
   return { text, message: parseAssistantMessage(rawMessage), finishReason, raw };
 }
 
@@ -670,7 +687,7 @@ export async function createChatCompletion(
   if (stream && response.headers.get('content-type')?.includes('text/event-stream')) {
     return streamedChatCompletion(response, config, request);
   }
-  const parsed = await response.json() as unknown;
+  const parsed = await response.json();
   if (!isRecord(parsed)) throw new ProviderApiError('Provider returned a non-object response');
   recordProviderUsage(parsed, config, config.runtime);
   if (isRecord(parsed.error)) {
@@ -688,10 +705,13 @@ export async function createChatCompletion(
     throw new ProviderApiError('Provider returned no assistant message');
   }
   const finishReason = typeof choice.finish_reason === 'string' ? choice.finish_reason : undefined;
-  assertFinishReason(finishReason, config.provider !== 'openai-compatible');
+  assertFinishReason(finishReason);
   const rawMessage = choice.message;
   const text = parseContent(rawMessage.content);
   const message = parseAssistantMessage(rawMessage);
+  if (finishReason === 'tool_calls' && !message.tool_calls?.length) {
+    throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
+  }
   if (!text && !message.tool_calls?.length) throw new ProviderApiError('Provider returned an empty response');
   return { text, message, finishReason, raw: parsed };
 }
@@ -699,7 +719,7 @@ export async function createChatCompletion(
 async function parseFileContentResponse(response: Response): Promise<string> {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.includes('application/json')) return response.text();
-  const value = await response.json() as unknown;
+  const value = await response.json();
   if (typeof value === 'string') return value;
   if (isRecord(value)) {
     for (const key of ['content', 'text', 'file_content']) {
@@ -730,7 +750,7 @@ export async function extractKimiFileContent(
     signal,
   });
   if (!upload.ok) throw await responseError(upload);
-  const uploaded = await upload.json() as unknown;
+  const uploaded = await upload.json();
   if (!isRecord(uploaded) || typeof uploaded.id !== 'string') {
     throw new ProviderApiError('Kimi file upload returned no file ID');
   }

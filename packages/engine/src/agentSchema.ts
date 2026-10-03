@@ -184,7 +184,9 @@ export function normalizeAgentDocumentType(documentType?: string): string {
   }
 
   const sanitized = sanitizeKey(documentType);
-  return DOCUMENT_TYPE_ALIASES[sanitized] ?? sanitized.replace(/_/g, ' ');
+  return Object.hasOwn(DOCUMENT_TYPE_ALIASES, sanitized)
+    ? DOCUMENT_TYPE_ALIASES[sanitized]
+    : sanitized.replace(/_/g, ' ');
 }
 
 export function getAgentDocumentSchema(documentType?: string): AgentDocumentSchema | null {
@@ -193,7 +195,9 @@ export function getAgentDocumentSchema(documentType?: string): AgentDocumentSche
     return null;
   }
 
-  return DOCUMENT_SCHEMAS[normalized as Exclude<KnownAgentDocumentType, 'unknown'>] ?? null;
+  return Object.hasOwn(DOCUMENT_SCHEMAS, normalized)
+    ? DOCUMENT_SCHEMAS[normalized as Exclude<KnownAgentDocumentType, 'unknown'>]
+    : null;
 }
 
 export function normalizeAgentFieldName(documentType: string | undefined, fieldName: string): string {
@@ -207,7 +211,7 @@ export function normalizeAgentFieldName(documentType: string | undefined, fieldN
     return normalizedField;
   }
 
-  return schema.aliases[normalizedField] ?? normalizedField;
+  return Object.hasOwn(schema.aliases, normalizedField) ? schema.aliases[normalizedField] : normalizedField;
 }
 
 export function getAgentReadiness(snapshot: AgentExtractionSnapshot): AgentReadiness {
@@ -240,7 +244,7 @@ export function getAgentReadiness(snapshot: AgentExtractionSnapshot): AgentReadi
 
   const missingRequiredFields = schema.requiredFields.filter((fieldName) => {
     const field = snapshot.extractedFields[fieldName];
-    return !field || String(field.value || '').trim().length === 0;
+    return !field || field.isValid === false || String(field.value || '').trim().length === 0;
   });
 
   const requiredCoverage = schema.requiredFields.length > 0
@@ -264,7 +268,7 @@ export function getAgentReadiness(snapshot: AgentExtractionSnapshot): AgentReadi
  * Deterministic completion decision owned by the runtime (not the model).
  *
  * A run is only "complete" when, for the document's schema, every required
- * field is populated AND overall confidence clears the configured threshold
+ * field is populated and valid AND overall confidence clears the configured threshold
  * AND at least one populated field survived validation. For unknown document
  * types (no schema) we cannot assert coverage, so completion requires a valid
  * field plus the confidence threshold. This is what makes `confidenceThreshold`

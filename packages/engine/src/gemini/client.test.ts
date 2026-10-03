@@ -134,6 +134,14 @@ describe('Gemini error classification', () => {
 });
 
 describe('applyThinkingConfig', () => {
+  it('uses current Flash defaults and rejects minimal for 3.8 and 3.7 before sending', () => {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash'] as const) {
+      expect(applyThinkingConfig({}, model).thinkingConfig.thinkingLevel).toBe('MEDIUM');
+      expect(() => applyThinkingConfig({}, model, { level: 'MINIMAL' })).toThrow('minimal is not supported');
+    }
+    expect(applyThinkingConfig({}, 'gemini-3.5-flash-lite').thinkingConfig.thinkingLevel).toBe('MINIMAL');
+    expect(applyThinkingConfig({}, 'gemini-3.6-flash', { level: 'MINIMAL' }).thinkingConfig.thinkingLevel).toBe('MINIMAL');
+  });
   it('defaults thinking by model family when no config is provided', () => {
     expect(applyThinkingConfig({}, 'gemini-3.1-pro-preview').thinkingConfig).toEqual({
       thinkingLevel: 'HIGH',

@@ -61,6 +61,8 @@ out/
 *.tsbuildinfo
 
 # Runtime data
+.open-ocr-results/
+open-ocr-output/
 pids
 *.pid
 *.seed

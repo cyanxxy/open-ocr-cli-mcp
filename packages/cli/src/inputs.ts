@@ -5,7 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import type { Readable } from 'node:stream';
 
-import fg from 'fast-glob';
+import { globIterate, Ignore, type IgnoreLike } from 'glob';
 
 import { EXTENSION_TO_MIME, FILE_CONSTRAINTS, maxFileSizeForMime } from '@open-ocr/engine/constants';
 import { CliExitError, type OcrErrorCode } from './errors';
@@ -35,16 +35,17 @@ const DEFAULT_EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set([
   'target',
 ]);
 
-// Ignore patterns that prune the excluded subtrees from the walk.
-//
-// The suffix is a single-star segment before the globstar, not the obvious bare
-// globstar: `<name>/**` also matches `<name>` itself, which drops the directory
-// from the stream and leaves the scan unable to say what it passed over. This
-// shape prunes everything below the directory while the directory entry still
-// surfaces. Entries one level down survive it, so hasDefaultExcludedAncestor —
-// not this pattern — is what guarantees no excluded file becomes a document.
-const DEFAULT_EXCLUDE_PATTERNS: readonly string[] = [...DEFAULT_EXCLUDED_DIRECTORIES]
-  .map((name) => `**/${name}/*/**`);
+// Prune excluded children while retaining the directory entry for skip reports.
+// Explicitly naming an excluded directory still scans that directory itself.
+function discoveryIgnore(options: ResolvedCliOptions, applyDefaults: boolean): IgnoreLike {
+  const patterns = new Ignore(options.excludes, {});
+  return {
+    ignored: (entry) => entry.isSymbolicLink() || patterns.ignored(entry),
+    childrenIgnored: (entry) => entry.isSymbolicLink()
+      || patterns.childrenIgnored(entry)
+      || (applyDefaults && entry.relative() !== '' && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)),
+  };
+}
 
 /**
  * Whether a scanned path lives under a default-excluded directory.
@@ -205,6 +206,13 @@ function sampleSkippedPath(sample: string[], absolutePath: string): void {
   if (sample.length > MAX_REPORTED_SKIP_NAMES) sample.length = MAX_REPORTED_SKIP_NAMES;
 }
 
+function appendDiscoveredFile(files: string[], absolutePath: string, maxFiles: number): void {
+  files.push(absolutePath);
+  if (files.length > maxFiles) {
+    throw inputError(`Matched at least ${files.length} files, exceeding --max-files ${maxFiles}`);
+  }
+}
+
 /**
  * Walk a directory once with the configured hidden/exclude pruning, partitioning
  * on extension as entries stream past rather than inside the glob.
@@ -220,41 +228,54 @@ function sampleSkippedPath(sample: string[], absolutePath: string): void {
  * build tree can be named. That is the whole reason the walk is not simply
  * `onlyFiles`.
  */
-async function scanDirectory(absolute: string, options: ResolvedCliOptions): Promise<ExpandedInput> {
+async function scanDirectory(
+  absolute: string,
+  options: ResolvedCliOptions,
+  signal?: AbortSignal,
+): Promise<ExpandedInput> {
   const applyDefaults = options.defaultExcludes;
-  const entries = fg.stream('**/*', {
+  const entries = globIterate('**/*', {
     cwd: absolute,
-    absolute: true,
-    onlyFiles: false,
-    objectMode: true,
+    withFileTypes: true,
     dot: options.hidden,
-    followSymbolicLinks: false,
-    ignore: applyDefaults ? [...options.excludes, ...DEFAULT_EXCLUDE_PATTERNS] : options.excludes,
-  }) as AsyncIterable<{ path: string; name: string; dirent: { isDirectory: () => boolean } }>;
+    follow: false,
+    signal,
+    ignore: discoveryIgnore(options, applyDefaults),
+  });
   const files: string[] = [];
   const unsupportedSample: string[] = [];
   const defaultExcludedSample: string[] = [];
   let unsupportedCount = 0;
   let defaultExcludedCount = 0;
   for await (const entry of entries) {
-    if (entry.dirent.isDirectory()) {
+    signal?.throwIfAborted();
+    const absolutePath = entry.fullpath();
+    if (entry.isDirectory()) {
       if (applyDefaults && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)) {
         defaultExcludedCount += 1;
-        sampleSkippedPath(defaultExcludedSample, entry.path);
+        sampleSkippedPath(defaultExcludedSample, absolutePath);
       }
       continue;
     }
-    if (applyDefaults && hasDefaultExcludedAncestor(absolute, entry.path)) continue;
-    if (SUPPORTED_EXTENSIONS.has(path.extname(entry.path).toLowerCase())) files.push(entry.path);
+    if (!entry.isFile()) continue;
+    if (applyDefaults && hasDefaultExcludedAncestor(absolute, absolutePath)) continue;
+    if (SUPPORTED_EXTENSIONS.has(path.extname(absolutePath).toLowerCase())) {
+      appendDiscoveredFile(files, absolutePath, options.maxFiles);
+    }
     else {
       unsupportedCount += 1;
-      sampleSkippedPath(unsupportedSample, entry.path);
+      sampleSkippedPath(unsupportedSample, absolutePath);
     }
   }
   return { files, unsupportedCount, unsupportedSample, defaultExcludedCount, defaultExcludedSample };
 }
 
-async function expandInput(value: string, options: ResolvedCliOptions): Promise<ExpandedInput> {
+async function expandInput(
+  value: string,
+  options: ResolvedCliOptions,
+  signal?: AbortSignal,
+): Promise<ExpandedInput> {
+  signal?.throwIfAborted();
   const absolute = path.resolve(options.cwd, value);
   let entry: Stats | undefined;
   try {
@@ -266,24 +287,27 @@ async function expandInput(value: string, options: ResolvedCliOptions): Promise<
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   if (entry?.isFile()) return { files: [absolute], ...noExpansionSkips() };
-  if (entry?.isDirectory()) return scanDirectory(absolute, options);
+  if (entry?.isDirectory()) return scanDirectory(absolute, options, signal);
   if (entry) return { files: [], ...noExpansionSkips() };
 
   if (!isGlobPattern(value)) throw inputError(`Input does not exist: ${value}`, 'INPUT_NOT_FOUND');
   // An explicit pattern is the caller's own filter: unsupported matches stay in
   // the set and fail loudly by MIME detection rather than disappearing here, and
   // the default directory excludes never apply — `dist/**/*.pdf` means `dist`.
-  return {
-    files: await fg(value, {
-      cwd: options.cwd,
-      absolute: true,
-      onlyFiles: true,
-      dot: options.hidden,
-      followSymbolicLinks: false,
-      ignore: options.excludes,
-    }),
-    ...noExpansionSkips(),
-  };
+  const files: string[] = [];
+  for await (const match of globIterate(value, {
+    cwd: options.cwd,
+    withFileTypes: true,
+    nodir: true,
+    dot: options.hidden,
+    follow: false,
+    signal,
+    ignore: discoveryIgnore(options, false),
+  })) {
+    signal?.throwIfAborted();
+    if (match.isFile()) appendDiscoveredFile(files, match.fullpath(), options.maxFiles);
+  }
+  return { files, ...noExpansionSkips() };
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -362,6 +386,7 @@ export async function discoverInputSet(
   options: ResolvedCliOptions,
   signal?: AbortSignal,
 ): Promise<InputDiscovery> {
+  signal?.throwIfAborted();
   if (rawInputs.length === 0) throw inputError('Provide at least one file, directory, glob, or - for stdin');
   if (rawInputs.includes('-') && rawInputs.length !== 1) throw inputError('stdin (-) must be the only input');
 
@@ -396,10 +421,15 @@ export async function discoverInputSet(
     };
   }
 
-  const expanded = await Promise.all(rawInputs.map((input) => expandInput(input, options)));
+  const expanded = await Promise.all([...new Set(rawInputs)].map((input) => expandInput(input, options, signal)));
+  signal?.throwIfAborted();
   const uniqueAbsolute = (paths: string[]): string[] => [...new Set(paths.map((entry) => path.resolve(entry)))]
     .sort((a, b) => a.localeCompare(b));
   const unique = uniqueAbsolute(expanded.flatMap((entry) => entry.files));
+  // Refuse oversized unions before opening every matched input for MIME sniffing.
+  if (unique.length > options.maxFiles) {
+    throw inputError(`Matched ${unique.length} files, exceeding --max-files ${options.maxFiles}`);
+  }
   // Each expansion already reduced itself to a bounded sample, so merging sorts
   // at most one sample per requested input.
   const mergeNames = (samples: string[]): string[] => uniqueAbsolute(samples)
@@ -438,9 +468,6 @@ export async function discoverInputSet(
     };
   }));
 
-  if (inputs.length > options.maxFiles) {
-    throw inputError(`Matched ${inputs.length} files, exceeding --max-files ${options.maxFiles}`);
-  }
   const totalBytes = inputs.reduce((sum, input) => sum + input.size, 0);
   const maxBytes = options.maxTotalMb * 1024 * 1024;
   if (totalBytes > maxBytes) {

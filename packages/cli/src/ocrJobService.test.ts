@@ -287,8 +287,9 @@ describe('OcrJobService', () => {
       status: 'skipped',
       skipReason: 'cost-limit',
       // The hint is the agent's next action; a typed error without one is a dead end.
-      errorDetails: { code: 'COST_LIMIT', hint: expect.stringContaining('--max-cost') },
+      errorDetails: { code: 'COST_LIMIT' },
     });
+    expect(execution.summary.results[1].errorDetails?.hint).toContain('--max-cost');
     expect(execution.result).toMatchObject({ ok: false, status: 'cost_limited' });
   });
 
@@ -316,8 +317,8 @@ describe('OcrJobService', () => {
       code: 'TIMEOUT',
       category: 'limit',
       retryable: true,
-      hint: expect.stringContaining('--timeout'),
     });
+    expect(execution.result.documents[0]?.error?.hint).toContain('--timeout');
   });
 
   it('reports an interrupted active document as cancelled instead of failed', async () => {
@@ -329,7 +330,7 @@ describe('OcrJobService', () => {
     const abortController = new AbortController();
     const extractDocument = vi.fn<OcrDocumentExtractor>((_input, _options, signal) => {
       abortController.abort(new Error('Interrupted by SIGINT'));
-      const reason = signal.reason;
+      const reason: unknown = signal.reason;
       return Promise.reject(reason instanceof Error ? reason : new Error(String(reason)));
     });
     const events: OcrJobEvent[] = [];
@@ -592,9 +593,9 @@ describe('OcrJobService', () => {
       error: {
         code: 'INPUT_INVALID',
         category: 'input',
-        hint: expect.stringContaining('Convert this image'),
       },
     });
+    expect(execution.result.documents[0]?.error?.hint).toContain('Convert this image');
   });
 
   it('resumes a single reference-first document from its manifest', async () => {
@@ -721,6 +722,35 @@ describe('OcrJobService', () => {
       .resolves.toBe('# changed.jpg pass 3\n');
     await expect(readFile(path.join(outputDirectory, 'docs', 'unchanged.md'), 'utf8'))
       .resolves.toBe('# unchanged.jpg pass 2\n');
+  });
+
+  it('retains stale artifact ownership after a resumed replacement fails', async () => {
+    const documentPath = path.join(directory, 'document.jpg');
+    const outputDirectory = path.join(directory, 'resumable');
+    const artifactPath = path.join(outputDirectory, 'document.md');
+    await writeFile(documentPath, JPEG_BYTES);
+    const options = resolveCliOptions({ output: outputDirectory }, {}, directory);
+    const extractDocument = vi.fn<OcrDocumentExtractor>()
+      .mockResolvedValueOnce({ artifacts: { markdown: '# Original' }, attempts: 1 })
+      .mockRejectedValueOnce(new Error('Temporary provider failure'))
+      .mockResolvedValueOnce({ artifacts: { markdown: '# Updated' }, attempts: 1 });
+    const service = new OcrJobService({ extractDocument });
+    const run = async (runId: string) => service.run(
+      await discoverInputs([documentPath], options),
+      options,
+      { runId, abortController: new AbortController() },
+    );
+
+    await run('seed');
+    await writeFile(documentPath, Uint8Array.from([...JPEG_BYTES, 4]));
+    const failed = await run('failed-replacement');
+    expect(failed.summary.failed).toBe(1);
+    await expect(readFile(artifactPath, 'utf8')).resolves.toBe('# Original\n');
+
+    const retried = await run('retry-replacement');
+    expect(retried.summary.succeeded).toBe(1);
+    expect(extractDocument).toHaveBeenCalledTimes(3);
+    await expect(readFile(artifactPath, 'utf8')).resolves.toBe('# Updated\n');
   });
 
   it('still reports a conflict when a resume run finds an artifact its manifest never recorded', async () => {

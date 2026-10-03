@@ -21,7 +21,7 @@ jobs:
     name: Sync Repository Labels
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.repository == 'cyanxxy/open-ocr-cli' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cyanxxy/open-ocr-cli-mcp' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout repository

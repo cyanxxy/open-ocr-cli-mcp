@@ -18,6 +18,8 @@ const versions = new Map([
   ['package-lock.json packages[""]', lockfile.packages?.['']?.version],
   ['package-lock.json packages["packages/cli"]', lockfile.packages?.['packages/cli']?.version],
   ['package-lock.json packages["packages/engine"]', lockfile.packages?.['packages/engine']?.version],
+  ['packages/cli/package.json devDependencies["@open-ocr/engine"]', cliPackage.devDependencies?.['@open-ocr/engine']],
+  ['package-lock.json packages["packages/cli"] devDependencies["@open-ocr/engine"]', lockfile.packages?.['packages/cli']?.devDependencies?.['@open-ocr/engine']],
 ]);
 
 for (const [source, version] of versions) {

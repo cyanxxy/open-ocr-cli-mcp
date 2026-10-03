@@ -122,6 +122,7 @@ export interface OcrJobServiceResult {
 interface OutputPlan {
   shouldWriteFiles: boolean;
   needsManifest: boolean;
+  deliveryMode: OcrDeliveryMode;
 }
 
 /** Remove document bodies and extraction payloads from the auditable summary. */
@@ -364,7 +365,11 @@ export class OcrJobService {
     const needsManifest = shouldWriteFiles && !singleArtifactFile && (
       inputs.length > 1 || keyedByPath || runtime.enableSingleInputResume === true
     );
-    return { shouldWriteFiles, needsManifest };
+    return {
+      shouldWriteFiles,
+      needsManifest,
+      deliveryMode: explicitDelivery ?? (shouldWriteFiles ? 'reference' : 'inline'),
+    };
   }
 
   async run(
@@ -372,7 +377,6 @@ export class OcrJobService {
     options: ResolvedCliOptions,
     runtime: OcrJobServiceRuntime,
   ): Promise<OcrJobServiceResult> {
-    const deliveryMode = runtime.deliveryMode ?? 'reference';
     const events = new EventDispatcher(runtime.runId, runtime.eventSink);
     const providerRuntime = createProviderExecutionContext({
       requestsPerMinute: options.requestsPerMinute,
@@ -389,6 +393,7 @@ export class OcrJobService {
       void events.emit({ type: 'run.warning', message }).catch(() => undefined);
     };
     let batchLock: BatchOutputLock | undefined;
+    let plan: OutputPlan | undefined;
     let summary: BatchSummary | undefined;
     let failure: unknown;
 
@@ -409,7 +414,7 @@ export class OcrJobService {
       // The lock guards the manifest, so both follow one plan: a run that keeps
       // no manifest (stdout, inline delivery, or a single-artifact-file output)
       // must not create a lock directory either.
-      const plan = await this.planOutput(inputs, options, runtime);
+      plan = await this.planOutput(inputs, options, runtime);
       if (plan.needsManifest && !options.dryRun) {
         try {
           batchLock = await BatchOutputLock.acquire(defaultOutputDirectory(options), {
@@ -457,12 +462,12 @@ export class OcrJobService {
       await events.flush();
       throw typedFailure;
     }
-    if (!summary) throw new Error('Internal error: batch completed without a summary');
+    if (!summary || !plan) throw new Error('Internal error: batch completed without a summary or output plan');
 
     const result = toOcrRunResult(
       runtime.runId,
       summary,
-      deliveryMode,
+      plan.deliveryMode,
       options.format,
       runtime.progress ?? options.progress,
       warnings,
@@ -482,12 +487,11 @@ export class OcrJobService {
   ): Promise<BatchSummary> {
     const started = performance.now();
     const startedAt = new Date().toISOString();
-    const explicitDelivery = runtime.deliveryMode;
     // stdin IDs include a content hash. Compute them once per document so a
     // detailed streaming run does not re-hash tens of megabytes for every
     // model delta.
     const documentIds = inputs.map((input) => ocrDocumentId({ input }));
-    const { shouldWriteFiles, needsManifest } = plan;
+    const { shouldWriteFiles, needsManifest, deliveryMode } = plan;
     if (shouldWriteFiles) {
       try {
         await assertNoOutputCollisions(inputs, options, needsManifest);
@@ -510,37 +514,35 @@ export class OcrJobService {
     // about it would approve a job the live run rejects. Resolving resume state
     // first keeps that honest in both directions: a document the live run would
     // skip as unchanged is not reported as a conflict.
-    if (!options.overwrite) {
-      try {
-        await Promise.all(inputs.map(async (input, index) => {
-          const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
-          const fingerprint = inputFingerprint(input, fingerprintMode);
-          const completedEntry = resumeActive
-            ? await manifest?.completedEntry(key, fingerprint)
-            : undefined;
-          if (completedEntry) {
-            resumableEntries.set(index, completedEntry);
-            return;
-          }
-          // A tracked input that changed (or lost part of its output) is exactly
-          // what resume exists for: re-extract it over its own stale artifacts
-          // rather than failing the whole batch on a destination this job owns.
-          // Only paths the manifest recorded for this same input are reclaimed;
-          // anything else at a target path is still a genuine collision.
-          const reclaimable = resumeActive
-            ? manifest?.recordedArtifactPaths(key) ?? new Set<string>()
-            : new Set<string>();
-          if (reclaimable.size > 0) staleArtifacts.set(index, reclaimable);
-          if (shouldWriteFiles) {
-            await assertArtifactTargetsAvailable(input, options, inputs.length, {
-              reclaimable,
-              resumeActive,
-            });
-          }
-        }));
-      } catch (error) {
-        throw asCliExitError(error, 2);
-      }
+    try {
+      await Promise.all(inputs.map(async (input, index) => {
+        const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
+        const fingerprint = inputFingerprint(input, fingerprintMode);
+        const completedEntry = resumeActive && !options.overwrite
+          ? await manifest?.completedEntry(key, fingerprint)
+          : undefined;
+        if (completedEntry) {
+          resumableEntries.set(index, completedEntry);
+          return;
+        }
+        // A tracked input that changed (or lost part of its output) is exactly
+        // what resume exists for: re-extract it over its own stale artifacts
+        // rather than failing the whole batch on a destination this job owns.
+        // Only paths the manifest recorded for this same input are reclaimed;
+        // anything else at a target path is still a genuine collision.
+        const reclaimable = resumeActive
+          ? manifest?.recordedArtifactPaths(key) ?? new Set<string>()
+          : new Set<string>();
+        if (reclaimable.size > 0) staleArtifacts.set(index, reclaimable);
+        if (shouldWriteFiles) {
+          await assertArtifactTargetsAvailable(input, options, inputs.length, {
+            reclaimable,
+            resumeActive,
+          });
+        }
+      }));
+    } catch (error) {
+      throw asCliExitError(error, 2);
     }
     const results = new Array<OcrJobResult | undefined>(inputs.length);
     let cursor = 0;
@@ -555,7 +557,7 @@ export class OcrJobService {
         type: terminalEventType(result),
         document: toProtocolDocument(
           result,
-          runtime.deliveryMode ?? 'reference',
+          deliveryMode,
           options.format,
           runtime.progress ?? options.progress,
         ),
@@ -678,7 +680,7 @@ export class OcrJobService {
                 ? progressFailure
                 : new Error(errorMessage(progressFailure));
             }
-            if (explicitDelivery === 'inline') {
+            if (deliveryMode === 'inline') {
               assertArtifactFormatAvailable(artifacts, options.format);
             }
             const outputArtifacts = shouldWriteFiles
@@ -740,7 +742,10 @@ export class OcrJobService {
             await manifest?.update(key, {
               fingerprint,
               status: 'failed',
-              outputFiles: [],
+              // A failed replacement leaves the previous artifact transaction
+              // intact. Retain its ownership so the next resume can replace
+              // those stale files instead of rejecting them as untracked.
+              outputFiles: [...(manifest?.recordedArtifactPaths(key) ?? [])],
               completedAt: result.completedAt,
               error: failure.error,
             });
