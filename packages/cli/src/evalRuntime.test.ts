@@ -1,7 +1,9 @@
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getProviderUsage, type ProviderRuntimeConfig } from '@open-ocr/engine/providers';
 import { validateEvalCase } from '@open-ocr/engine/evals';
-import { resolveEvalTokenPrices, runEvalCase } from '../../../evals/run';
+import { formatEvalError, resolveEvalTokenPrices, runEvalCase } from '../../../evals/run';
 
 const mocks = vi.hoisted(() => ({ generateContent: vi.fn(), createInteraction: vi.fn() }));
 
@@ -99,4 +101,72 @@ describe('eval price overrides', () => {
       })).toThrow('finite nonnegative');
     },
   );
+});
+
+describe('eval error diagnostics', () => {
+  it('redacts opaque configured credentials before persisting case errors', async () => {
+    const apiKey = 'custom-service-credential';
+    const gatewayToken = 'custom-gateway-credential';
+    mocks.generateContent.mockRejectedValue(new Error(
+      `Access denied for ${apiKey} through ${gatewayToken}; check model permissions.`,
+    ));
+    const completed = await runEvalCase(evalCase('simple'), {
+      ...config(1, 2), apiKey, gatewayToken,
+    }, 0);
+    expect(completed.result.execution?.runtimeError).toBe(
+      'Access denied for [REDACTED] through [REDACTED]; check model permissions.',
+    );
+    expect(JSON.stringify(completed)).not.toContain(apiKey);
+    expect(JSON.stringify(completed)).not.toContain(gatewayToken);
+  });
+
+  it('redacts escaped credentials and standard token patterns while preserving the provider reason', () => {
+    const credential = 'opaque/key+"value';
+    const message = JSON.stringify({ error: {
+      message: `Denied ${credential} at ${encodeURIComponent(credential)}; Bearer unconfigured-token`,
+      status: 'PERMISSION_DENIED',
+    } });
+    const formatted = formatEvalError(new Error(message), [credential]);
+    expect(formatted).toContain('PERMISSION_DENIED');
+    expect(formatted).toContain('Denied [REDACTED] at [REDACTED]');
+    expect(formatted).not.toContain(credential);
+    expect(formatted).not.toContain('unconfigured-token');
+  });
+
+  it('does not serialize arbitrary thrown objects into diagnostics', () => {
+    expect(formatEvalError({ apiKey: 'opaque' })).toBe('Evaluation failed with a non-Error value.');
+  });
+
+  it('never echoes a misconfigured credential selector from the actual entrypoint', () => {
+    const selector = 'accidentally-pasted-credential';
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'evals/run.ts'], {
+      cwd: path.resolve(),
+      env: { PATH: process.env.PATH, EVAL_PROVIDER: 'gemini', EVAL_API_KEY_ENV: selector },
+      encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('EVAL_API_KEY_ENV to the name of a populated credential variable');
+    expect(result.stderr).not.toContain(selector);
+  });
+
+  it('redacts custom environment credentials from fatal entrypoint diagnostics', () => {
+    const credential = 'opaque-private-value';
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'evals/run.ts'], {
+      cwd: path.resolve(),
+      env: {
+        PATH: process.env.PATH,
+        // Trigger a setup failure before any provider request. The fatal
+        // renderer must still recognize a nonstandard configured key value.
+        EVAL_PROVIDER: credential,
+        EVAL_API_KEY_ENV: 'CUSTOM_PROVIDER_SECRET',
+        CUSTOM_PROVIDER_SECRET: credential,
+      },
+      encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('Unsupported EVAL_PROVIDER: [REDACTED]');
+    expect(result.stderr).not.toContain(credential);
+  });
 });

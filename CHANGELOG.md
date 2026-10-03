@@ -22,6 +22,8 @@
 - Single-file JSONL extraction includes its content when no artifact is saved.
 - Evaluation runs isolate case usage and enforce paired nonnegative price
   overrides, including native Gemini agent continuations.
+- Evaluation diagnostics redact configured credentials before logging or
+  persisting errors and never echo a misplaced credential selector.
 - Evaluation matrix path validation, cancellation, worker cleanup, and missing
   report failures.
 - Malformed template values, incomplete provider responses, and oversized or

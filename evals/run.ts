@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { type ExtractedContent, type ThinkingLevel } from '@open-ocr/engine/gemini';
+import { providerErrorMessage, redactSensitiveErrorText } from '@open-ocr/engine/gemini/errorPayload';
 import { agentLoop } from '@open-ocr/engine/agentLoop';
 import { getAgentReadiness, normalizeAgentDocumentType, normalizeAgentFieldName } from '@open-ocr/engine/agentSchema';
 import {
@@ -210,6 +211,29 @@ interface CompletedEvalCase {
   artifact: EvalArtifact;
 }
 
+/** Keep provider diagnostics useful without printing or persisting credentials. */
+export function formatEvalError(error: unknown, credentials: readonly (string | undefined)[] = []): string {
+  let message = error instanceof Error ? error.message
+    : typeof error === 'string' ? error : 'Evaluation failed with a non-Error value.';
+  // Custom endpoints can use opaque keys that the standard provider-pattern
+  // redactor cannot recognize. Cover URL and JSON-escaped error echoes too.
+  const secrets = [...new Set(credentials.flatMap((credential) => {
+    const value = credential?.trim();
+    return value ? [value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)] : [];
+  }))].sort((left, right) => right.length - left.length);
+  for (const secret of secrets) message = message.replaceAll(secret, '[REDACTED]');
+  return redactSensitiveErrorText(providerErrorMessage(message));
+}
+
+function configuredEvalCredentials(env: NodeJS.ProcessEnv): (string | undefined)[] {
+  const customKeyEnv = env.EVAL_API_KEY_ENV;
+  return [
+    ...(customKeyEnv ? [env[customKeyEnv]] : []),
+    ...PROVIDER_IDS.map((provider) => env[providerDefaultApiKeyEnv(provider)]),
+    env.CLOUDFLARE_AI_GATEWAY_TOKEN,
+  ];
+}
+
 function estimateCost(usage: ProviderUsageSnapshot): number | undefined {
   return usage.estimatedCostUsd || undefined;
 }
@@ -260,7 +284,7 @@ export async function runEvalCase(evalCase: EvalCase, clientConfig: ProviderRunt
       artifact: { evalCase, output, repeatIndex },
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatEvalError(error, [clientConfig.apiKey, clientConfig.gatewayToken]);
     const execution = executionMetadata(runtime, startedAt, executionExtras, message, repeatIndex);
     let groundTruth;
     try {
@@ -336,7 +360,9 @@ async function main() {
     cloudflareProvider: process.env.CLOUDFLARE_AI_GATEWAY_PROVIDER,
   });
   if (!apiKey && !cloudflareByok && !(provider === 'openai-compatible' && isLocalBaseUrl(baseUrl))) {
-    throw new Error(`${apiKeyEnv} is required to run live ${provider} evals.`);
+    // EVAL_API_KEY_ENV is untrusted configuration, not a credential to echo.
+    // A user may accidentally put the secret itself here instead of its name.
+    throw new Error('A provider credential is required for live evals. Set the provider’s default key variable, or set EVAL_API_KEY_ENV to the name of a populated credential variable.');
   }
   const suite = resolveSuiteName();
   const repeatCount = resolveRepeatCount();
@@ -400,7 +426,7 @@ async function main() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   void main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    process.stderr.write(`${formatEvalError(error, configuredEvalCredentials(process.env))}\n`);
     process.exitCode = 1;
   });
 }

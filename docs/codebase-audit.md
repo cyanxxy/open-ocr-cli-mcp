@@ -112,11 +112,14 @@ official MCP SDK smoke, corpus validation, matrix dry run, and diff checks pass.
   create an immutable tag and explicitly dispatch publication at that tag.
   Preserve eligible CI runs, queue releases, fail closed on registry errors,
   and keep partial GitHub releases as drafts until all surfaces are complete.
+- Remove credential-selector echoes and redact configured API/gateway keys,
+  including escaped opaque values, before logging or persisting eval errors.
 - Pin PDF.js to Node 20-compatible 5.5.207, outside the
   [affected later 5.x range](https://github.com/advisories/GHSA-hq66-cqwq-w95j).
   Add engine-strict installation and real PDF checks on the minimum runtime.
 
-Verification: 820 unit tests and 11 release-automation tests pass. Full lint,
+Verification: 825 unit tests and 11 release-automation tests pass. Coverage passes
+at 86.12% statements and 77.16% branches. Full lint,
 typechecking, coverage, corpus validation, matrix dry run, pack inspection,
 clean Node 20/24 tarball installations, official MCP SDK smokes, and the GitHub
 Action wrapper pass. The npm audit reports zero known vulnerabilities. Workflow
