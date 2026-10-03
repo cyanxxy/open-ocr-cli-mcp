@@ -55,6 +55,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function scalarText(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  throw new Error('Preset extraction response did not match the expected schema: field and row values must be finite scalars');
+}
+
 /**
  * Fail closed on malformed preset JSON. Models (and non-Gemini providers without
  * responseJsonSchema) can return primitives, arrays, or half-shaped objects that
@@ -82,8 +88,13 @@ function assertValidPresetPayload(value: unknown): RawPresetPayload {
     throw schemaError;
   }
 
-  if (value.rows !== undefined && !Array.isArray(value.rows)) {
-    throw schemaError;
+  if (value.rows !== undefined) {
+    if (!Array.isArray(value.rows) || !value.rows.every(isRecord)) throw schemaError;
+    for (const row of value.rows) {
+      for (const cell of Object.values(row)) {
+        if (cell !== null) scalarText(cell);
+      }
+    }
   }
 
   if (value.warnings !== undefined) {
@@ -104,9 +115,14 @@ function assertValidPresetPayload(value: unknown): RawPresetPayload {
     ) {
       throw schemaError;
     }
+    if (Array.isArray(field.value)) {
+      if (!field.value.every((entry: unknown) => typeof entry === 'string')) throw schemaError;
+    } else if (field.value !== null) {
+      scalarText(field.value);
+    }
   }
 
-  return value as RawPresetPayload;
+  return value;
 }
 
 function parsePresetPayload(rawText: string): RawPresetPayload {
@@ -186,9 +202,9 @@ export function normalizeFieldValue(value: unknown, type: PresetExtractedField['
 
   if (type === 'list') {
     if (Array.isArray(value)) {
-      return value.map((entry) => String(entry).trim()).filter(Boolean);
+      return value.map((entry: unknown) => scalarText(entry).trim()).filter(Boolean);
     }
-    return String(value)
+    return scalarText(value)
       .split(/[,\n]/)
       .map((entry) => entry.trim())
       .filter(Boolean);
@@ -198,31 +214,31 @@ export function normalizeFieldValue(value: unknown, type: PresetExtractedField['
     if (typeof value === 'boolean') {
       return value;
     }
-    const normalized = String(value).trim().toLowerCase();
+    const normalized = scalarText(value).trim().toLowerCase();
     if (normalized === 'true' || normalized === 'yes') return true;
     if (normalized === 'false' || normalized === 'no') return false;
-    return String(value).trim();
+    return scalarText(value).trim();
   }
 
   if (type === 'number') {
-    if (typeof value === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) {
       return value;
     }
-    const numeric = parseLocaleNumber(String(value));
-    return numeric !== null ? numeric : String(value).trim();
+    const numeric = parseLocaleNumber(scalarText(value));
+    return numeric !== null ? numeric : scalarText(value).trim();
   }
 
   if (type === 'currency') {
-    if (typeof value === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) {
       return value.toFixed(2);
     }
 
-    const trimmed = String(value).trim();
+    const trimmed = scalarText(value).trim();
     const numeric = parseLocaleNumber(trimmed);
     return numeric !== null ? numeric.toFixed(2) : trimmed;
   }
 
-  return String(value).trim();
+  return scalarText(value).trim();
 }
 
 function clampFieldLength(value: string): string {
@@ -244,7 +260,7 @@ function normalizeRows(rows: unknown): NormalizedRows {
   const normalized = rows
     .filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null && !Array.isArray(entry))
     .map((entry) => Object.fromEntries(
-      Object.entries(entry).map(([key, value]) => [key, value == null ? '' : clampFieldLength(String(value).trim())])
+      Object.entries(entry).map(([key, value]) => [key, value == null ? '' : clampFieldLength(scalarText(value).trim())])
     ))
     .filter((entry) => Object.values(entry).some(Boolean));
 

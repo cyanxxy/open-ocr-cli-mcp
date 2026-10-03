@@ -1,17 +1,17 @@
 {
   "name": "open-ocr-workspace",
   "private": true,
-  "version": "4.0.0",
-  "description": "Provider-neutral multimodal OCR engine, CLI, and MCP server for images, PDFs, URLs, JSON schemas, and agentic extraction.",
+  "version": "4.1.0",
+  "description": "Agent-first OCR CLI and MCP server for images, PDFs, URLs, structured data, and resumable batches.",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cyanxxy/open-ocr-cli.git"
+    "url": "git+https://github.com/cyanxxy/open-ocr-cli-mcp.git"
   },
-  "homepage": "https://github.com/cyanxxy/open-ocr-cli#readme",
+  "homepage": "https://github.com/cyanxxy/open-ocr-cli-mcp#readme",
   "bugs": {
-    "url": "https://github.com/cyanxxy/open-ocr-cli/issues"
+    "url": "https://github.com/cyanxxy/open-ocr-cli-mcp/issues"
   },
   "keywords": [
     "ocr",
@@ -29,7 +29,12 @@
     "command-line-tool",
     "pdf",
     "receipt-ocr",
-    "invoice-ocr"
+    "invoice-ocr",
+    "mcp",
+    "mcp-server",
+    "agent-first",
+    "codex",
+    "claude-code"
   ],
   "engines": {
     "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
@@ -41,12 +46,12 @@
   ],
   "overrides": {
     "esbuild": "^0.28.1",
-    "fast-uri": "3.1.6"
+    "fast-uri": "3.1.8"
   },
   "scripts": {
     "lint": "eslint .",
     "typecheck": "npm run typecheck -w @open-ocr/engine && tsc --noEmit -p tsconfig.node.json && npm run typecheck -w open-ocr-cli",
-    "cli": "tsx packages/cli/src/index.ts",
+    "cli": "node --import tsx packages/cli/src/index.ts",
     "cli:build": "npm run build -w open-ocr-cli",
     "cli:smoke": "npm run cli:build && node packages/cli/dist/index.js --help",
     "cli:install-smoke": "node scripts/smoke-packed-cli.mjs",
@@ -54,28 +59,29 @@
     "test": "vitest run --maxWorkers=4",
     "test:watch": "vitest --watch",
     "test:coverage": "vitest run --coverage --maxWorkers=4",
-    "evals": "tsx evals/run.ts --suite full",
-    "evals:canary": "tsx evals/run.ts --suite canary",
-    "evals:benchmark": "tsx evals/run.ts --suite benchmark",
-    "evals:stability": "tsx evals/run.ts --suite benchmark --repeat 3",
-    "evals:matrix": "tsx evals/run-matrix.ts",
-    "evals:matrix:check": "tsx evals/run-matrix.ts --suite canary --dry-run",
-    "evals:setup": "tsx evals/setup-datasets.ts",
+    "evals": "node --import tsx evals/run.ts --suite full",
+    "evals:canary": "node --import tsx evals/run.ts --suite canary",
+    "evals:benchmark": "node --import tsx evals/run.ts --suite benchmark",
+    "evals:stability": "node --import tsx evals/run.ts --suite benchmark --repeat 3",
+    "evals:matrix": "node --import tsx evals/run-matrix.ts",
+    "evals:matrix:check": "node --import tsx evals/run-matrix.ts --suite canary --dry-run",
+    "evals:setup": "node --import tsx evals/setup-datasets.ts",
     "evals:fixtures": "python3 evals/generate_corpus.py && python3 evals/build_fixtures.py",
-    "evals:report": "tsx evals/render-report.ts",
-    "evals:validate": "tsx evals/validate.ts"
+    "evals:report": "node --import tsx evals/render-report.ts",
+    "evals:validate": "node --import tsx evals/validate.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/client": "2.3.0",
     "@types/node": "^20.19.43",
-    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/coverage-v8": "^4.1.11",
     "audit-ci": "^7.1.0",
     "eslint": "^10.8.1",
     "globals": "^17.3.0",
     "tsx": "^4.20.5",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.3.0",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.11"
   },
   "allowScripts": {
     "fsevents@2.3.3": true,

@@ -105,6 +105,25 @@ describe('custom JSON schemas', () => {
     expect(input).toHaveProperty('$schema');
   });
 
+  it('isolates repeated schema IDs across requests and preserves each validator', () => {
+    const schema = {
+      $id: 'https://example.com/extraction.json',
+      type: 'object',
+      properties: { value: { $ref: '#/$defs/value' } },
+      required: ['value'],
+      $defs: { value: { type: 'string' } },
+    };
+    const first = validateCustomSchema(schema);
+    const repeated = validateCustomSchema(schema);
+    const changed = validateCustomSchema({ ...schema, $defs: { value: { type: 'number' } } });
+
+    expect(() => assertCustomSchemaOutput(first, { value: 'original' })).not.toThrow();
+    expect(() => assertCustomSchemaOutput(repeated, { value: 'repeated' })).not.toThrow();
+    expect(() => assertCustomSchemaOutput(changed, { value: 42 })).not.toThrow();
+    expect(() => assertCustomSchemaOutput(first, { value: 42 })).toThrow('must be string');
+    expect(() => assertCustomSchemaOutput(changed, { value: 'stale' })).toThrow('must be number');
+  });
+
   // An array bound the provider cannot compile is rejected as a bare 400 that
   // names no field, so the cost has to be explained before the request is sent.
   it('warns that a costly array bound will likely be rejected', () => {

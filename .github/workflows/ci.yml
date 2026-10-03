@@ -12,7 +12,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Main version-bump commits must finish their own CI so later ordinary pushes
+  # cannot cancel the only exact commit eligible for automatic publication.
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -46,6 +48,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Test release automation
+        run: node --test scripts/release-automation.test.mjs
 
       - name: Type check
         if: ${{ matrix.node-version == '24.x' }}
@@ -110,6 +115,17 @@ jobs:
 
       - name: Smoke-test GitHub Action wrapper
         run: npm run action:smoke
+
+      # Keep Build Application's required check name stable while validating
+      # both the current build runtime and the oldest supported consumer.
+      - name: Setup minimum supported Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20.19.0'
+          package-manager-cache: false
+
+      - name: Smoke-test engine-strict CLI installation on Node 20
+        run: npm run cli:install-smoke
 
   # Release workflows publish a multi-architecture image. CI performs the
   # cheaper single-platform smoke on protected main pushes, not on every PR.

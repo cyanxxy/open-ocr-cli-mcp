@@ -6,6 +6,7 @@
 import { GoogleGenAI, ThinkingLevel as GoogleThinkingLevel } from '@google/genai';
 import { logger } from '../logger';
 import { GeminiModel, OcrError, OcrErrorType, ThinkingLevel } from './types';
+import { knownModelThinkingLevels, providerDefaultThinkingLevel } from '../providers/registry';
 
 /**
  * Cache for GoogleGenAI instances to avoid recreating them
@@ -140,13 +141,6 @@ export function createGeminiStreamCompletionTracker(
   };
 }
 
-/** Flash-family models that support MINIMAL thinking. */
-export function isFlashFamilyModel(modelName: GeminiModel): boolean {
-  return modelName === 'gemini-3-flash-preview'
-    || modelName === 'gemini-3.5-flash'
-    || modelName === 'gemini-3.1-flash-lite';
-}
-
 /**
  * Global generateContent media resolution for OCR.
  * Images: HIGH (fine text). PDFs: MEDIUM (docs: quality saturates at medium).
@@ -273,15 +267,13 @@ export function isRetryableGeminiError(error: unknown): boolean {
 
 /**
  * Model-aware default thinking level when the host has not set one.
- * - 3.1 Flash-Lite: minimal (API default; cheap/high-volume)
- * - 3.5 Flash: medium
+ * - Flash-Lite: minimal (API default; cheap/high-volume)
+ * - Stable Flash: medium
  * - 3 Flash Preview: high
  * - 3.1 Pro: high
  */
 export function defaultThinkingLevelForModel(modelName: GeminiModel): ThinkingLevel {
-  if (modelName === 'gemini-3.1-flash-lite') return 'MINIMAL';
-  if (modelName === 'gemini-3.5-flash') return 'MEDIUM';
-  return 'HIGH';
+  return providerDefaultThinkingLevel('gemini', modelName);
 }
 
 /**
@@ -295,9 +287,7 @@ export function normalizeThinkingLevel(
 ): 'minimal' | 'low' | 'medium' | 'high' {
   const rawLevel = level ?? defaultThinkingLevelForModel(modelName);
   const normalized = typeof rawLevel === 'string' ? rawLevel.toUpperCase() : rawLevel;
-  const allowed = isFlashFamilyModel(modelName)
-    ? (['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const)
-    : (['LOW', 'MEDIUM', 'HIGH'] as const);
+  const allowed = knownModelThinkingLevels('gemini', modelName) ?? [];
   if (!(allowed as readonly string[]).includes(normalized)) {
     throw new Error(
       `${modelName} supports thinking levels ${allowed.map((entry) => entry.toLowerCase()).join(', ')}; `

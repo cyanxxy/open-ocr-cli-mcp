@@ -249,7 +249,9 @@ function normalizeUrlExtractionError(error: unknown): Error {
       return createGroundedUrlError('Grounded URL retrieval is unavailable for this API key, model, or region.');
     }
 
-    return new Error(error.message);
+    // Preserve typed cost, cancellation, and provider errors for the host's
+    // retry policy and result classification.
+    return error;
   }
 
   return createGroundedUrlError('Grounded URL retrieval failed.');

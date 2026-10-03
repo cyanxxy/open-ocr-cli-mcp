@@ -100,7 +100,7 @@ describe('machine request execution', () => {
 
     expect(execution.summary).toMatchObject({
       provider: 'gemini',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       failed: 0,
     });
     expect(process.env.OPEN_OCR_PROVIDER).toBeUndefined();

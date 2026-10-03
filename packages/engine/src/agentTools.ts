@@ -1,4 +1,5 @@
-import { AgentFunctionResult, AgentMemory } from './agentTypes';
+import { AgentFunctionResult, AgentMemory, AgentMemoryUpdate } from './agentTypes';
+import { mergeField, shouldReplaceField } from './agentMemory';
 import { FunctionDeclaration } from '@google/genai';
 import type { AgentClientConfig } from './agentTypes';
 import {
@@ -18,7 +19,7 @@ import {
 import type { GeminiModel } from './gemini/types';
 import { parseJsonPayload } from './gemini/structured';
 import { recordGeminiUsage } from './gemini/usage';
-import { waitForGeminiRequestSlot } from './gemini/requestPolicy';
+import { isGeminiCostLimitError, waitForGeminiRequestSlot } from './gemini/requestPolicy';
 import { assertNormalizedRegion } from './normalizedRegion';
 
 // Runtime validation helpers for Gemini function call args
@@ -33,8 +34,8 @@ function assertString(args: Record<string, unknown>, key: string): string {
 
 function assertNumber(args: Record<string, unknown>, key: string): number {
   const v = args[key];
-  if (typeof v !== 'number' || Number.isNaN(v)) {
-    throw new TypeError(`Expected number for "${key}", got ${typeof v}`);
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+    throw new TypeError(`Expected a finite confidence between 0 and 1 for "${key}"`);
   }
   return v;
 }
@@ -113,9 +114,11 @@ function normalizeStructuredFields(
       extractedAt: Date.now(),
     };
 
-    const currentField = acceptedFields[field_name] ?? memory.extractedFields[field_name];
-    if (!currentField || preparedField.confidence >= currentField.confidence) {
-      acceptedFields[field_name] = preparedField;
+    const currentField = Object.hasOwn(acceptedFields, field_name)
+      ? acceptedFields[field_name]
+      : Object.hasOwn(memory.extractedFields, field_name) ? memory.extractedFields[field_name] : undefined;
+    if (!currentField || shouldReplaceField(currentField, preparedField)) {
+      acceptedFields[field_name] = currentField ? mergeField(currentField, preparedField) : preparedField;
     }
 
     extractedSummaries.push({
@@ -240,7 +243,9 @@ export async function executeReOcrRegion(
     const explicitTargetFields = Array.isArray(args.target_fields)
       ? args.target_fields.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
       : [];
-    const confidence_threshold = typeof args.confidence_threshold === 'number' ? args.confidence_threshold : 0.7;
+    const confidence_threshold = args.confidence_threshold === undefined
+      ? 0.7
+      : assertNumber(args, 'confidence_threshold');
     const readiness = getAgentReadiness(memory);
     const targetFields = explicitTargetFields.length > 0
       ? explicitTargetFields
@@ -288,23 +293,6 @@ export async function executeReOcrRegion(
         },
       },
     };
-    let generationConfig: Record<string, unknown> = {
-      maxOutputTokens: 8192,
-      responseMimeType: 'application/json',
-      responseJsonSchema: responseSchema,
-      mediaResolution: generateContentMediaResolution(croppedRegion.mimeType),
-    };
-
-    if (clientConfig.abortSignal) {
-      generationConfig.abortSignal = clientConfig.abortSignal;
-    }
-
-    generationConfig = applyThinkingConfig(
-      generationConfig,
-      clientConfig.model as GeminiModel,
-      clientConfig.thinkingConfig,
-    );
-
     const prompt = [
       'Return valid JSON only.',
       'Do not wrap the JSON in markdown fences.',
@@ -336,6 +324,13 @@ export async function executeReOcrRegion(
       );
       rawResponseText = typeof value === 'string' ? value : JSON.stringify(value);
     } else {
+      const generationConfig = applyThinkingConfig({
+        maxOutputTokens: 8192,
+        responseMimeType: 'application/json',
+        responseJsonSchema: responseSchema,
+        mediaResolution: generateContentMediaResolution(croppedRegion.mimeType),
+        ...(clientConfig.abortSignal ? { abortSignal: clientConfig.abortSignal } : {}),
+      }, clientConfig.model as GeminiModel, clientConfig.thinkingConfig);
       const genAI = getGenAIClient(clientConfig.apiKey, {
         baseUrl: clientConfig.baseUrl,
         headers: clientConfig.headers,
@@ -401,6 +396,7 @@ export async function executeReOcrRegion(
       },
       memoryUpdate: {
         extractedFields: acceptedFields,
+        fieldReviews: fieldReviews(simulatedFields),
         confidence: updatedReadiness.averageConfidence,
         processingHistoryItem: {
           type: 'function_call',
@@ -421,7 +417,13 @@ export async function executeReOcrRegion(
   } catch (error) {
     // Surface API-level failures so the agent loop stops (terminal) or backs off
     // and retries (transient) instead of looping against the endpoint (H-17).
-    if (isFatalGeminiError(error) || isRetryableGeminiError(error)) {
+    if (
+      clientConfig.abortSignal?.aborted
+      || isGeminiCostLimitError(error)
+      || isFatalGeminiError(error)
+      || isRetryableGeminiError(error)
+      || (error instanceof Error && (error.name === 'AbortError' || error.name === 'ProviderApiError'))
+    ) {
       throw error;
     }
     return {
@@ -434,7 +436,7 @@ export async function executeReOcrRegion(
 /**
  * Extract and validate a batch of fields.
  */
-export async function executeExtractFieldsBatch(
+export function executeExtractFieldsBatch(
   args: Record<string, unknown>,
   _fileData: string,
   _mimeType: string,
@@ -450,7 +452,7 @@ export async function executeExtractFieldsBatch(
       extractedFields: simulatedFields,
     });
 
-    return {
+    return Promise.resolve({
       success: true,
       data: {
         fieldCount: Object.keys(acceptedFields).length,
@@ -460,6 +462,7 @@ export async function executeExtractFieldsBatch(
       },
       memoryUpdate: {
         extractedFields: acceptedFields,
+        fieldReviews: fieldReviews(simulatedFields),
         confidence: readiness.averageConfidence,
         processingHistoryItem: {
           type: 'function_call',
@@ -476,19 +479,19 @@ export async function executeExtractFieldsBatch(
           timestamp: Date.now(),
         }
       }
-    };
+    });
   } catch (error) {
-    return {
+    return Promise.resolve({
       success: false,
       error: error instanceof Error ? error.message : 'Batch field extraction failed',
-    };
+    });
   }
 }
 
 /**
  * Analyze document structure
  */
-export async function executeAnalyzeDocumentStructure(
+export function executeAnalyzeDocumentStructure(
   args: Record<string, unknown>,
   _fileData: string,
   _mimeType: string,
@@ -509,7 +512,7 @@ export async function executeAnalyzeDocumentStructure(
       specialFeatures: extractSpecialFeatures(layout_analysis),
     };
 
-    return {
+    return Promise.resolve({
       success: true,
       data: {
         document_type,
@@ -531,12 +534,12 @@ export async function executeAnalyzeDocumentStructure(
           timestamp: Date.now(),
         }
       }
-    };
+    });
   } catch (error) {
-    return {
+    return Promise.resolve({
       success: false,
       error: error instanceof Error ? error.message : 'Document analysis failed',
-    };
+    });
   }
 }
 
@@ -571,6 +574,32 @@ function parseNumeric(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** Parse supported numeric dates without depending on host locale or Date.parse. */
+function dateCandidates(value: string): number[] {
+  const iso = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
+  const numeric = /^(\d{2})([/-])(\d{2})\2(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
+  if (!iso && !numeric) return [];
+  const year = Number(iso?.[1] ?? numeric?.[4]);
+  const first = Number(iso?.[2] ?? numeric?.[1]);
+  const second = Number(iso?.[3] ?? numeric?.[3]);
+  const hour = Number(iso?.[4] ?? numeric?.[5] ?? 0);
+  const minute = Number(iso?.[5] ?? numeric?.[6] ?? 0);
+  const seconds = Number(iso?.[6] ?? numeric?.[7] ?? 0);
+  if (hour > 23 || minute > 59 || seconds > 59) return [];
+  const pairs = iso ? [[first, second]] : [[first, second], [second, first]];
+  const candidates: number[] = [];
+  for (const [month, day] of pairs) {
+    if (month < 1 || month > 12 || day < 1 || day > 31) continue;
+    const date = new Date(0);
+    date.setUTCFullYear(year, month - 1, day);
+    date.setUTCHours(hour, minute, seconds, 0);
+    if (date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day) {
+      candidates.push(date.getTime());
+    }
+  }
+  return [...new Set(candidates)];
+}
+
 /**
  * Validate field value based on validation rule
  */
@@ -591,10 +620,10 @@ function validateFieldValue(value: string, rule: string): { isValid: boolean; me
       };
     }
     case 'date': {
-      const dateRegex = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$|^\d{2}\/\d{2}\/\d{4}([ T]\d{2}:\d{2}(:\d{2})?)?$|^\d{2}-\d{2}-\d{4}([ T]\d{2}:\d{2}(:\d{2})?)?$/;
+      const isValid = dateCandidates(value).length > 0;
       return {
-        isValid: dateRegex.test(value),
-        message: dateRegex.test(value) ? 'Valid date format' : 'Invalid date format',
+        isValid,
+        message: isValid ? 'Valid date' : 'Invalid date or time',
       };
     }
     case 'currency': {
@@ -636,13 +665,28 @@ function inferValidationRule(fieldName: string): string | undefined {
   return undefined;
 }
 
-function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFields'][string]>) {
+function fieldReviews(
+  fields: Record<string, AgentMemory['extractedFields'][string]>,
+): NonNullable<AgentMemoryUpdate['fieldReviews']> {
+  return Object.fromEntries(Object.entries(fields).map(([name, field]) => [name, {
+    value: field.value,
+    isValid: field.isValid !== false,
+    validationMessage: field.validationMessage,
+  }]));
+}
+
+function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFields'][string]>): void {
   const reviewMemory = {
     extractedFields: fields,
   } as Readonly<AgentMemory>;
 
   for (const [fieldName, field] of Object.entries(fields)) {
-    const formatResult = validateFieldFormat(field.value, fieldName);
+    const explicitRule = field.validation_rule
+      ? validateFieldValue(field.value, field.validation_rule)
+      : undefined;
+    const formatResult = explicitRule?.isValid === false
+      ? explicitRule
+      : validateFieldFormat(field.value, fieldName);
     const consistencyResult = validateFieldConsistency(field.value, fieldName, reviewMemory);
     const crossReferenceResult = validateFieldCrossReference(field.value, fieldName, reviewMemory);
 
@@ -656,10 +700,10 @@ function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFie
 
     fields[fieldName] = {
       ...field,
-      isValid: failedReview ? false : field.isValid ?? true,
+      isValid: failedReview === null,
       validationMessage: failedReview
         ? failedReview.message
-        : field.validationMessage || formatResult.message,
+        : formatResult.message,
     };
   }
 }
@@ -686,28 +730,33 @@ function validateFieldFormat(value: string, fieldName: string): { isValid: boole
  * Validate field consistency with other fields
  */
 function validateFieldConsistency(value: string, fieldName: string, memory: Readonly<AgentMemory>): { isValid: boolean; message: string } {
-  // Check consistency with other extracted fields
-  const existingFields = memory.extractedFields;
-  
-  // Example: Check if total matches sum of line items. Only numeric line-item
-  // fields participate — a textual "line_items" blob parses to null and is
-  // skipped instead of being coerced to 0 (audit A-14).
-  if (fieldName.toLowerCase().includes('total')) {
-    const lineItems = Object.entries(existingFields)
-      .filter(([key]) => key.toLowerCase().includes('item') || key.toLowerCase().includes('line'))
-      .map(([, field]) => parseNumeric(field.value))
-      .filter((amount): amount is number => amount !== null);
-    const extractedTotal = parseNumeric(value);
-
-    if (lineItems.length > 0 && extractedTotal !== null) {
-      const calculatedTotal = lineItems.reduce((sum, item) => sum + item, 0);
-      const isConsistent = Math.abs(calculatedTotal - extractedTotal) < 0.01;
-
-      return {
-        isValid: isConsistent,
-        message: isConsistent ? 'Total matches sum of line items' : 'Total does not match sum of line items',
-      };
-    }
+  // A grand total may include tax, shipping, discounts, or adjustments not yet
+  // extracted. Only a subtotal with an explicitly complete set of indexed
+  // item amounts can support a deterministic sum check. Descriptions and
+  // quantities containing digits are never interpreted as monetary amounts.
+  if (fieldName !== 'subtotal_amount' && fieldName !== 'subtotal') {
+    return { isValid: true, message: 'Consistency validation passed' };
+  }
+  const fields = memory.extractedFields;
+  const rawCount = fields.line_item_count ?? fields.line_items_count ?? fields.item_count;
+  const count = rawCount ? parseNumeric(rawCount.value) : null;
+  if (count === null || !Number.isInteger(count) || count < 1 || count > 1000) {
+    return { isValid: true, message: 'Item completeness is not established' };
+  }
+  const items = new Map<number, number>();
+  for (const [name, field] of Object.entries(fields)) {
+    const match = /^(?:line_)?item_(\d+)_(?:amount|total)$/.exec(name);
+    if (!match) continue;
+    const index = Number(match[1]);
+    const amount = parseNumeric(field.value);
+    if (amount === null || items.has(index)) return { isValid: true, message: 'Item amounts are ambiguous' };
+    items.set(index, amount);
+  }
+  const subtotal = parseNumeric(value);
+  if (subtotal !== null && items.size === count && Array.from({ length: count }, (_, index) => items.has(index + 1)).every(Boolean)) {
+    const sum = [...items.values()].reduce((total, amount) => total + amount, 0);
+    const isValid = Math.abs(sum - subtotal) < 0.05;
+    return { isValid, message: isValid ? 'Subtotal matches item amounts' : 'Subtotal does not match the complete item amounts' };
   }
 
   return { isValid: true, message: 'Consistency validation passed' };
@@ -722,45 +771,21 @@ function validateFieldCrossReference(value: string, fieldName: string, memory: R
 
   // Date Cross-References
   if (lowerFieldName.includes('date')) {
-    const currentDate = new Date(value);
-    if (isNaN(currentDate.getTime())) {
-      return { isValid: false, message: 'Invalid date format' };
+    const currentDates = dateCandidates(value);
+    if (currentDates.length === 0) {
+      return { isValid: false, message: 'Invalid date or time' };
     }
 
     // Check Due Date vs Invoice Date
     if (lowerFieldName.includes('due')) {
       const invoiceDateField = Object.entries(existingFields).find(([key]) => key.toLowerCase().includes('invoice') && key.toLowerCase().includes('date'));
       if (invoiceDateField) {
-        const invoiceDate = new Date(invoiceDateField[1].value);
-        if (!isNaN(invoiceDate.getTime()) && currentDate < invoiceDate) {
+        const invoiceDates = dateCandidates(invoiceDateField[1].value);
+        // Ambiguous numeric dates are not guessed: reject only when no
+        // supported interpretation can put the due date after the invoice.
+        if (invoiceDates.length > 0 && Math.max(...currentDates) < Math.min(...invoiceDates)) {
           return { isValid: false, message: 'Due date cannot be before invoice date' };
         }
-      }
-    }
-  }
-
-  // Arithmetic Cross-References (Total vs Subtotal + Tax). Components that do not
-  // parse to a number are ignored rather than coerced to NaN/0, so the check only
-  // fires when there is genuinely comparable data (audit A-14).
-  if (lowerFieldName === 'total' || lowerFieldName === 'total_amount' || lowerFieldName === 'grand_total') {
-    let subtotal: number | null = null;
-    let tax: number | null = null;
-
-    for (const [key, field] of Object.entries(existingFields)) {
-      const k = key.toLowerCase();
-      if (k.includes('subtotal') || k.includes('net_amount')) {
-        subtotal = parseNumeric(field.value);
-      }
-      if (k.includes('tax') || k.includes('vat')) {
-        tax = parseNumeric(field.value);
-      }
-    }
-
-    const extractedTotal = parseNumeric(value);
-    if (extractedTotal !== null && (subtotal !== null || tax !== null)) {
-      const calculatedTotal = (subtotal ?? 0) + (tax ?? 0);
-      if (Math.abs(calculatedTotal - extractedTotal) > 0.05) { // 0.05 tolerance for rounding
-        return { isValid: false, message: `Total (${extractedTotal}) does not match Subtotal + Tax (${calculatedTotal.toFixed(2)})` };
       }
     }
   }
@@ -785,5 +810,7 @@ function determineComplexity(layoutAnalysis: Record<string, unknown>): 'low' | '
 function extractSpecialFeatures(layoutAnalysis: Record<string, unknown>): string[] {
   // Extract special features from layout analysis
   const features = layoutAnalysis?.specialFeatures;
-  return Array.isArray(features) ? features : [];
+  return Array.isArray(features)
+    ? features.filter((feature): feature is string => typeof feature === 'string')
+    : [];
 }

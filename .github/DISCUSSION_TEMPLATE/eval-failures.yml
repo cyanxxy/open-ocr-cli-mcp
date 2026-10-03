@@ -18,7 +18,7 @@ body:
     attributes:
       label: Model
       description: Which model produced the failure?
-      placeholder: gemini-3-flash-preview
+      placeholder: gemini / gemini-3.8-flash
     validations:
       required: true
   - type: textarea

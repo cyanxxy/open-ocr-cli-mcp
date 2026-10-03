@@ -64,6 +64,17 @@ describe('evaluateAgentCompletion — runtime stop decision (C-03)', () => {
     expect(result.reason).toBe('no-fields');
   });
 
+  it('does not count an invalid required field as completed coverage', () => {
+    const data = snapshot('resume', {
+      full_name: { value: 'Example Person', confidence: 0.99, isValid: true },
+      email: { value: 'invalid', confidence: 0.99, isValid: false },
+    });
+    expect(getAgentReadiness(data).missingRequiredFields).toEqual(['email']);
+    expect(evaluateAgentCompletion(data, 0.99, 0.8)).toEqual({
+      complete: false, reason: 'missing-required-fields',
+    });
+  });
+
   it('is complete when an unknown-schema doc has a valid field above the threshold', () => {
     const result = evaluateAgentCompletion(
       snapshot('unknown', { note: { value: 'x', confidence: 0.9, isValid: true } }),
@@ -86,6 +97,15 @@ describe('agentSchema', () => {
     expect(normalizeAgentFieldName('business card', 'email_address')).toBe('email');
     expect(normalizeAgentFieldName('invoice', 'grand-total')).toBe('total_amount');
     expect(normalizeAgentFieldName('resume', 'candidate_name')).toBe('full_name');
+  });
+
+  it.each([
+    ['constructor', 'constructor'], ['__proto__', 'proto'], ['toString', 'tostring'],
+  ])('treats prototype name %s as ordinary text', (input, normalized) => {
+    expect(normalizeAgentDocumentType(input)).toBe(normalized);
+    expect(getAgentDocumentSchema(input)).toBeNull();
+    expect(normalizeAgentFieldName('invoice', input)).toBe(normalized);
+    expect(normalizeAgentFieldName(input, input)).toBe(normalized);
   });
 
   it('reports missing required fields for schema-backed document types', () => {

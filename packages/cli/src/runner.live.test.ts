@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -31,7 +31,7 @@ import { discoverInputSet } from './inputs';
 import { runBatch } from './runner';
 import { BatchOutputLock } from './output';
 import { cliExitCode } from './errors';
-import { toOcrRunResult } from './protocol';
+import { toOcrRunResult, type OcrJobEvent } from './protocol';
 import { recordGeminiUsage } from '@open-ocr/engine/gemini/usage';
 import type { GeminiClientConfig } from '@open-ocr/engine/gemini/types';
 
@@ -67,6 +67,53 @@ afterEach(async () => {
 });
 
 describe('CLI live batch orchestration', () => {
+  it.each([
+    { name: 'single input on stdout', count: 1, output: false, inline: true },
+    { name: 'single input with output', count: 1, output: true, inline: false },
+    { name: 'batch with default output', count: 2, output: false, inline: false },
+  ])('delivers readable JSONL content for $name', async ({ count, output, inline }) => {
+    for (let index = 0; index < count; index += 1) {
+      await writeFile(path.join(directory, `${index}.jpg`), JPEG_BYTES);
+    }
+    const options = resolveCliOptions({
+      jsonl: true,
+      quiet: true,
+      ...(output ? { output: outputDirectory } : {}),
+    }, {}, directory);
+    const inputs = await discoverInputs(['*.jpg'], options);
+    const events: OcrJobEvent[] = [];
+    const writeStdout = vi.fn();
+
+    const summary = await runBatch(inputs, options, {
+      abortController: new AbortController(),
+      eventSink: (event) => { events.push(event); },
+      writeStdout,
+      writeStderr: () => undefined,
+    });
+
+    expect(summary.succeeded).toBe(count);
+    expect(writeStdout).not.toHaveBeenCalled();
+    const completed = events.filter((event) => event.type === 'document.completed');
+    expect(completed).toHaveLength(count);
+    const final = events.at(-1);
+    expect(final?.type).toBe('run.completed');
+    expect(final?.result?.documents).toHaveLength(count);
+    for (const event of completed) {
+      const document = event.document!;
+      const finalDocument = final?.result?.documents.find((item) => item.documentId === document.documentId);
+      expect(finalDocument).toEqual(document);
+      if (inline) {
+        expect(document.content?.markdown).toContain('Hello from OCR');
+        expect(document.artifacts).toEqual([]);
+      } else {
+        expect(document.content).toBeUndefined();
+        expect(document.artifacts).toHaveLength(1);
+        expect(await readFile(document.artifacts[0].path, 'utf8')).toContain('Hello from OCR');
+      }
+    }
+    if (inline) expect(await readdir(directory)).toEqual(['0.jpg']);
+  });
+
   it('rejects concurrent ownership before spending Gemini requests', async () => {
     await writeFile(path.join(directory, 'one.jpg'), JPEG_BYTES);
     await writeFile(path.join(directory, 'two.jpg'), JPEG_BYTES);
@@ -256,7 +303,7 @@ describe('CLI live batch orchestration', () => {
     expect(mockExtractStructuredDataFromFile).toHaveBeenCalledWith(
       expect.any(String),
       'image/jpeg',
-      expect.objectContaining({ model: 'gemini-3.5-flash' }),
+      expect.objectContaining({ model: 'gemini-3.8-flash' }),
       schema,
       undefined,
       expect.objectContaining({ maxTokens: 32768 }),
@@ -320,7 +367,7 @@ describe('CLI live batch orchestration', () => {
     expect(await readFile(path.join(outputDirectory, 'invoice.md'), 'utf8')).toContain('INV-42');
   });
 
-  it('refuses CSV from a record-shaped preset before spending a request', async () => {
+  it('refuses CSV from a record-shaped preset before spending a request', () => {
     // `business-card` extracts one record, so it can never produce rows. The
     // refusal has to happen at option resolution, not after a billed call.
     expect(() => resolveCliOptions(

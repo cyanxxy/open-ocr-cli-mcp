@@ -4,7 +4,7 @@ import path from 'node:path';
 import { GATEWAY_IDS, GEMINI_MODELS, PROVIDER_IDS } from '@open-ocr/engine/providers';
 import { batchMetadataError, CliExitError } from './errors';
 import { asRecord, isIsoTimestamp, isOneOf, parseBatchLockOwner } from './jsonValidation';
-import { parseCliManifest } from './manifest';
+import { artifactFileExists, parseCliManifest } from './manifest';
 import {
   CLI_MODES,
   type BatchSummary,
@@ -311,7 +311,7 @@ export async function inspectBatchStatus(
   const entries = await Promise.all(Object.entries(manifest?.entries ?? {}).map(async ([source, entry]) => {
     const missingOutputFiles = (await Promise.all(entry.outputFiles.map(async (file) => ({
       file,
-      exists: await pathExists(file),
+      exists: await artifactFileExists(file),
     })))).filter(({ exists }) => !exists).map(({ file }) => file);
     // Every real key is `input.absolutePath`, so anything relative is a
     // synthetic key rather than a path that has gone missing.

@@ -1,5 +1,5 @@
 {
-  "model": "gemini-3.5-flash",
+  "model": "gemini-3.8-flash",
   "thinking": "MEDIUM",
   "concurrency": 4,
   "retries": 3,

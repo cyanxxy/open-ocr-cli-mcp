@@ -86,7 +86,7 @@ describe('interactive command menu', () => {
       'https://example.com/b',
       '--provider', 'muse',
       '--gateway', 'direct',
-      '--model', 'muse-spark-1.1',
+      '--model', 'muse-spark-1.3',
       '--thinking', 'medium',
       '--api-key-env', 'META_API_KEY',
       '--analysis', 'comparison',

@@ -22,7 +22,9 @@ try {
   const installDirectory = path.join(temporary, 'install');
   mkdirSync(installDirectory);
   writeFileSync(path.join(installDirectory, 'package.json'), '{"private":true}\n');
-  run('npm', ['install', path.join(temporary, tarballName)], installDirectory);
+  // Exercise consumers' declared Node support, not only whether the executable
+  // happens to run despite a transitive package's unsupported engine range.
+  run('npm', ['install', '--engine-strict', path.join(temporary, tarballName)], installDirectory);
   const npmMajor = Number.parseInt(run('npm', ['--version'], installDirectory), 10);
   if (npmMajor >= 11) {
     const pendingScripts = JSON.parse(
@@ -70,6 +72,17 @@ try {
     path.join(root, 'evals', 'corpus', 'raster', 'invoice.png'),
     '--provider',
     'kimi',
+    '--dry-run',
+    '--quiet',
+  ]);
+  // Parse a real PDF with the installed dependency, beyond the raster sniffing
+  // above. Regional PDF rendering is also exercised by the Node matrix tests.
+  run(executable, [
+    'extract',
+    path.join(root, 'evals', 'corpus', 'invoice.pdf'),
+    '--provider',
+    'gemini',
+    '--no-config',
     '--dry-run',
     '--quiet',
   ]);

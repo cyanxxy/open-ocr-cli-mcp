@@ -38,7 +38,7 @@ describe('selectModelStepsForReplay — exact transcript fidelity (C-02 / A-05 /
         signature: 'sig-abc',
         summary: [{ text: 'reasoning' }],
         server_metadata: { future_field: true },
-      } as InteractionStep,
+      },
       { type: 'function_call', id: 'call-1', name: 'analyze_document_structure', arguments: { a: 1 } },
     ];
     const replay = selectModelStepsForReplay(steps);
@@ -60,7 +60,7 @@ describe('selectModelStepsForReplay — exact transcript fidelity (C-02 / A-05 /
 
   it('rejects a function call without the current required id', () => {
     const steps: InteractionStep[] = [
-      { type: 'function_call', name: 'extract_fields_batch', arguments: {} } as InteractionStep,
+      { type: 'function_call', name: 'extract_fields_batch', arguments: {} },
     ];
     expect(() => extractInteractionFunctionCalls(steps)).toThrow('without an ID');
   });
@@ -95,7 +95,7 @@ describe('selectModelStepsForReplay — exact transcript fidelity (C-02 / A-05 /
 
   it('does not rewrite forward-compatible step shapes', () => {
     const steps: InteractionStep[] = [
-      { type: 'future_server_step', opaque: { value: 1 } } as InteractionStep,
+      { type: 'future_server_step', opaque: { value: 1 } },
     ];
     const replay = selectModelStepsForReplay(steps);
     expect(replay).toEqual(steps);
@@ -162,6 +162,7 @@ describe('runModelInteraction', () => {
       { type: 'model_output', content: [{ type: 'text', text: 'Finished' }] },
     ];
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'interaction.created', interaction: { id: 'interaction-stream', status: 'in_progress' } };
       yield { event_type: 'step.start', index: 0, step: { type: 'thought', summary: [] } };
       yield { event_type: 'step.delta', index: 0, delta: { type: 'thought_summary', content: { type: 'text', text: 'Inspect ' } } };
@@ -216,6 +217,7 @@ describe('runModelInteraction', () => {
 
   it('preserves output_text supplied only by the terminal streaming event', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'interaction.created', interaction: { id: 'terminal-text', status: 'in_progress' } };
       yield {
         event_type: 'interaction.completed',
@@ -239,6 +241,7 @@ describe('runModelInteraction', () => {
 
   it('records reported streaming usage before surfacing a terminal stream error', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'interaction.created', interaction: { id: 'failed-stream', status: 'in_progress' } };
       yield {
         event_type: 'step.stop',
@@ -262,6 +265,7 @@ describe('runModelInteraction', () => {
 
   it('sums per-step usage when a stream omits cumulative usage', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'interaction.created', interaction: { id: 'step-usage-stream', status: 'in_progress' } };
       yield {
         event_type: 'step.stop',
@@ -300,6 +304,7 @@ describe('runModelInteraction', () => {
 
   it('keeps a delta channel ID stable when a gateway emits deltas before interaction.created', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } };
       yield { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'Early ' } };
       yield { event_type: 'interaction.created', interaction: { id: 'late-created-id', status: 'in_progress' } };
@@ -329,6 +334,7 @@ describe('runModelInteraction', () => {
 
   it('rejects a stream that ends before interaction.completed', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
       yield { event_type: 'interaction.created', interaction: { id: 'truncated', status: 'in_progress' } };
       yield { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } };
       yield { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'partial' } };

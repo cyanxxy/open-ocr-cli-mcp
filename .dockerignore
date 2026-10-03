@@ -10,3 +10,5 @@ evals/cache
 evals/reports/runs
 *.tgz
 .env*
+.open-ocr-results
+open-ocr-output

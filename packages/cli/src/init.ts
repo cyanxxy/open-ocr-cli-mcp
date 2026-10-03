@@ -13,6 +13,7 @@ import {
   PROVIDER_IDS,
   PROVIDER_PROFILES,
   createChatCompletion,
+  createProviderExecutionContext,
   providerDefaultApiKeyEnv,
   providerDefaultBaseUrl,
   providerDefaultModel,
@@ -184,6 +185,8 @@ async function writeConfig(configPath: string, config: CliConfigFile): Promise<v
 }
 
 export async function validateProviderCredentials(config: ProviderRuntimeConfig): Promise<void> {
+  const runtime = config.runtime ?? createProviderExecutionContext();
+  runtime.configureUsagePricing(config);
   // Credential validation proves endpoint access; it is not an extraction
   // quality evaluation. Use the lowest supported effort so modern reasoning
   // models cannot exhaust this small probe response before returning `OK`.
@@ -197,7 +200,7 @@ export async function validateProviderCredentials(config: ProviderRuntimeConfig)
         headers: config.gateway === 'cloudflare' ? providerRequestHeaders(config) : undefined,
       },
     );
-    await waitForGeminiRequestSlot();
+    await waitForGeminiRequestSlot(undefined, runtime);
     const response = await client.models.generateContent({
       model: config.model,
       contents: 'Reply with OK.',
@@ -207,11 +210,12 @@ export async function validateProviderCredentials(config: ProviderRuntimeConfig)
         { level: probeThinkingLevel },
       ),
     });
-    recordGeminiUsage(response, config.model as GeminiModel);
+    recordGeminiUsage(response, config.model as GeminiModel, runtime);
     return;
   }
   await createChatCompletion({
     ...config,
+    runtime,
     thinkingConfig: { level: probeThinkingLevel },
   }, {
     messages: [{ role: 'user', content: 'Reply with OK.' }],
@@ -424,7 +428,7 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
           cloudflareProvider,
         });
         if (runtime.validateCredentials) {
-          await runtime.validateCredentials(apiKey, model as GeminiModel);
+          await runtime.validateCredentials(apiKey, model);
         } else {
           await validateProviderCredentials({
             provider,

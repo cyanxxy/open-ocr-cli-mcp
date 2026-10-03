@@ -1,4 +1,4 @@
 interface:
-  display_name: "Open OCR"
-  short_description: "Extract documents with the Open OCR CLI"
-  default_prompt: "Use $open-ocr to extract this document safely with reference-first output."
+  display_name: "Open OCR CLI + MCP"
+  short_description: "Extract document text and fields with CLI or MCP"
+  default_prompt: "Use $open-ocr to validate the inputs, extract this document, and return artifact paths and document statuses."

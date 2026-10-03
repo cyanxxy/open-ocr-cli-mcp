@@ -1,5 +1,5 @@
-name: Open OCR CLI
-description: Extract text or structured data from images and PDFs in GitHub Actions.
+name: Open OCR CLI + MCP
+description: Agent-first OCR CLI and MCP server; extract images and PDFs in GitHub Actions.
 author: Open OCR CLI contributors
 branding:
   icon: file-text

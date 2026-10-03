@@ -29,7 +29,7 @@ API keys.
   - open-ocr-cli version: [e.g. `open-ocr-cli --version`]
   - Node.js version: [e.g. 22.13.0]
   - OS: [e.g. macOS 15, Ubuntu 24.04, Windows 11]
-  - Provider and model: [e.g. gemini / gemini-3.5-flash]
+  - Provider and model: [e.g. gemini / gemini-3.8-flash]
   - Install method: [npm / Docker / GitHub Action / Homebrew]
 
 **Additional context**

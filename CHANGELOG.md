@@ -1,5 +1,46 @@
 # Changelog
 
+## 4.1.0 - 2026-10-03
+
+### Added
+
+- Current Gemini Flash, Meta Muse Spark, and OpenRouter model catalogs with
+  model-specific reasoning controls and paid-tier cost estimates.
+- Bounded MCP artifact reads for clients without filesystem tools, using SDK 2.3.0.
+- Automatic tagged releases and npm publication after successful CI for a
+  merged version bump on `main`.
+
+### Fixed
+
+- Resume ownership after failed retries, output file/directory collisions, and
+  repeated custom-schema IDs in long-lived MCP processes.
+- Agent field correction/validation, active deadlines, and propagation of
+  region re-OCR failures while preserving useful partial results.
+- Calendar-date and invoice validation, plus safe handling of prototype-named
+  fields such as `constructor`.
+- Native Gemini custom pricing, per-run cost accounting, and typed URL errors.
+- Single-file JSONL extraction includes its content when no artifact is saved.
+- Evaluation runs isolate case usage and enforce paired nonnegative price
+  overrides, including native Gemini agent continuations.
+- Evaluation diagnostics redact configured credentials before logging or
+  persisting errors and never echo a misplaced credential selector.
+- Evaluation matrix path validation, cancellation, worker cleanup, and missing
+  report failures.
+- Malformed template values, incomplete provider responses, and oversized or
+  cancelled input discovery.
+- Dependency advisories and source CLI/eval execution in restricted sandboxes.
+- Pin PDF.js 5.5.207 to preserve Node 20.19 support and avoid the affected 5.6
+  releases; verify engine-strict package installation and real PDFs on Node 20.
+
+### Changed
+
+- Repository renamed to `open-ocr-cli-mcp`; npm package and executable remain
+  `open-ocr-cli`. READMEs and Codex/Claude Code integration guidance rewritten.
+- Corrected documentation, skill pagination/config guidance, CLI/MCP help,
+  evaluation setup, credential routing/retention, and release instructions.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.0.0...v4.1.0)
+
 ## 4.0.0 - 2026-09-07
 
 Agent-facing contract changes. Protocol v2 schemas, the `run`/MCP surfaces,
@@ -65,7 +106,7 @@ branch.
   `capabilities` alike; a test guards the schema against drift.
 - Protocol requests no longer round-trip validated numbers through strings.
 
-[Full comparison](https://github.com/cyanxxy/open-ocr-cli/compare/v3.0.1...v4.0.0)
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v3.0.1...v4.0.0)
 
 ## 3.0.1 - 2026-08-14
 
@@ -123,7 +164,7 @@ machine-facing output, MCP, retry, packaging, and release contracts.
   removed web app; rotate any key entered into a deployment built from an older
   revision.
 
-[Full comparison](https://github.com/cyanxxy/open-ocr-cli/compare/v3.0.0...v3.0.1)
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v3.0.0...v3.0.1)
 
 ## 3.0.0 - 2026-08-11
 
@@ -190,4 +231,4 @@ machine-facing output, MCP, retry, packaging, and release contracts.
 - Upgrades PDF.js and transitive dependencies to patched versions so the
   release security gate reports no known vulnerabilities.
 
-[Full comparison](https://github.com/cyanxxy/open-ocr-cli/compare/v2.7.0...v3.0.0)
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v2.7.0...v3.0.0)

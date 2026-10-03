@@ -108,7 +108,7 @@ describe('secure public URL fetching', () => {
     pinnedLookup('documents.example', {}, callback);
     expect(callback).toHaveBeenCalledWith(null, '93.184.216.34', 4);
     expect((requestOptions[0].headers as Record<string, string>)['User-Agent'])
-      .toBe('open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli)');
+      .toBe('open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli-mcp)');
     const createdRequest = mocks.request.mock.results[0].value as { setTimeout: ReturnType<typeof vi.fn> };
     expect(createdRequest.setTimeout).toHaveBeenCalledWith(30_000, expect.any(Function));
   });

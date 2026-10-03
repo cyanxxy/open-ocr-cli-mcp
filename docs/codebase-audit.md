@@ -1,48 +1,139 @@
-# Agent integration audit — 2026-09-07
+# Codebase and provider audit — 2026-10-03
 
-Scope: shared extraction engine, CLI and MCP adapters, request/result schemas,
-batch lifecycle and persistence, provider execution, agent progress, packaging,
-evaluation tooling, and public integration guidance. Existing uncommitted
-contract changes were preserved and used as the starting point. The release was
-then reconciled with upstream 3.0.1, retaining its engine restructure, retry,
-partial-result, packaging, and CLI fixes.
+Scope: every implemented provider profile, shared extraction/agent tools, CLI
+input/output/resume behavior, machine schemas, MCP, dependencies, agent setup,
+packaging, evaluation tooling, and public documentation. Three parallel agents
+performed provider, MCP, and CLI/core reviews, followed by cross-review.
 
-## Fixed
+## Verified upstream contracts
 
-| Finding | Change and evidence |
+| Surface | Verified source and implemented decision |
 | --- | --- |
-| The browser checkout contradicted the documented CLI/engine architecture | Relocated shared code to private `packages/engine`, changed consumers to workspace imports, removed the React host and its deployment dependencies, and switched tests/typechecks to Node without DOM libraries. |
-| Logging could corrupt machine stdout | All logger levels use stderr, including development and enabled production logging. A regression test checks stdout stays untouched. |
-| MCP discovery shared process-specific information through public caching | Discovery is privately cacheable; version-only catalogs remain public. Transport tests assert the distinction. |
-| MCP progress could start above zero or exceed total | Start at zero and cap progress at the document total; verify monotonic bounded notifications. |
-| Tool annotations understated resume side effects | Extraction tools declare that they may replace their own stale artifacts. |
-| Cancellation during a document-start event could still launch extraction | Relay an already-aborted parent signal and check before invoking the extractor. Regression test verifies no extraction call occurs. |
-| A worker failure could release the output lock while sibling workers remained active | Abort the pool and join all workers before propagating failure. Regression test checks lock lifetime while a sibling is finishing. |
-| An undefined rejection could appear to be successful agent completion | Track rejection independently of the rejection value; test undefined, null, and string reasons. |
-| Bundled engine packaging needed verification | Explicitly bundle the private engine and Gemini SDK, retain the upstream fetch-based Gemini bundle, and exercise the installed tarball's lazy MCP entry point. |
-| Build/release/docs still described a browser product | Update CI artifacts, Docker workspace manifests, release version checks, contributor/security guidance, and the distributed OCR skill. |
+| Gemini | [Model catalog](https://ai.google.dev/gemini-api/docs/models) and [pricing](https://ai.google.dev/gemini-api/docs/pricing): add 3.8/3.7/3.6 Flash and 3.5 Flash-Lite; default to 3.8 Flash; enforce known thinking levels and time-bound published pricing. |
+| Kimi | [Models](https://platform.kimi.ai/docs/models), [pricing](https://platform.kimi.ai/docs/pricing/chat), [caching](https://platform.kimi.ai/docs/guide/context-caching): retain K3, K2.7 Code/highspeed, K2.6; distinguish model reasoning controls and direct/router cached pricing. |
+| Meta Muse | [Models](https://dev.meta.ai/docs/models), [pricing](https://dev.meta.ai/docs/pricing-rate-limits): add Spark 1.3/1.2; default to Standard 1.3; add known prices and model-specific MAX validation. Contributor variants require a data-sharing choice and are not curated recommendations. |
+| OpenRouter | [Published catalog](https://openrouter.ai/api/v1/models) and [reasoning guide](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens): add verified Gemini, Muse, GPT-6, and Claude routes; constrain known model reasoning; preserve actual reported cost. |
+| OpenAI-compatible | Endpoint/model-dependent capabilities remain explicit. Require terminal completion evidence; do not apply unrelated named-provider prices to arbitrary model IDs. |
+| Cloudflare | Existing native/custom-provider routes and BYOK remain; [authentication](https://developers.cloudflare.com/ai-gateway/configuration/authentication/) and [BYOK](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/) are separate from the upstream model contract. |
+| MCP | [Published revision 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28), [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog), [SDK 2.3.0 release](https://github.com/modelcontextprotocol/typescript-sdk/releases/tag/v2.3.0). Keep one modern stdio contract; use SDK lifecycle and real SDK client validation. |
+| Claude Code | [MCP runtimes](https://code.claude.com/docs/en/mcp#mcp-client-runtimes): document v2 host runtime and explicit stdio protocol probing. Local installed CLI: 2.1.284; no paid/model session run. |
+| Codex | [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and [skills](https://learn.chatgpt.com/docs/build-skills): document environment forwarding, cwd, timeouts, and portable CLI/skill routing. Local installed CLI: 0.159.0; exact MCP revision interoperability unverified. |
+
+Model discovery is a curated snapshot, not a claim that every model is available
+to every account. `capabilities --json` is the runtime source of truth. Direct
+provider and router prices may differ. Google promotional pricing has an
+explicit UTC expiry instead of remaining discounted indefinitely.
+
+## Changes
+
+- Add current model IDs/defaults, known reasoning constraints, prices, and
+  fail-closed transport completion handling.
+- Apply custom token prices to native Gemini usage and isolate request/cost
+  accounting per execution, including web extraction and credential probes.
+  Preserve typed cost-limit and cancellation errors through URL extraction.
+- Preserve stale artifact ownership after failed resume attempts. Reject
+  directories, file/parent collisions, and optional-output collisions before
+  paid extraction. Resume/status require actual artifact files.
+- Isolate custom-schema validators so repeated `$id` values work in long-lived
+  MCP processes and schemas can be garbage-collected.
+- Upgrade MCP to SDK 2.3.0, bound input complexity, improve cancellation/progress
+  handling, and support bounded reading of issued artifact files through
+  `ocr_read_artifact` and resources.
+- Reject malformed nested template values instead of producing `[object Object]`
+  or silently dropping malformed rows.
+- Preserve valid lower-confidence field corrections and runtime validation
+  feedback. Continue useful same-field refinements, reject invalid confidence,
+  and preserve partial output when active agent deadlines expire. Propagate
+  region re-OCR cost/cancellation failures and use the selected provider's
+  reasoning contract.
+- Validate actual calendar dates without locale-dependent parsing; avoid
+  rejecting invoice totals when adjustments or item completeness are unknown.
+  Treat prototype-named fields as data in schema aliases and memory updates.
+- Validate evaluation matrix identifiers before writing reports; forward
+  cancellation, join/terminate workers, stop scheduling, and fail missing reports.
+- Replace vulnerable glob dependencies with streaming discovery, propagate
+  cancellation, bound oversized expansions before MIME inspection, and avoid
+  rescanning identical inputs.
+- Update vulnerable dependencies; keep the declared Node support range.
+- Make source CLI/eval scripts use `node --import tsx`, avoiding an unnecessary
+  IPC listener inside restricted agent environments. Isolate smoke-test caches.
+- Rename GitHub repository and local remote to `cyanxxy/open-ocr-cli-mcp`;
+  update metadata, workflow repository checks, source links, and skill branding.
+  The npm package/executable and container package retain their existing names.
+- Rewrite both READMEs, separate the detailed CLI reference, and refresh agent
+  integration instructions. Ignore default extraction output directories in Git.
 
 ## Verification
 
-- Typecheck: engine, CLI, and evaluation/tooling projects passed.
-- Tests: 51 files, 698 tests passed. Browser-only suites were removed with their host.
-- Coverage gate passed: 84.93% statements, 75.16% branches, 89.97% functions, 88.06% lines.
-- Lint: zero errors; 84 warnings remain in the retained code/test surface. They are not represented as fixed by this audit.
-- CLI build/help and install-from-tarball smoke passed.
-- Packaged MCP stdio discovery, tool catalog, capabilities, invalid stdin input, and shutdown passed using protocol frames against the SDK-backed server.
-- GitHub Action wrapper smoke and npm pack dry run passed.
-- 64 evaluation cases and the canary provider matrix validated without provider calls. Used `node --import tsx` because the sandbox blocks the tsx CLI's IPC listener.
-- Release version consistency and git diff whitespace checks passed.
+- All **805 tests in 56 files** pass on Node **20.19.0**, **22.13.0**, and
+  **24.19.0**.
+- Coverage gate passes: **86.04% statements**, **77.03% branches**,
+  **90.85% functions**, **89.10% lines**.
+- Full TypeScript checks and ESLint pass with no warnings.
+- npm dependency audit reports **zero known vulnerabilities**.
+- Evaluation corpus validation passes: **64 cases**, **one suite assertion**;
+  provider matrix dry run and release-version consistency checks pass.
+- CLI build/help, npm pack dry run, clean tarball installation (including the
+  official MCP SDK stdio client), and GitHub Action wrapper smokes pass.
+- Local README/documentation links resolve; `git diff --check` is clean.
 
-## Verification limits
+## Documentation review — second pass, 2026-10-03
 
-Provider behavior was exercised with mocks/local fixtures, not billed live OCR.
-The packaged transport smoke is a protocol harness, not a live Pi extension,
-Codex client, or Claude Agent SDK session. Those clients' exact MCP revision
-support remains unverified. Docker configuration was updated but a container
-build was not run. The server remains stdio-only with blocking calls and does
-not implement the optional MCP Tasks extension.
+Reviewed all 19 repository Markdown documents, including GitHub templates, the
+historical evaluation report, the source/generated skill, and ignored local
+`AGENTS.md`/`CLAUDE.md`. Compared command examples, settings, output, provider
+defaults, MCP metadata, evaluation setup, security guidance, and release steps
+against current code and official documentation.
 
-See [agent integration guidance](agent-integrations.md) for supported contracts
-and host-specific routing. This audit documents findings and checks; passing
-tests is not a claim that every possible defect has been eliminated.
+- Correct config/environment precedence, discovery exclusions, transient output
+  metadata, artifact pagination (`nextOffset`), previous-process resume access,
+  request thinking-level casing, credential defaults, provider routing/retention,
+  and current Codex skill locations.
+- Fix single-input `extract --jsonl` content loss: use inline content when no
+  artifacts are saved and references when output is persisted. Keep explicit
+  machine delivery authoritative.
+- Isolate evaluation usage per case/repetition, apply Gemini custom prices to
+  agent continuations, and reject incomplete, empty, negative, or non-finite
+  override rates before provider work.
+- Preserve historical quality reports and corpus data; dry runs are not new
+  model-quality evidence.
+
+Verification: **820 tests in 57 files** pass on Node **20.19.0**, **22.13.0**, and
+**24.19.0**. Typechecking and ESLint pass. Coverage passes at **86.10% statements**,
+**77.11% branches**, **90.85% functions**, and **89.16% lines**. Local links resolve
+across all 19 documents; complete protocol request examples pass CLI dry runs.
+The generated skill is synchronized. CLI build/help, clean tarball installation,
+official MCP SDK smoke, corpus validation, matrix dry run, and diff checks pass.
+
+## Release preparation — 4.1.0
+
+- Align all workspace, lockfile, and bundled engine dependency versions.
+- Release only the exact successful `main` CI commit that increases the version;
+  create an immutable tag and explicitly dispatch publication at that tag.
+  Preserve eligible CI runs, queue releases, fail closed on registry errors,
+  and keep partial GitHub releases as drafts until all surfaces are complete.
+- Remove credential-selector echoes and redact configured API/gateway keys,
+  including escaped opaque values, before logging or persisting eval errors.
+- Pin PDF.js to Node 20-compatible 5.5.207, outside the
+  [affected later 5.x range](https://github.com/advisories/GHSA-hq66-cqwq-w95j).
+  Add engine-strict installation and real PDF checks on the minimum runtime.
+
+Verification: 825 unit tests and 11 release-automation tests pass. Coverage passes
+at 86.12% statements and 77.16% branches. Full lint,
+typechecking, coverage, corpus validation, matrix dry run, pack inspection,
+clean Node 20/24 tarball installations, official MCP SDK smokes, and the GitHub
+Action wrapper pass. The npm audit reports zero known vulnerabilities. Workflow
+lint passes except for the installed linter's outdated schema rejecting the
+[documented `queue: max` property](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+
+## Limits
+
+Provider behavior uses deterministic fixtures and mocked/local transports;
+no billed live OCR or quality benchmark was run. The real MCP SDK client checks
+stdio interoperability, not an end-to-end Codex/Claude/Pi model session. The
+server is stdio-only, calls block until completion, and Tasks are not implemented.
+The audit itself did not publish a package or create a release tag. Publishing
+after the repository rename requires npm's trusted publisher to use the new
+repository name; see [release setup](releasing.md). The local Docker daemon was
+unavailable, so no container build was run locally. Passing checks establishes tested behavior, not
+absence of every possible defect.

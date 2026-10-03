@@ -4,7 +4,7 @@ import {
   createUserPrompt,
   executeFunctionCall,
 } from '../agentGemini';
-import { applyMemoryUpdate, createInitialMemory } from '../agentMemory';
+import { agentProgressFingerprint, applyMemoryUpdate, createInitialMemory } from '../agentMemory';
 import { evaluateAgentCompletion } from '../agentSchema';
 import { AGENT_FUNCTIONS } from '../agentTools';
 import type {
@@ -25,7 +25,7 @@ import {
 import { isProviderCostLimitError } from './requestPolicy';
 import { transientRetryDelayMs } from './retry';
 import type { ProviderRuntimeConfig } from './types';
-import { streamAgentOperation, waitForAbortableAgentDelay } from '../agentStepStream';
+import { createAgentDeadline, streamAgentOperation, waitForAbortableAgentDelay } from '../agentStepStream';
 
 const MAX_INNER_ROUNDS = 10;
 const MAX_TRANSIENT_RETRIES = 3;
@@ -290,85 +290,97 @@ export async function* providerAgentLoop(
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
     file.name,
   );
-  const deadline = Date.now() + (config.maxDurationMs ?? 120_000);
+  const deadline = createAgentDeadline(config.maxDurationMs ?? 120_000, signal);
+  signal = deadline.signal;
   let stopReason: AgentStopReason | undefined;
-  const media = await documentContentParts(
-    providerConfig,
-    fileData,
-    file.type,
-    file.name,
-    signal,
-  );
-  const messages: OpenAIMessage[] = [
-    { role: 'system', content: createAgentSystemPrompt(memory.documentAnalysis.documentType) },
-    {
-      role: 'user',
-      content: [{ type: 'text', text: createUserPrompt(file.name, 1) }, ...media],
-    },
-  ];
-
-  for (let iteration = 1; iteration <= config.maxIterations; iteration += 1) {
-    if (signal?.aborted) { stopReason = 'cancelled'; break; }
-    if (Date.now() > deadline) { stopReason = 'budget_exhausted'; break; }
-    memory.currentIteration = iteration;
-    if (iteration > 1) messages.push({ role: 'user', content: createFollowUpPrompt(iteration, memory) });
-    messages[0] = {
-      role: 'system',
-      content: createAgentSystemPrompt(memory.documentAnalysis.documentType),
-    };
+  try {
     try {
-      const before = Object.keys(memory.extractedFields).length;
-      const streamedTurn = streamAgentOperation((onStep) => executeProviderTurn(
-        messages,
+      const media = await documentContentParts(
+        providerConfig,
         fileData,
         file.type,
-        memory,
-        providerConfig,
-        config,
+        file.name,
         signal,
-        regionCropper,
-        iteration,
-        onStep,
-      ));
-      let streamed = await streamedTurn.next();
-      while (!streamed.done) {
-        yield streamed.value;
-        streamed = await streamedTurn.next();
+      );
+      const messages: OpenAIMessage[] = [
+        { role: 'system', content: createAgentSystemPrompt(memory.documentAnalysis.documentType) },
+        {
+          role: 'user',
+          content: [{ type: 'text', text: createUserPrompt(file.name, 1) }, ...media],
+        },
+      ];
+
+      for (let iteration = 1; iteration <= config.maxIterations; iteration += 1) {
+        if (signal.aborted) { stopReason = deadline.hasExpired() ? 'budget_exhausted' : 'cancelled'; break; }
+        if (deadline.hasExpired()) { stopReason = 'budget_exhausted'; break; }
+        memory.currentIteration = iteration;
+        if (iteration > 1) messages.push({ role: 'user', content: createFollowUpPrompt(iteration, memory) });
+        messages[0] = {
+          role: 'system',
+          content: createAgentSystemPrompt(memory.documentAnalysis.documentType),
+        };
+        try {
+          const before = agentProgressFingerprint(memory);
+          const streamedTurn = streamAgentOperation((onStep) => executeProviderTurn(
+            messages,
+            fileData,
+            file.type,
+            memory,
+            providerConfig,
+            config,
+            signal,
+            regionCropper,
+            iteration,
+            onStep,
+          ));
+          let streamed = await streamedTurn.next();
+          while (!streamed.done) {
+            yield streamed.value;
+            streamed = await streamedTurn.next();
+          }
+          const turn = streamed.value;
+          if (deadline.hasExpired()) { stopReason = 'budget_exhausted'; break; }
+          const completion = evaluateAgentCompletion(memory, memory.confidence, config.confidenceThreshold);
+          if (completion.complete) { stopReason = 'succeeded'; break; }
+          if (!turn.finished) { stopReason = 'tool_limit_reached'; break; }
+          if (agentProgressFingerprint(memory) === before) { stopReason = 'partial'; break; }
+        } catch (error) {
+          if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+            stopReason = deadline.hasExpired() ? 'budget_exhausted' : 'cancelled';
+            break;
+          }
+          if (isProviderCostLimitError(error)) { stopReason = 'cost_limit_reached'; break; }
+          const message = error instanceof Error ? error.message : String(error);
+          yield {
+            type: 'error',
+            source: 'runtime',
+            content: `Agent iteration failed: ${message}`,
+            timestamp: Date.now(),
+          };
+          if (config.throwOnFailure) throw error;
+          stopReason = 'failed';
+          break;
+        }
       }
-      const turn = streamed.value;
-      const completion = evaluateAgentCompletion(memory, memory.confidence, config.confidenceThreshold);
-      if (completion.complete) { stopReason = 'succeeded'; break; }
-      if (!turn.finished) { stopReason = 'tool_limit_reached'; break; }
-      if (Object.keys(memory.extractedFields).length === before) { stopReason = 'partial'; break; }
     } catch (error) {
-      if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
-        stopReason = 'cancelled';
-        break;
-      }
-      if (isProviderCostLimitError(error)) { stopReason = 'cost_limit_reached'; break; }
-      const message = error instanceof Error ? error.message : String(error);
+      if (deadline.hasExpired()) stopReason = 'budget_exhausted';
+      else if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) stopReason = 'cancelled';
+      else throw error;
+    }
+    stopReason ??= evaluateAgentCompletion(memory, memory.confidence, config.confidenceThreshold).complete
+      ? 'succeeded'
+      : 'max_iterations';
+    memory.stopReason = stopReason;
+    if (stopReason !== 'cancelled') {
       yield {
-        type: 'error',
+        type: 'result',
         source: 'runtime',
-        content: `Agent iteration failed: ${message}`,
+        content: terminalLine(stopReason, memory),
         timestamp: Date.now(),
       };
-      if (config.throwOnFailure) throw error;
-      stopReason = 'failed';
-      break;
     }
+    return memory;
+  } finally {
+    deadline.dispose();
   }
-  stopReason ??= evaluateAgentCompletion(memory, memory.confidence, config.confidenceThreshold).complete
-    ? 'succeeded'
-    : 'max_iterations';
-  memory.stopReason = stopReason;
-  if (stopReason !== 'cancelled') {
-    yield {
-      type: 'result',
-      source: 'runtime',
-      content: terminalLine(stopReason, memory),
-      timestamp: Date.now(),
-    };
-  }
-  return memory;
 }

@@ -14,7 +14,7 @@ if (path.basename(tarballPath) !== expectedTarballName) {
 const sha256 = createHash('sha256').update(readFileSync(tarballPath)).digest('hex');
 const formula = `class OpenOcrCli < Formula
   desc "Provider-neutral multimodal OCR for files, URLs, and document pipelines"
-  homepage "https://github.com/cyanxxy/open-ocr-cli"
+  homepage "https://github.com/cyanxxy/open-ocr-cli-mcp"
   url "https://registry.npmjs.org/open-ocr-cli/-/open-ocr-cli-${version}.tgz"
   sha256 "${sha256}"
   license "MIT"

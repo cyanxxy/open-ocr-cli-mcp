@@ -37,6 +37,85 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('OpenAI-compatible transport', () => {
+  it('uses the Kimi K3 default effort for callers without a thinking override', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await createChatCompletion(config({ model: 'kimi-k3', thinkingConfig: undefined }), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
+    });
+    const wireBody = fetchMock.mock.calls[0]?.[1]?.body;
+    if (typeof wireBody !== 'string') throw new Error('Expected JSON request body');
+    const body = JSON.parse(wireBody) as Record<string, unknown>;
+    expect(body.reasoning_effort).toBe('max');
+  });
+
+  it('supports Muse 1.3 max and rejects unsupported current model efforts before fetch', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const request = { messages: [{ role: 'user' as const, content: 'Extract' }], maxTokens: 1024 };
+    await createChatCompletion(config({ provider: 'muse', model: 'muse-spark-1.3', thinkingConfig: { level: 'MAX' } }), request);
+    const wireBody = fetchMock.mock.calls[0]?.[1]?.body;
+    if (typeof wireBody !== 'string') throw new Error('Expected JSON request body');
+    const body = JSON.parse(wireBody) as Record<string, unknown>;
+    expect(body.reasoning_effort).toBe('max');
+    await expect(createChatCompletion(config({
+      provider: 'muse', model: 'muse-spark-1.3-contributor', thinkingConfig: { level: 'MAX' },
+    }), request)).rejects.toThrow('received max');
+    await expect(createChatCompletion(config({
+      provider: 'openrouter', model: 'google/gemini-3.8-flash', thinkingConfig: { level: 'MINIMAL' },
+    }), request)).rejects.toThrow('received minimal');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['moonshotai/kimi-k2.7-code', 'HIGH', true],
+    ['moonshotai/kimi-k2.6', 'HIGH', true],
+    ['moonshotai/kimi-k2.6', 'MINIMAL', false],
+  ] as const)('uses the reasoning toggle for %s %s', async (model, level, enabled) => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await createChatCompletion(config({ provider: 'openrouter', model, thinkingConfig: { level } }), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
+    });
+    const wireBody = fetchMock.mock.calls[0]?.[1]?.body;
+    if (typeof wireBody !== 'string') throw new Error('Expected JSON request body');
+    expect(JSON.parse(wireBody) as unknown).toMatchObject({ reasoning: { enabled, exclude: false } });
+  });
+
+  it.each([undefined, 'budget_exceeded', 'paused'])('rejects unconfirmed completion %s from a generic endpoint', async (finishReason) => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: finishReason, message: { role: 'assistant', content: 'partial' } }],
+    })));
+    await expect(createChatCompletion(config({ provider: 'openai-compatible', model: 'local-vision' }), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
+    })).rejects.toThrow('finish reason');
+  });
+
+  it('rejects tool-call completion without the corresponding calls', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: 'Inspecting...' } }],
+    })));
+    await expect(createChatCompletion(config(), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
+    })).rejects.toThrow('returned no tool calls');
+  });
+
+  it('rejects streamed choice errors and preserves usage carried on that choice', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      `data: ${JSON.stringify({ choices: [{ error: { message: 'upstream unavailable', code: 'UNAVAILABLE' }, usage: { prompt_tokens: 8, completion_tokens: 2 }, delta: { content: 'partial' }, finish_reason: 'stop' }] })}\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } },
+    )));
+    await expect(createChatCompletion(config(), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024, onDelta: () => undefined,
+    })).rejects.toThrow('upstream unavailable');
+    expect(getProviderUsage()).toMatchObject({ inputTokens: 8, outputTokens: 2, requests: 1 });
+  });
   it('uses Kimi K3 current token and reasoning fields', async () => {
     const fetchMock = vi.fn((_input: FetchInput, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
@@ -216,7 +295,7 @@ describe('OpenAI-compatible transport', () => {
       { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'inspect', arguments: '"totals"}' } }] }, finish_reason: 'tool_calls' }] },
       { choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, cost: 0.001 } },
     ].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
-    const fetchMock = vi.fn()
+    const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(sse, {
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -753,9 +832,9 @@ describe('OpenAI-compatible transport', () => {
     const request = fetchMock.mock.calls[0][1] as RequestInit;
     if (typeof request.body !== 'string') throw new Error('Expected a string request body');
     expect(JSON.parse(request.body) as unknown).toMatchObject({
-      reasoning: { effort: 'minimal', exclude: false },
+      reasoning: { enabled: false, exclude: false },
     });
-    expect(new Headers(request.headers).get('http-referer')).toBe('https://github.com/cyanxxy/open-ocr-cli');
+    expect(new Headers(request.headers).get('http-referer')).toBe('https://github.com/cyanxxy/open-ocr-cli-mcp');
     // cost:0 with known Kimi pricing falls back to a local estimate so --max-cost cannot fail open.
     expect(getProviderUsage().estimatedCostUsd).toBeGreaterThan(0);
   });

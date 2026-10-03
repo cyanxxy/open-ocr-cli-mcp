@@ -43,7 +43,7 @@ describe('CLI configuration', () => {
     const options = resolveCliOptions({}, {}, '/workspace');
     expect(options).toMatchObject({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       thinking: 'MEDIUM',
       mode: 'simple',
       format: 'markdown',
@@ -299,17 +299,17 @@ describe('CLI configuration', () => {
     }, '/workspace')).toThrow('requires both --input-price and --output-price');
   });
 
-  it('enables max-cost for published Kimi prices and requires explicit Muse prices', () => {
+  it('enables max-cost for published Kimi and Muse prices', () => {
     expect(resolveCliOptions({
       provider: 'kimi',
       maxCost: '1',
       dryRun: true,
     }, {}, '/workspace').maxCostUsd).toBe(1);
-    expect(() => resolveCliOptions({
+    expect(resolveCliOptions({
       provider: 'muse',
       maxCost: '1',
       dryRun: true,
-    }, {}, '/workspace')).toThrow('requires both --input-price and --output-price');
+    }, {}, '/workspace').maxCostUsd).toBe(1);
   });
 
   it('accepts an explicit zero-price route with a cost ceiling', () => {
@@ -502,9 +502,9 @@ describe('CLI configuration', () => {
     );
   });
 
-  it('preserves an explicit minimal effort for agentic Flash runs', () => {
+  it('preserves an explicit minimal effort for agentic Flash models that support it', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    expect(resolveCliOptions({ mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
+    expect(resolveCliOptions({ model: 'gemini-3.6-flash', mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
   });
 
   it('uses model-aware Gemini defaults and rejects unsupported Pro minimal effort', () => {
@@ -517,6 +517,27 @@ describe('CLI configuration', () => {
       {},
       '/workspace',
     )).toThrow('minimal is not supported');
+  });
+
+  it('validates current Gemini and Muse model efforts before requesting credentials', () => {
+    expect(resolveCliOptions({ model: 'gemini-3.8-flash', dryRun: true }, {}, '/workspace').thinking).toBe('MEDIUM');
+    expect(resolveCliOptions({ model: 'gemini-3.5-flash-lite', dryRun: true }, {}, '/workspace').thinking).toBe('MINIMAL');
+    for (const provider of ['gemini', 'openrouter'] as const) {
+      const model = provider === 'gemini' ? 'gemini-3.8-flash' : 'google/gemini-3.8-flash';
+      expect(() => resolveCliOptions({ provider, model, thinking: 'minimal', dryRun: true }, {}, '/workspace'))
+        .toThrow('minimal is not supported');
+    }
+    expect(resolveCliOptions({ provider: 'muse', thinking: 'max', dryRun: true }, {}, '/workspace'))
+      .toMatchObject({ model: 'muse-spark-1.3', thinking: 'MAX' });
+    expect(() => resolveCliOptions({
+      provider: 'muse', model: 'muse-spark-1.3-contributor', thinking: 'max', dryRun: true,
+    }, {}, '/workspace')).toThrow('Muse Spark 1.3 Standard');
+  });
+
+  it('accepts a credential-free generic endpoint on IPv6 loopback', () => {
+    expect(resolveCliOptions({
+      provider: 'openai-compatible', model: 'vision', baseUrl: 'http://[::1]:11434/v1',
+    }, {}, '/workspace').apiKey).toBe('');
   });
 
   it('keeps progress visibility scoped to agentic extraction', () => {

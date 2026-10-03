@@ -110,7 +110,7 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
       headers: {
         Accept: 'text/html,application/xhtml+xml,application/pdf,image/*,text/plain;q=0.9,*/*;q=0.5',
         'Accept-Encoding': 'gzip, deflate, br',
-        'User-Agent': 'open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli)',
+        'User-Agent': 'open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli-mcp)',
       },
       lookup: (_hostname, _options, callback) => callback(null, selected.address, selected.family),
       // SNI carries names, never addresses; sending an IP literal as the server

@@ -205,6 +205,7 @@ export class ProviderExecutionContext {
   private previousRequestAt = 0;
   private queue: Promise<void> = Promise.resolve();
   private costLimitDenied = false;
+  private usagePricing: UsagePricingConfig | undefined;
 
   constructor(policy: ProviderRequestPolicy = {}) {
     this.configure(policy);
@@ -217,6 +218,17 @@ export class ProviderExecutionContext {
     this.previousRequestAt = 0;
     this.queue = Promise.resolve();
     this.costLimitDenied = false;
+    this.usagePricing = undefined;
+  }
+
+  /** Per-job prices for transports that report usage with only provider/model. */
+  configureUsagePricing(config: UsagePricingConfig): void {
+    this.usagePricing = {
+      provider: config.provider,
+      model: config.model,
+      inputPricePerMillionUsd: config.inputPricePerMillionUsd,
+      outputPricePerMillionUsd: config.outputPricePerMillionUsd,
+    };
   }
 
   resetUsage(): void {
@@ -271,9 +283,18 @@ export class ProviderExecutionContext {
     this.usage.toolTokens += measurement.toolTokens;
     this.usage.cachedTokens += measurement.cachedTokens;
     this.usage.totalTokens += measurement.totalTokens;
-    const localEstimate = config
+    const contextPricing = this.usagePricing;
+    const effectivePricing = config && contextPricing
+      && config.provider === contextPricing.provider && config.model === contextPricing.model
+      ? {
+          ...config,
+          inputPricePerMillionUsd: config.inputPricePerMillionUsd ?? contextPricing.inputPricePerMillionUsd,
+          outputPricePerMillionUsd: config.outputPricePerMillionUsd ?? contextPricing.outputPricePerMillionUsd,
+        }
+      : config ?? contextPricing;
+    const localEstimate = effectivePricing
       ? estimateProviderRequestCostUsd(
-        config,
+        effectivePricing,
         measurement.inputTokens,
         measurement.outputTokens,
         measurement.usesOpenAITokenAccounting ? 0 : measurement.thoughtTokens,
@@ -294,7 +315,7 @@ export class ProviderExecutionContext {
     } else if (measurement.exactCost !== undefined) {
       // Truly free (zero tokens, or zero cost without a local price table).
       this.usage.estimatedCostUsd += measurement.exactCost;
-    } else if (config) {
+    } else if (effectivePricing) {
       this.usage.estimatedCostUsd += localEstimate;
     }
   }

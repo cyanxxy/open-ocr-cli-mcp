@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { parseBatchLockOwner, type BatchLockOwner } from './jsonValidation';
 import { batchMetadataError, CliExitError } from './errors';
-import { parseCliManifest } from './manifest';
+import { artifactFileExists, parseCliManifest } from './manifest';
 import type {
   BatchSummary,
   CliManifest,
@@ -234,7 +234,7 @@ export async function assertArtifactTargetsAvailable(
   availability: ArtifactAvailabilityOptions = {},
 ): Promise<void> {
   const writesFiles = totalInputs > 1 || Boolean(options.output) || options.format === 'all';
-  if (!writesFiles || options.overwrite) return;
+  if (!writesFiles) return;
   const reclaimable = availability.reclaimable ?? new Set<string>();
   const targets = await resolveArtifactTargets(
     input,
@@ -243,11 +243,14 @@ export async function assertArtifactTargetsAvailable(
     totalInputs,
   );
   const existing = (await Promise.all(targets.map(async ({ path: target }): Promise<string | undefined> => {
-    if (reclaimable.has(artifactPathKey(target))) return undefined;
     try {
       // lstat treats a dangling symlink as occupied; access() would follow it,
       // report ENOENT, and allow paid extraction before the final EEXIST.
-      await fs.lstat(target);
+      const metadata = await fs.lstat(target);
+      if (metadata.isDirectory()) {
+        throw outputConflict(`Output artifact path is occupied by a directory: ${target}`);
+      }
+      if (options.overwrite || reclaimable.has(artifactPathKey(target))) return undefined;
       return target;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
@@ -289,7 +292,14 @@ export async function assertNoOutputCollisions(
     }
   }
   await Promise.all(inputs.map(async (input) => {
-    const targets = await plannedArtifactTargets(input, options, inputs.length);
+    // Reserve optional outputs too: template CSV is not guaranteed, but it
+    // must never overwrite or obstruct another document when it is produced.
+    const targets = await resolveArtifactTargets(
+      input,
+      possibleArtifactExtensions(options),
+      options,
+      inputs.length,
+    );
     for (const { path: target } of targets) {
       // Use a portable case-folded key on every platform. This deliberately
       // rejects names that are distinct on some Linux filesystems but collide
@@ -299,6 +309,16 @@ export async function assertNoOutputCollisions(
     }
   }));
   const collisions = [...owners.entries()].filter(([, sources]) => sources.length > 1);
+  // Every artifact occupies a file path. An otherwise distinct destination
+  // cannot also use that path as a directory, including reserved job metadata.
+  for (const [target, sources] of owners) {
+    let parent = path.dirname(target);
+    while (parent !== path.dirname(parent)) {
+      const parentOwners = owners.get(parent);
+      if (parentOwners) collisions.push([target, [...parentOwners, ...sources]]);
+      parent = path.dirname(parent);
+    }
+  }
   if (collisions.length === 0) return;
   const details = collisions
     .slice(0, 5)
@@ -401,6 +421,9 @@ async function commitArtifacts(
 
     for (const entry of staged) {
       if (entry.replace && await pathExists(entry.target)) {
+        if ((await fs.lstat(entry.target)).isDirectory()) {
+          throw outputConflict(`Output artifact path is occupied by a directory: ${entry.target}`);
+        }
         entry.backup = `${entry.target}.${transactionId}.bak`;
         await fs.rename(entry.target, entry.backup);
       } else if (!entry.replace && await pathExists(entry.target)) {
@@ -555,7 +578,7 @@ export class ManifestStore {
       || entry.status !== 'succeeded'
       || entry.fingerprint !== fingerprint
     ) return undefined;
-    if (!(await Promise.all(entry.outputFiles.map(pathExists))).every(Boolean)) return undefined;
+    if (!(await Promise.all(entry.outputFiles.map(artifactFileExists))).every(Boolean)) return undefined;
     return { ...entry, outputFiles: [...entry.outputFiles] };
   }
 

@@ -571,10 +571,7 @@ export async function extractTextFromFile(
         promptFeedback?: { blockReason?: string };
       } | null = null;
       for await (const chunk of result) {
-        lastChunk = chunk as unknown as {
-          candidates?: Array<{ finishReason?: string }>;
-          promptFeedback?: { blockReason?: string };
-        };
+        lastChunk = chunk;
         try {
           completion.observe(lastChunk);
         } catch (error) {

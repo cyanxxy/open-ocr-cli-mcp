@@ -16,13 +16,13 @@ import {
   createUserPrompt,
   createFollowUpPrompt
 } from './agentGemini';
-import { createInitialMemory } from './agentMemory';
+import { agentProgressFingerprint, createInitialMemory } from './agentMemory';
 import { evaluateAgentCompletion } from './agentSchema';
 import type { InteractionStep } from './gemini/interactions';
 import { isFatalGeminiError, isRetryableGeminiError } from './gemini/client';
 import { isGeminiCostLimitError } from './gemini/requestPolicy';
 import { transientRetryDelayMs } from './providers/retry';
-import { streamAgentOperation, waitForAbortableAgentDelay } from './agentStepStream';
+import { createAgentDeadline, streamAgentOperation, waitForAbortableAgentDelay } from './agentStepStream';
 
 /**
  * A cancellation is identified by the abort signal or a fetch-level AbortError —
@@ -92,7 +92,11 @@ export async function* agentLoop(
   let iteration = 0;
   let stopReason: AgentStopReason | null = null;
   let transientRetries = 0;
-  const deadline = Date.now() + (agentConfig.maxDurationMs ?? DEFAULT_AGENT_CONFIG.maxDurationMs!);
+  const deadline = createAgentDeadline(
+    agentConfig.maxDurationMs ?? DEFAULT_AGENT_CONFIG.maxDurationMs!,
+    clientConfig.abortSignal,
+  );
+  const executionClientConfig = { ...clientConfig, abortSignal: deadline.signal };
 
   try {
     // Initialize
@@ -134,13 +138,13 @@ export async function* agentLoop(
     const interactionState: AgentInteractionState = {};
 
     while (iteration < agentConfig.maxIterations) {
-      if (clientConfig.abortSignal?.aborted) {
-        stopReason = 'cancelled';
+      if (deadline.signal.aborted) {
+        stopReason = deadline.hasExpired() ? 'budget_exhausted' : 'cancelled';
         break;
       }
       // Wall-clock safety net so a stuck/looping run cannot consume unbounded
       // time and cost even if it never converges (audit H-16).
-      if (Date.now() > deadline) {
+      if (deadline.hasExpired()) {
         stopReason = 'budget_exhausted';
         break;
       }
@@ -177,7 +181,7 @@ export async function* agentLoop(
           timestamp: Date.now(),
         };
 
-        const fieldCountBefore = Object.keys(memory.extractedFields).length;
+        const progressBefore = agentProgressFingerprint(memory);
 
         // Execute multi-turn function calling
         const streamedTurn = streamAgentOperation((onStep) => executeAgentTurn(
@@ -189,7 +193,7 @@ export async function* agentLoop(
           fileData,
           file.type,
           memory,
-          clientConfig,
+          executionClientConfig,
           agentConfig,
           onStep,
         ));
@@ -199,6 +203,10 @@ export async function* agentLoop(
           streamed = await streamedTurn.next();
         }
         const turnResult = streamed.value;
+        if (deadline.hasExpired()) {
+          stopReason = 'budget_exhausted';
+          break;
+        }
 
         // A successful turn resets the transient-retry budget.
         transientRetries = 0;
@@ -229,15 +237,14 @@ export async function* agentLoop(
         // this iteration, iterating again would only spin — stop as partial.
         // Otherwise continue; the follow-up prompt targets the missing/
         // low-confidence fields.
-        const fieldCountAfter = Object.keys(memory.extractedFields).length;
-        if (fieldCountAfter === fieldCountBefore) {
+        if (agentProgressFingerprint(memory) === progressBefore) {
           stopReason = 'partial';
           break;
         }
 
       } catch (error) {
-        if (wasAborted(error, clientConfig.abortSignal)) {
-          stopReason = 'cancelled';
+        if (wasAborted(error, deadline.signal)) {
+          stopReason = deadline.hasExpired() ? 'budget_exhausted' : 'cancelled';
           break;
         }
         if (isGeminiCostLimitError(error)) {
@@ -275,7 +282,7 @@ export async function* agentLoop(
             timestamp: Date.now(),
           };
           iteration--;
-          await waitForAbortableAgentDelay(backoff, clientConfig.abortSignal);
+          await waitForAbortableAgentDelay(backoff, deadline.signal);
           continue;
         }
 
@@ -286,13 +293,13 @@ export async function* agentLoop(
       }
 
       // Brief pause between iterations
-      if (clientConfig.abortSignal?.aborted) {
-        stopReason = 'cancelled';
+      if (deadline.signal.aborted) {
+        stopReason = deadline.hasExpired() ? 'budget_exhausted' : 'cancelled';
         break;
       }
       await waitForAbortableAgentDelay(
         agentConfig.iterationPauseMs ?? 500,
-        clientConfig.abortSignal,
+        deadline.signal,
       );
     }
 
@@ -323,7 +330,16 @@ export async function* agentLoop(
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Agent processing failed';
-    if (wasAborted(error, clientConfig.abortSignal)) {
+    if (deadline.hasExpired()) {
+      memory.stopReason = 'budget_exhausted';
+      yield {
+        type: 'result', source: 'runtime',
+        content: describeStopReason('budget_exhausted', memory), timestamp: Date.now(),
+      };
+      onProgress?.(100, 'Processing finished');
+      return memory;
+    }
+    if (wasAborted(error, deadline.signal)) {
       memory.stopReason = 'cancelled';
       return memory;
     }
@@ -337,6 +353,8 @@ export async function* agentLoop(
       timestamp: Date.now(),
     };
     onProgress?.(100, 'Processing failed');
+  } finally {
+    deadline.dispose();
   }
 
   // Return final memory state

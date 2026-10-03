@@ -261,10 +261,10 @@ describe('CLI exit errors', () => {
         code: 'PROVIDER_FAILURE',
         category: 'provider',
         retryable: false,
-        hint: expect.stringContaining('provider rejected'),
+        hint: expect.stringContaining('provider rejected') as unknown,
       });
     expect(ocrErrorPayload(new Error('Something the classifiers do not recognize'), 1))
-      .toMatchObject({ code: 'PROVIDER_FAILURE', hint: expect.any(String) });
+      .toMatchObject({ code: 'PROVIDER_FAILURE', hint: expect.any(String) as unknown });
   });
 
   it('does not let an exit-status default contradict an explicitly named code', () => {
@@ -325,7 +325,7 @@ describe('CLI exit errors', () => {
         code: 'AUTH_INVALID',
         category: 'authentication',
         retryable: false,
-        message: expect.stringContaining('Request had invalid authentication credentials.'),
+        message: expect.stringContaining('Request had invalid authentication credentials.') as unknown,
       });
       expect(ocrErrorPayload(error, 1).message).not.toContain('httpMeta');
     });

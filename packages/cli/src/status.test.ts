@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -97,6 +97,26 @@ describe('CLI batch status', () => {
     expect(report).toMatchObject({ healthy: true, summaryPresent: true, manifestPresent: false });
     expect(renderBatchStatus(report)).toContain('120 tokens');
     expect(renderBatchStatus(report)).toContain('gemini/gemini-3.5-flash via direct');
+  });
+
+  it('reports a directory at an artifact path as missing output', async () => {
+    const outputFile = path.join(directory, 'invoice.md');
+    await mkdir(outputFile);
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        '<stdin>': {
+          fingerprint: 'abc',
+          status: 'succeeded',
+          outputFiles: [outputFile],
+          completedAt: '2026-07-15T00:00:00.000Z',
+        },
+      },
+    }));
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.healthy).toBe(false);
+    expect(report.counts.missingArtifacts).toBe(1);
+    expect(report.entries[0].missingOutputFiles).toEqual([outputFile]);
   });
 
   it('reports the provider and gateway for provider-neutral summaries', async () => {

@@ -181,6 +181,32 @@ describe('CLI output', () => {
     )).rejects.toThrow('reserved job metadata');
   });
 
+  it.each(['md', 'csv'])('rejects artifact-versus-directory collisions for %s output', async (extension) => {
+    const first = { ...input, relativePath: 'invoice.pdf', displayPath: 'invoice.pdf' };
+    const nested = {
+      ...input,
+      relativePath: `invoice.${extension}/page.pdf`,
+      displayPath: `invoice.${extension}/page.pdf`,
+    };
+    const templateOptions = resolveCliOptions(
+      { output: directory, format: 'all', preset: 'invoice' },
+      {},
+      '/workspace',
+    );
+    await expect(assertNoOutputCollisions([first, nested], templateOptions))
+      .rejects.toMatchObject({ code: 'OUTPUT_CONFLICT' });
+  });
+
+  it('rejects document directories that occupy a reserved metadata file', async () => {
+    const nested = {
+      ...input,
+      relativePath: 'batch-summary.json/page.pdf',
+      displayPath: 'batch-summary.json/page.pdf',
+    };
+    await expect(assertNoOutputCollisions([nested], options, true))
+      .rejects.toThrow('reserved job metadata');
+  });
+
   it('can reserve job metadata for a reference-first single-document run', async () => {
     const metadataCollision = {
       ...input,
@@ -395,7 +421,7 @@ describe('CLI output', () => {
       outputFiles: [path.join(directory, 'invoice.json')],
       completedAt: new Date().toISOString(),
     });
-    const access = vi.spyOn(fs, 'access').mockRejectedValueOnce(Object.assign(
+    const stat = vi.spyOn(fs, 'stat').mockRejectedValueOnce(Object.assign(
       new Error('permission denied'),
       { code: 'EACCES' },
     ));
@@ -404,8 +430,35 @@ describe('CLI output', () => {
         code: 'EACCES',
       });
     } finally {
-      access.mockRestore();
+      stat.mockRestore();
     }
+  });
+
+  it('does not resume when a directory occupies a recorded artifact path', async () => {
+    const outputFile = path.join(directory, 'invoice.json');
+    await fs.mkdir(outputFile);
+    const manifest = new ManifestStore(directory);
+    await manifest.update('/workspace/invoice.pdf', {
+      fingerprint: 'abc',
+      status: 'succeeded',
+      outputFiles: [outputFile],
+      completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry('/workspace/invoice.pdf', 'abc')).resolves.toBeUndefined();
+  });
+
+  it.each([false, true])('preserves directories at artifact destinations with overwrite=%s', async (overwrite) => {
+    const target = path.join(directory, 'nested', 'invoice.md');
+    await fs.mkdir(target, { recursive: true });
+    await writeFile(path.join(target, 'keep.txt'), 'keep');
+    const destinationOptions = { ...options, format: 'markdown' as const, overwrite };
+    const reclaimable = new Set([target]);
+
+    await expect(assertArtifactTargetsAvailable(input, destinationOptions, 2, { reclaimable }))
+      .rejects.toMatchObject({ code: 'OUTPUT_CONFLICT' });
+    await expect(writeArtifacts(input, artifacts, destinationOptions, 2, reclaimable))
+      .rejects.toMatchObject({ code: 'OUTPUT_CONFLICT' });
+    await expect(readFile(path.join(target, 'keep.txt'), 'utf8')).resolves.toBe('keep');
   });
 
   it('rejects malformed resume manifests instead of trusting unsafe entry shapes', async () => {

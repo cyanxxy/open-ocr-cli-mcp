@@ -437,7 +437,7 @@ export async function runWebExtraction(
           ...(options.gateway === 'cloudflare' ? { headers: providerRequestHeaders(config) } : {}),
         }
         : undefined,
-    runtime,
+    config.runtime,
   );
 }
 

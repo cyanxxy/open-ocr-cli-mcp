@@ -11,6 +11,22 @@ import type { AgentMemory, AgentMemoryUpdate } from './agentTypes';
 
 type FieldData = AgentMemory['extractedFields'][string];
 
+/** Semantic progress excludes timestamps and audit history, which always grow. */
+export function agentProgressFingerprint(memory: Readonly<AgentMemory>): string {
+  return JSON.stringify({
+    documentAnalysis: memory.documentAnalysis,
+    confidence: memory.confidence,
+    fields: Object.entries(memory.extractedFields)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, field]) => [name, {
+        value: field.value,
+        confidence: field.confidence,
+        isValid: field.isValid,
+        location: field.location,
+      }]),
+  });
+}
+
 /**
  * Create initial agent memory.
  */
@@ -101,10 +117,30 @@ export function applyMemoryUpdate(memory: AgentMemory, update?: AgentMemoryUpdat
 
   if (update.extractedFields) {
     for (const [fieldName, incomingField] of Object.entries(update.extractedFields)) {
-      const existingField = memory.extractedFields[fieldName];
-      memory.extractedFields[fieldName] = existingField
+      const existingField = Object.hasOwn(memory.extractedFields, fieldName)
+        ? memory.extractedFields[fieldName]
+        : undefined;
+      const field = existingField
         ? mergeField(existingField, incomingField)
         : incomingField;
+      // Defining a data property also handles direct updates named __proto__;
+      // assignment on a normal object would invoke its inherited setter.
+      Object.defineProperty(memory.extractedFields, fieldName, {
+        value: field, enumerable: true, writable: true, configurable: true,
+      });
+    }
+  }
+
+  for (const [name, review] of Object.entries(update.fieldReviews ?? {})) {
+    const field = Object.hasOwn(memory.extractedFields, name) ? memory.extractedFields[name] : undefined;
+    // A review describes one exact value. Do not apply it if the candidate
+    // merger retained a different, better extraction.
+    if (field?.value === review.value) {
+      memory.extractedFields[name] = {
+        ...field,
+        isValid: review.isValid,
+        validationMessage: review.validationMessage,
+      };
     }
   }
 

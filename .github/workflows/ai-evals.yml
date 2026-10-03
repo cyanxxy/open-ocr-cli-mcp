@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 120
     # Scheduled reports and their commits must always use the authoritative
     # default branch, including manually-dispatched runs.
-    if: github.repository == 'cyanxxy/open-ocr-cli' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cyanxxy/open-ocr-cli-mcp' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout repository
@@ -49,18 +49,21 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          META_API_KEY: ${{ secrets.META_API_KEY }}
         run: |
           [[ -n "$GEMINI_API_KEY" ]] && gemini=true || gemini=false
           [[ -n "$MOONSHOT_API_KEY" ]] && kimi=true || kimi=false
           [[ -n "$OPENROUTER_API_KEY" ]] && openrouter=true || openrouter=false
+          [[ -n "$META_API_KEY" ]] && muse=true || muse=false
           {
             echo "gemini=$gemini"
             echo "kimi=$kimi"
             echo "openrouter=$openrouter"
+            echo "muse=$muse"
           } >> "$GITHUB_OUTPUT"
 
       - name: Skip live evals when no provider credentials are configured
-        if: ${{ steps.credentials.outputs.gemini == 'false' && steps.credentials.outputs.kimi == 'false' && steps.credentials.outputs.openrouter == 'false' }}
+        if: ${{ steps.credentials.outputs.gemini == 'false' && steps.credentials.outputs.kimi == 'false' && steps.credentials.outputs.openrouter == 'false' && steps.credentials.outputs.muse == 'false' }}
         run: echo "No provider API keys are configured; skipping live evals."
 
       - name: Run Kimi live canary
@@ -69,7 +72,7 @@ jobs:
         env:
           EVAL_PROVIDER: kimi
           MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          OPEN_OCR_MODEL: kimi-k2.6
+          OPEN_OCR_MODEL: kimi-k3
 
       - name: Run OpenRouter live canary
         if: ${{ steps.credentials.outputs.openrouter == 'true' }}
@@ -77,14 +80,22 @@ jobs:
         env:
           EVAL_PROVIDER: openrouter
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPEN_OCR_MODEL: moonshotai/kimi-k2.6
+          OPEN_OCR_MODEL: moonshotai/kimi-k3
+
+      - name: Run Muse live canary
+        if: ${{ steps.credentials.outputs.muse == 'true' }}
+        run: npm run evals:canary
+        env:
+          EVAL_PROVIDER: muse
+          META_API_KEY: ${{ secrets.META_API_KEY }}
+          OPEN_OCR_MODEL: muse-spark-1.3
 
       - name: Run live evals
         if: ${{ steps.credentials.outputs.gemini == 'true' }}
         run: npm run evals
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3-flash-preview
+          OPEN_OCR_MODEL: gemini-3.8-flash
 
       - name: Refresh markdown report
         if: ${{ steps.credentials.outputs.gemini == 'true' }}

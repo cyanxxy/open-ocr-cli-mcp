@@ -4,19 +4,17 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-import {
-  defaultThinkingLevelForModel,
-  type GeminiModel,
-  type ThinkingLevel,
-} from '@open-ocr/engine/gemini';
+import type { ThinkingLevel } from '@open-ocr/engine/gemini';
 import {
   GATEWAY_IDS,
   GEMINI_MODELS,
   PROVIDER_IDS,
   isKimiK3Route,
   isLocalBaseUrl,
+  knownModelThinkingLevels,
   providerDefaultApiKeyEnv,
   providerDefaultModel,
+  providerDefaultThinkingLevel,
   providerTokenPrice,
   resolveProviderBaseUrl,
   type GatewayId,
@@ -71,7 +69,7 @@ const DEFAULT_CONFIG: Required<Pick<
 >> = {
   provider: 'gemini',
   gateway: 'direct',
-  model: 'gemini-3.5-flash',
+  model: 'gemini-3.8-flash',
   thinking: 'MEDIUM',
   includeThoughts: false,
   progress: 'standard',
@@ -235,19 +233,14 @@ export function cliConfigDisabled(value?: string | false, disabled = false): boo
 }
 
 export function defaultCliThinkingLevel(provider: ProviderId, model: string): ThinkingLevel {
-  if (isKimiK3Route(provider, model)) return 'MAX';
-  if (provider === 'kimi' && (/^kimi-k2\.7-code/u.test(model) || model === 'kimi-k2.6')) return 'HIGH';
-  if (provider === 'gemini') return defaultThinkingLevelForModel(model as GeminiModel);
-  return DEFAULT_CONFIG.thinking;
+  return providerDefaultThinkingLevel(provider, model);
 }
 
 export function cliThinkingLevels(provider: ProviderId, model: string): readonly ThinkingLevel[] {
-  if (isKimiK3Route(provider, model)) return ['LOW', 'HIGH', 'MAX'];
-  if (provider === 'kimi' && /^kimi-k2\.7-code/u.test(model)) return ['HIGH'];
-  if (provider === 'kimi' && model === 'kimi-k2.6') return ['MINIMAL', 'HIGH'];
+  const known = knownModelThinkingLevels(provider, model);
+  if (known) return known;
   if (provider === 'openrouter') return ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'];
   if (provider === 'muse') return ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'];
-  if (provider === 'gemini' && model === 'gemini-3.1-pro-preview') return ['LOW', 'MEDIUM', 'HIGH'];
   return ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'];
 }
 
@@ -432,8 +425,8 @@ export function resolveCliOptions(
     DEFAULT_CONFIG.progress,
   );
 
-  if (!isKimiK3 && provider !== 'openrouter' && thinking === 'MAX') {
-    throw configurationError(`${name('thinking')} max is supported by Kimi K3 and model-dependent OpenRouter routes`);
+  if (!isKimiK3 && provider !== 'openrouter' && !(provider === 'muse' && model === 'muse-spark-1.3') && thinking === 'MAX') {
+    throw configurationError(`${name('thinking')} max is supported by Kimi K3, Muse Spark 1.3 Standard, and model-dependent OpenRouter routes`);
   }
   if (provider !== 'openrouter' && provider !== 'muse' && thinking === 'XHIGH') {
     throw configurationError(`${name('thinking')} xhigh is supported by Muse and model-dependent OpenRouter routes`);
@@ -455,6 +448,10 @@ export function resolveCliOptions(
   }
   if (provider === 'kimi' && model === 'kimi-k2.6' && thinking !== 'MINIMAL' && thinking !== 'HIGH') {
     throw configurationError(`Direct Kimi K2.6 supports only instant mode (${name('thinking')} minimal) or thinking mode (${name('thinking')} high)`);
+  }
+  const knownThinking = knownModelThinkingLevels(provider, model);
+  if (knownThinking && !knownThinking.includes(thinking)) {
+    throw configurationError(`${model} supports ${name('thinking')} ${knownThinking.map((level) => level.toLowerCase()).join(', ')}; ${thinking.toLowerCase()} is not supported`);
   }
   if (hasSchema && preset) throw configurationError(`${name('schema')} cannot be combined with ${name('preset')}`);
   if (effectiveMode === 'template' && !preset) throw configurationError(`${name('preset')} is required when ${name('mode')} template is selected`);
