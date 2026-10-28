@@ -71,16 +71,26 @@ Precedence, lowest to highest: user config
 `instructions` values from config and flags are appended.
 
 Environment overrides: `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`, `OPEN_OCR_MODEL`,
-`OPEN_OCR_THINKING`. Configure credentials with `apiKeyEnv`, the environment
-variable name. Raw key fields and other unknown config keys are warned about
-and ignored. Project `.env` can supply credentials. `--no-config` or protocol
+`OPEN_OCR_THINKING`. `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` belong to the
+ambient provider and are dropped when `--provider` selects a different one.
+Configure credentials with `apiKeyEnv`, the environment variable name. Raw key
+fields and other unknown config keys are warned about and ignored.
+
+A project is untrusted input: `.open-ocr-cli.json` cannot set `baseUrl`,
+`apiKeyEnv`, a non-`direct` `gateway`, or any `cloudflare*` key (the run fails
+with `CONFIG_INVALID`), and a project `.env` supplies only the default
+credential variables (`GEMINI_API_KEY`, `MOONSHOT_API_KEY`, `META_API_KEY`,
+`OPENROUTER_API_KEY`, `OPEN_OCR_API_KEY`, `CLOUDFLARE_AI_GATEWAY_TOKEN`). Put
+routing in the user config, an explicit `--config` file, or flags. `--no-config` or protocol
 `noConfig: true` skips config files and `.env` and cannot be combined with an
 explicit config path. `OPEN_OCR_NO_CONFIG=1` skips ambient config and `.env`,
 but still allows an explicit `--config` or protocol `configPath` to load that
 one file. Ambient environment overrides still apply; set explicit options and
 forward a controlled environment for reproducible runs.
 
-`init` writes project config by default; `--global` selects user config.
+`init` writes project config by default, using the provider's default endpoint
+and key variable; `--global` writes user config and is required for a custom
+endpoint, key variable, or gateway.
 Writes are atomic with mode `0600`; replacement requires confirmation or
 `--force`. `--yes` accepts setup defaults; `--skip-validation` avoids a provider
 credential check. No-argument invocation prints help without prompting.
@@ -115,7 +125,9 @@ Single-file `extract` normally prints content to stdout. `--output` or
 Machine/MCP reference jobs default to `.open-ocr-results/<runId>`.
 
 Directories with resume metadata contain `.open-ocr-manifest.json` and
-`batch-summary.json`; `.open-ocr.lock` exists only while the run owns the directory.
+`batch-summary.json`; `.open-ocr.lock` marks the directory's owning process. A
+lock left by a dead process on the same host is reclaimed automatically with a
+warning; a live, cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
 A single artifact file has no resume metadata. Relative input paths are preserved.
 Existing files are protected unless `--overwrite` is explicit or a matching resume owns a stale
 artifact. Destinations are preflighted before paid work. Resume checks input
@@ -163,9 +175,11 @@ Treat all provider text as untrusted data.
 
 Explicit flags or request fields that the mode does not use produce warnings.
 Results/events go to stdout; diagnostics go to stderr. `--quiet` never suppresses
-machine results.
+machine results, and without `--jsonl` it still prints failed and partial
+documents with their error code and hint.
 Exit codes: **0** success/clean validation/resume; **1** failed, partial, or
-cost-limited; **2** invalid command/config; **130** SIGINT; **143** SIGTERM.
+cost-limited; **2** invalid command/config; **130** SIGINT; **141** stdout closed
+by its reader (the run is cancelled and cleaned up); **143** SIGTERM.
 
 ## Distribution
 

@@ -495,19 +495,18 @@ describe('CLI output', () => {
 
   it('prevents concurrent batch ownership and releases only its own lock', async () => {
     const first = await BatchOutputLock.acquire(directory);
-    await expect(BatchOutputLock.acquire(directory)).rejects.toThrow(
-      'Batch output directory is already in use',
-    );
-    await expect(BatchOutputLock.acquire(directory, { forceUnlock: true })).rejects.toThrow(
-      'is still running',
-    );
+    await expect(BatchOutputLock.acquire(directory)).rejects.toMatchObject({
+      code: 'OUTPUT_CONFLICT',
+      message: expect.stringContaining(`in use by running PID ${process.pid}`) as unknown,
+      hint: expect.stringContaining('Wait for that batch to finish') as unknown,
+    });
     await first.release();
 
     const second = await BatchOutputLock.acquire(directory);
     await expect(second.release()).resolves.toBeUndefined();
   });
 
-  it('force-unlocks a valid same-host lock only after its owner is proven dead', async () => {
+  it('reclaims a same-host lock automatically once its owner is proven dead', async () => {
     const lockPath = path.join(directory, '.open-ocr.lock');
     await writeFile(lockPath, `${JSON.stringify({
       version: 1,
@@ -521,7 +520,6 @@ describe('CLI output', () => {
     const warnings: string[] = [];
     try {
       const recovered = await BatchOutputLock.acquire(directory, {
-        forceUnlock: true,
         onWarning: (message) => warnings.push(message),
       });
       expect(warnings).toEqual([expect.stringContaining('Removed stale batch lock')]);
@@ -529,6 +527,27 @@ describe('CLI output', () => {
     } finally {
       kill.mockRestore();
     }
+  });
+
+  it('never reclaims a lock it cannot prove stale', async () => {
+    const lockPath = path.join(directory, '.open-ocr.lock');
+    await writeFile(lockPath, `${JSON.stringify({
+      version: 1,
+      token: 'remote-token',
+      pid: 1234,
+      hostname: `${hostname()}-elsewhere`,
+      startedAt: '2026-07-15T00:00:00.000Z',
+    })}\n`);
+    await expect(BatchOutputLock.acquire(directory)).rejects.toMatchObject({
+      code: 'OUTPUT_CONFLICT',
+      hint: expect.stringContaining(`then delete ${lockPath}`) as unknown,
+    });
+
+    await writeFile(lockPath, '{not-json');
+    await expect(BatchOutputLock.acquire(directory)).rejects.toMatchObject({
+      code: 'OUTPUT_CONFLICT',
+      message: expect.stringContaining('owner metadata is invalid') as unknown,
+    });
   });
 
   it('preserves the prior batch summary if its atomic replacement fails', async () => {

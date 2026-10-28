@@ -1,8 +1,9 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { parseEnv } from 'node:util';
 
 import type { ThinkingLevel } from '@open-ocr/engine/gemini';
 import {
@@ -264,16 +265,73 @@ export async function loadCliConfig(
     readConfigFile(userPath, false),
     readConfigFile(projectPath, false),
   ]);
+  assertProjectConfigDoesNotRoute(project);
   return { ...user, ...project, ...explicit };
 }
+
+/**
+ * Keys that decide which host receives a request and which environment
+ * variable's value travels with it as the credential.
+ */
+const ROUTING_CONFIG_KEYS = [
+  'baseUrl', 'apiKeyEnv', 'cloudflareAccountId', 'cloudflareGatewayId', 'cloudflareTokenEnv',
+  'cloudflareProvider', 'cloudflareByok', 'cloudflareByokAlias',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+/**
+ * `.open-ocr-cli.json` arrives with whatever repository the caller (often a
+ * coding agent) is standing in. If it could set routing, a cloned repository
+ * could pair its own `baseUrl` with `apiKeyEnv: "ANY_SECRET"` and receive that
+ * secret plus every document. Routing therefore comes only from sources the
+ * user chose: the user config, an explicit --config file, flags, or the
+ * environment. Refusing (rather than ignoring) keeps a repository that relied
+ * on it from silently sending documents somewhere else.
+ */
+function assertProjectConfigDoesNotRoute(project: CliConfigFile): void {
+  const routing: string[] = ROUTING_CONFIG_KEYS.filter((key) => project[key] !== undefined);
+  if (project.gateway !== undefined && project.gateway !== 'direct') routing.unshift('gateway');
+  if (routing.length === 0) return;
+  throw new CliExitError(
+    `.open-ocr-cli.json cannot set ${routing.join(', ')}: a project configuration may not choose where requests or credentials are sent`,
+    2,
+    {
+      code: 'CONFIG_INVALID',
+      category: 'configuration',
+      retryable: false,
+      hint: 'Move these keys to ~/.config/open-ocr-cli/config.json or a file passed with --config, pass them as flags, or run with --no-config.',
+    },
+  );
+}
+
+/**
+ * The only variables a project `.env` may supply: each provider's default
+ * credential and the default gateway token. Anything else in that file
+ * (`OPEN_OCR_GATEWAY`, `CLOUDFLARE_ACCOUNT_ID`, `OPEN_OCR_MCP_CONFIRM`...) would
+ * let a repository redirect the user's credential or change server policy.
+ */
+export const PROJECT_ENV_CREDENTIALS: readonly string[] = [
+  ...new Set([...PROVIDER_IDS.map(providerDefaultApiKeyEnv), 'CLOUDFLARE_AI_GATEWAY_TOKEN']),
+];
 
 export function loadLocalEnv(cwd: string, disabled = false): void {
   // Ambient OPEN_OCR_NO_CONFIG always blocks project .env, even when a caller
   // passes an explicit config path for option resolution.
   if (disabled || environmentDisablesConfig()) return;
   const envPath = path.join(cwd, '.env');
-  if (existsSync(envPath) && typeof process.loadEnvFile === 'function') {
-    process.loadEnvFile(envPath);
+  if (!existsSync(envPath)) return;
+  const parsed = parseEnv(readFileSync(envPath, 'utf8'));
+  // Values already in the environment win, matching `process.loadEnvFile`.
+  for (const name of PROJECT_ENV_CREDENTIALS) {
+    const value = parsed[name];
+    if (value !== undefined && process.env[name] === undefined) process.env[name] = value;
+  }
+  const ignored = Object.keys(parsed).filter((name) => (
+    !PROJECT_ENV_CREDENTIALS.includes(name) && /^(?:OPEN_OCR_|CLOUDFLARE_)/.test(name)
+  )).sort();
+  if (ignored.length > 0) {
+    process.stderr.write(
+      `${envPath}: ignoring ${ignored.join(', ')}; a project .env may only supply ${PROJECT_ENV_CREDENTIALS.join(', ')}\n`,
+    );
   }
 }
 
@@ -364,46 +422,64 @@ export function resolveCliOptions(
   vocabulary: OptionVocabulary = 'flag',
 ): ResolvedCliOptions {
   const name = (key: keyof typeof OPTION_NAMES): string => OPTION_NAMES[key][vocabulary === 'flag' ? 0 : 1];
+  // OPEN_OCR_* variables are a layer of their own between flags and files. An
+  // error about one names the variable: the caller never typed the flag, and
+  // "fix --model" sends them looking in the wrong place.
+  const envProvider = process.env.OPEN_OCR_PROVIDER;
+  const envGateway = process.env.OPEN_OCR_GATEWAY;
   const configuredProvider = fileConfig.provider ?? DEFAULT_CONFIG.provider;
-  const selectedProvider = flags.provider ?? process.env.OPEN_OCR_PROVIDER;
+  const selectedProvider = flags.provider ?? envProvider;
   const provider = oneOf<ProviderId>(
     selectedProvider ?? configuredProvider,
     PROVIDER_IDS,
-    name('provider'),
+    flags.provider === undefined && envProvider !== undefined ? 'OPEN_OCR_PROVIDER' : name('provider'),
     DEFAULT_CONFIG.provider,
   );
   const providerContextMatches = selectedProvider === undefined || selectedProvider === configuredProvider;
   const configuredGateway = fileConfig.gateway ?? DEFAULT_CONFIG.gateway;
-  const selectedGateway = flags.gateway ?? process.env.OPEN_OCR_GATEWAY;
+  const selectedGateway = flags.gateway ?? envGateway;
   const gateway = oneOf<GatewayId>(
     selectedGateway ?? configuredGateway,
     GATEWAY_IDS,
-    name('gateway'),
+    flags.gateway === undefined && envGateway !== undefined ? 'OPEN_OCR_GATEWAY' : name('gateway'),
     DEFAULT_CONFIG.gateway,
   );
   const gatewayContextMatches = selectedGateway === undefined || selectedGateway === configuredGateway;
-  const selectedModel = flags.model
-    ?? process.env.OPEN_OCR_MODEL;
+  // OPEN_OCR_MODEL and OPEN_OCR_THINKING were chosen for the ambient provider
+  // (OPEN_OCR_PROVIDER, else the configured one). A --provider flag that
+  // switches away from it drops them, exactly as it drops the file's model:
+  // `kimi/gemini-3.8-flash` validates locally and fails upstream.
+  const envContextMatches = flags.provider === undefined
+    || flags.provider === (envProvider ?? configuredProvider);
+  const envModel = envContextMatches ? process.env.OPEN_OCR_MODEL : undefined;
+  const selectedModel = flags.model ?? envModel;
   const configuredModel = providerContextMatches
     ? fileConfig.model ?? providerDefaultModel(provider)
     : providerDefaultModel(provider);
   const model = selectedModel
     ?? configuredModel
     ?? providerDefaultModel(provider);
-  if (!model) throw configurationError(`${name('model')} is required for the openai-compatible provider`);
+  const modelLabel = flags.model === undefined && envModel !== undefined ? 'OPEN_OCR_MODEL' : name('model');
+  if (!model) throw configurationError(`${modelLabel} is required for the openai-compatible provider`);
   if (provider === 'gemini' && !GEMINI_MODELS.includes(model as (typeof GEMINI_MODELS)[number])) {
-    throw configurationError(`${name('model')} must be one of: ${SUPPORTED_MODELS.join(', ')}`);
+    throw configurationError(`${modelLabel} must be one of: ${SUPPORTED_MODELS.join(', ')}`);
   }
   const modelContextMatches = providerContextMatches
     && (selectedModel === undefined || selectedModel === configuredModel);
+  const envThinking = envContextMatches && (flags.model === undefined || flags.model === (envModel ?? configuredModel))
+    ? process.env.OPEN_OCR_THINKING
+    : undefined;
   const configuredThinking = flags.thinking
-    ?? process.env.OPEN_OCR_THINKING
+    ?? envThinking
     ?? (modelContextMatches ? fileConfig.thinking : undefined);
+  const thinkingLabel = flags.thinking === undefined && envThinking !== undefined
+    ? 'OPEN_OCR_THINKING'
+    : name('thinking');
   const isKimiK3 = isKimiK3Route(provider, model);
   let thinking = oneOf<ThinkingLevel>(
     configuredThinking?.toUpperCase(),
     ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'],
-    name('thinking'),
+    thinkingLabel,
     defaultCliThinkingLevel(provider, model),
   );
   const schemaPath = flags.schema ?? fileConfig.schema;
@@ -426,32 +502,32 @@ export function resolveCliOptions(
   );
 
   if (!isKimiK3 && provider !== 'openrouter' && !(provider === 'muse' && model === 'muse-spark-1.3') && thinking === 'MAX') {
-    throw configurationError(`${name('thinking')} max is supported by Kimi K3, Muse Spark 1.3 Standard, and model-dependent OpenRouter routes`);
+    throw configurationError(`${thinkingLabel} max is supported by Kimi K3, Muse Spark 1.3 Standard, and model-dependent OpenRouter routes`);
   }
   if (provider !== 'openrouter' && provider !== 'muse' && thinking === 'XHIGH') {
-    throw configurationError(`${name('thinking')} xhigh is supported by Muse and model-dependent OpenRouter routes`);
+    throw configurationError(`${thinkingLabel} xhigh is supported by Muse and model-dependent OpenRouter routes`);
   }
   if (provider === 'gemini' && model === 'gemini-3.1-pro-preview' && thinking === 'MINIMAL') {
-    throw configurationError(`Gemini 3.1 Pro supports ${name('thinking')} low, medium, or high; minimal is not supported`);
+    throw configurationError(`Gemini 3.1 Pro supports ${thinkingLabel} low, medium, or high; minimal is not supported`);
   }
   if (isKimiK3 && thinking === 'MEDIUM') {
-    throw configurationError(`Kimi K3 supports ${name('thinking')} low, high, or max; medium would be an ambiguous silent upgrade`);
+    throw configurationError(`Kimi K3 supports ${thinkingLabel} low, high, or max; medium would be an ambiguous silent upgrade`);
   }
   if (isKimiK3 && thinking === 'XHIGH') {
-    throw configurationError(`Kimi K3 supports ${name('thinking')} low, high, or max; xhigh is not a Kimi K3 effort`);
+    throw configurationError(`Kimi K3 supports ${thinkingLabel} low, high, or max; xhigh is not a Kimi K3 effort`);
   }
   if (isKimiK3 && thinking === 'MINIMAL') {
     thinking = 'LOW';
   }
   if (provider === 'kimi' && /^kimi-k2\.7-code/u.test(model) && thinking !== 'HIGH') {
-    throw configurationError(`Kimi K2.7 Code always thinks and does not expose configurable reasoning effort; use ${name('thinking')} high`);
+    throw configurationError(`Kimi K2.7 Code always thinks and does not expose configurable reasoning effort; use ${thinkingLabel} high`);
   }
   if (provider === 'kimi' && model === 'kimi-k2.6' && thinking !== 'MINIMAL' && thinking !== 'HIGH') {
-    throw configurationError(`Direct Kimi K2.6 supports only instant mode (${name('thinking')} minimal) or thinking mode (${name('thinking')} high)`);
+    throw configurationError(`Direct Kimi K2.6 supports only instant mode (${thinkingLabel} minimal) or thinking mode (${thinkingLabel} high)`);
   }
   const knownThinking = knownModelThinkingLevels(provider, model);
   if (knownThinking && !knownThinking.includes(thinking)) {
-    throw configurationError(`${model} supports ${name('thinking')} ${knownThinking.map((level) => level.toLowerCase()).join(', ')}; ${thinking.toLowerCase()} is not supported`);
+    throw configurationError(`${model} supports ${thinkingLabel} ${knownThinking.map((level) => level.toLowerCase()).join(', ')}; ${thinking.toLowerCase()} is not supported`);
   }
   if (hasSchema && preset) throw configurationError(`${name('schema')} cannot be combined with ${name('preset')}`);
   if (effectiveMode === 'template' && !preset) throw configurationError(`${name('preset')} is required when ${name('mode')} template is selected`);
@@ -641,7 +717,6 @@ export function resolveCliOptions(
     defaultExcludes: flags.defaultExcludes ?? fileConfig.defaultExcludes ?? DEFAULT_CONFIG.defaultExcludes,
     resume: flags.resume ?? fileConfig.resume ?? DEFAULT_CONFIG.resume,
     overwrite: flags.overwrite ?? fileConfig.overwrite ?? DEFAULT_CONFIG.overwrite,
-    forceUnlock: flags.forceUnlock ?? false,
     failFast: flags.failFast ?? fileConfig.failFast ?? DEFAULT_CONFIG.failFast,
     jsonl: flags.jsonl ?? DEFAULT_CONFIG.jsonl,
     dryRun: flags.dryRun ?? DEFAULT_CONFIG.dryRun,

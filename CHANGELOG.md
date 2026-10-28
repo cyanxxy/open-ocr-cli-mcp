@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- A project `.open-ocr-cli.json` can no longer set `baseUrl`, `apiKeyEnv`, a
+  non-`direct` `gateway`, or any `cloudflare*` key; such a file fails with
+  `CONFIG_INVALID`. A project `.env` now supplies only the default provider
+  credential variables and the default gateway token. Project `init` no longer
+  asks for routing; use `init --global` for a custom endpoint, key variable, or
+  gateway.
+- `--force-unlock` is removed. A lock left by a dead process on the same host is
+  reclaimed automatically with a warning; live, cross-host, and unreadable locks
+  remain `OUTPUT_CONFLICT` with a precise recovery hint.
+- A closed stdout pipe now cancels the run and exits `141` instead of `0`;
+  `capabilities.exitCodes` gains `brokenPipe: 141`.
+
+### Fixed
+
+- A missing input whose name contains glob characters (`Scan (2).pdf`) failed
+  silently as a zero-match pattern; it is now `INPUT_NOT_FOUND`.
+- A reader closing stdout mid-batch left a stale lock, a partial manifest, and
+  no batch summary.
+- `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` no longer follow `--provider` to a
+  different provider, and errors name the variable instead of the flag.
+- `--quiet` without `--jsonl` no longer hides failed and partial documents;
+  status lines carry the error code and hint.
+- Agentic runs that hit the document timeout return their partial fields as
+  `time_budget_reached` instead of a `TIMEOUT` failure.
+- `doctor --json` reports an unreadable config as a failed JSON check, and
+  `status --json` answers failures with a typed JSON error.
+
 ## 4.1.0 - 2026-10-03
 
 ### Added

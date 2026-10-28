@@ -110,7 +110,6 @@ export interface ExtractCommandFlags {
   defaultExcludes?: boolean;
   resume?: boolean;
   overwrite?: boolean;
-  forceUnlock?: boolean;
   failFast?: boolean;
   jsonl?: boolean;
   dryRun?: boolean;
@@ -196,7 +195,6 @@ export interface ResolvedCliOptions {
   defaultExcludes: boolean;
   resume: boolean;
   overwrite: boolean;
-  forceUnlock: boolean;
   failFast: boolean;
   jsonl: boolean;
   dryRun: boolean;

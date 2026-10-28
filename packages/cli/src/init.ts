@@ -30,7 +30,7 @@ import {
   credentialSetupGuidance,
   defaultCliThinkingLevel,
 } from './config';
-import { asCliExitError } from './errors';
+import { asCliExitError, CliExitError } from './errors';
 import {
   isPromptAbort,
   promptSelect,
@@ -67,6 +67,7 @@ interface InitRuntime {
   prompter?: InitPrompter;
   validateCredentials?: (apiKey: string, model: string) => Promise<void>;
   writeOutput?: (text: string) => void;
+  homeDirectory?: string;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -240,8 +241,20 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
   }
   const prompter = runtime.prompter ?? terminalPrompter();
   const configPath = flags.global
-    ? path.join(homedir(), '.config', 'open-ocr-cli', 'config.json')
+    ? path.join(runtime.homeDirectory ?? homedir(), '.config', 'open-ocr-cli', 'config.json')
     : path.join(cwd, '.open-ocr-cli.json');
+  // A project file cannot choose where requests and credentials go (see
+  // loadCliConfig), so project setup keeps the provider's own endpoint and key
+  // variable and never asks about them.
+  const projectScoped = !flags.global;
+  if (projectScoped && flags.gateway !== undefined && flags.gateway !== 'direct') {
+    throw new CliExitError('Gateway routing cannot be stored in a project configuration', 2, {
+      code: 'CONFIG_INVALID',
+      category: 'configuration',
+      retryable: false,
+      hint: 'Run `open-ocr-cli init --global` to configure a gateway in your user configuration.',
+    });
+  }
 
   try {
     if (await pathExists(configPath) && !flags.force) {
@@ -276,7 +289,7 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
           );
     const gateway = flags.gateway !== undefined
       ? choice<GatewayId>(flags.gateway, GATEWAY_IDS, 'Gateway')
-      : flags.yes
+      : flags.yes || projectScoped
         ? 'direct'
         : await promptChoice(
             prompter,
@@ -356,12 +369,14 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
     if (needsCustomPrice && (inputPricePerMillionUsd === undefined || outputPricePerMillionUsd === undefined)) {
       throw new Error('A maximum cost for this provider requires both input and output token prices');
     }
-    const apiKeyEnv = await ask('API key environment variable', providerDefaultApiKeyEnv(provider));
+    const apiKeyEnv = projectScoped
+      ? providerDefaultApiKeyEnv(provider)
+      : await ask('API key environment variable', providerDefaultApiKeyEnv(provider));
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
       throw new Error('API key environment variable must be a valid environment-variable name');
     }
 
-    const baseUrl = gateway === 'direct'
+    const baseUrl = gateway === 'direct' && !projectScoped
       ? await ask('Provider API base URL', providerDefaultBaseUrl(provider))
       : undefined;
     const cloudflareAccountId = gateway === 'cloudflare'
@@ -400,7 +415,7 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
       timeoutSeconds: 120,
       resume: true,
       format: 'markdown',
-      apiKeyEnv,
+      ...(projectScoped ? {} : { apiKeyEnv }),
       ...(baseUrl ? { baseUrl } : {}),
       ...(cloudflareAccountId ? { cloudflareAccountId } : {}),
       ...(cloudflareGatewayId ? { cloudflareGatewayId } : {}),
@@ -453,6 +468,12 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
 
     await writeConfig(configPath, config);
     writeOutput(`Created ${configPath}\n`);
+    if (projectScoped) {
+      writeOutput(
+        `Project configuration uses the ${provider} default endpoint and ${apiKeyEnv}; `
+        + 'run `open-ocr-cli init --global` to set a custom endpoint, key variable, or gateway.\n',
+      );
+    }
     if (credentialStatus === 'valid') writeOutput(`${credentialEnvironmentVariable}: credential validated\n`);
     else if (credentialStatus === 'missing') {
       const credentialProvider = cloudflareByok ? 'Cloudflare AI Gateway' : provider;

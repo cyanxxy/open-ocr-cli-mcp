@@ -77,7 +77,8 @@ and save it as `invoice.schema.json` before running the schema example.
 
 Results and JSONL events use stdout; diagnostics use stderr. Exit codes:
 `0` success/validation/resume, `1` failed/partial/cost-limited,
-`2` invalid command/configuration, `130` SIGINT, `143` SIGTERM.
+`2` invalid command/configuration, `130` SIGINT, `141` stdout closed by its
+reader, `143` SIGTERM.
 
 [Full CLI reference](https://github.com/cyanxxy/open-ocr-cli-mcp/blob/main/docs/cli-reference.md) ·
 [Source and issues](https://github.com/cyanxxy/open-ocr-cli-mcp) ·

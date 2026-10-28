@@ -78,6 +78,45 @@ describe('CLI configuration', () => {
     expect(options.concurrency).toBe(6);
   });
 
+  it('drops OPEN_OCR_MODEL and OPEN_OCR_THINKING when --provider switches away from their provider', () => {
+    process.env.MOONSHOT_API_KEY = 'kimi-key';
+    process.env.GEMINI_API_KEY = 'test-key';
+    process.env.OPEN_OCR_MODEL = 'gemini-3.8-flash';
+    process.env.OPEN_OCR_THINKING = 'low';
+
+    expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
+      provider: 'kimi',
+      model: 'kimi-k3',
+      thinking: 'MAX',
+    });
+    // The same provider keeps them, whether named by flag or left ambient.
+    expect(resolveCliOptions({ provider: 'gemini' }, {}, '/workspace')).toMatchObject({
+      model: 'gemini-3.8-flash',
+      thinking: 'LOW',
+    });
+    process.env.OPEN_OCR_PROVIDER = 'kimi';
+    process.env.OPEN_OCR_MODEL = 'kimi-k3';
+    process.env.OPEN_OCR_THINKING = 'low';
+    expect(resolveCliOptions({}, {}, '/workspace')).toMatchObject({ provider: 'kimi', model: 'kimi-k3', thinking: 'LOW' });
+    expect(resolveCliOptions({ provider: 'gemini' }, {}, '/workspace')).toMatchObject({
+      provider: 'gemini',
+      model: 'gemini-3.8-flash',
+    });
+  });
+
+  it('names the environment variable, not the flag, when an OPEN_OCR_* value is invalid', () => {
+    process.env.GEMINI_API_KEY = 'test-key';
+    process.env.OPEN_OCR_MODEL = 'not-a-gemini-model';
+    expect(() => resolveCliOptions({}, {}, '/workspace')).toThrow('OPEN_OCR_MODEL must be one of');
+    expect(() => resolveCliOptions({ model: 'not-a-gemini-model' }, {}, '/workspace')).toThrow('--model must be one of');
+    delete process.env.OPEN_OCR_MODEL;
+    process.env.OPEN_OCR_THINKING = 'max';
+    expect(() => resolveCliOptions({}, {}, '/workspace')).toThrow('OPEN_OCR_THINKING max is supported');
+    delete process.env.OPEN_OCR_THINKING;
+    process.env.OPEN_OCR_PROVIDER = 'nope';
+    expect(() => resolveCliOptions({}, {}, '/workspace')).toThrow('OPEN_OCR_PROVIDER must be one of');
+  });
+
   it('resolves named provider defaults and arbitrary OpenRouter model IDs', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
@@ -691,15 +730,79 @@ describe('CLI configuration', () => {
     }
   });
 
-  it('loads a project-local .env file for first-run credential setup', async () => {
+  it('loads only default provider credentials from a project-local .env file', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-env-'));
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.CLOUDFLARE_ACCOUNT_ID;
+    delete process.env.OPEN_OCR_MCP_CONFIRM;
     delete process.env.PROJECT_GEMINI_KEY;
+    const warning = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      await writeFile(path.join(directory, '.env'), 'PROJECT_GEMINI_KEY=from-project-env\n');
+      await writeFile(path.join(directory, '.env'), [
+        'GEMINI_API_KEY=from-project-env',
+        'OPEN_OCR_GATEWAY=cloudflare',
+        'CLOUDFLARE_ACCOUNT_ID=attacker',
+        'OPEN_OCR_MCP_CONFIRM=1',
+        'PROJECT_GEMINI_KEY=unrelated',
+        '',
+      ].join('\n'));
       loadLocalEnv(directory);
-      expect(process.env.PROJECT_GEMINI_KEY).toBe('from-project-env');
+      expect(process.env.GEMINI_API_KEY).toBe('from-project-env');
+      expect(process.env.OPEN_OCR_GATEWAY).toBeUndefined();
+      expect(process.env.CLOUDFLARE_ACCOUNT_ID).toBeUndefined();
+      expect(process.env.OPEN_OCR_MCP_CONFIRM).toBeUndefined();
+      expect(process.env.PROJECT_GEMINI_KEY).toBeUndefined();
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining('ignoring CLOUDFLARE_ACCOUNT_ID, OPEN_OCR_GATEWAY, OPEN_OCR_MCP_CONFIRM'),
+      );
     } finally {
-      delete process.env.PROJECT_GEMINI_KEY;
+      warning.mockRestore();
+      delete process.env.CLOUDFLARE_ACCOUNT_ID;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an already-set credential over the project .env value', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-env-'));
+    process.env.GEMINI_API_KEY = 'from-shell';
+    try {
+      await writeFile(path.join(directory, '.env'), 'GEMINI_API_KEY=from-project-env\n');
+      loadLocalEnv(directory);
+      expect(process.env.GEMINI_API_KEY).toBe('from-shell');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a project configuration that would choose where credentials are sent', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-routing-'));
+    try {
+      await writeFile(path.join(directory, '.open-ocr-cli.json'), JSON.stringify({
+        provider: 'openai-compatible',
+        model: 'm',
+        baseUrl: 'http://attacker.example/v1',
+        apiKeyEnv: 'MY_SECRET_TOKEN',
+      }));
+      await expect(loadCliConfig(directory)).rejects.toMatchObject({
+        code: 'CONFIG_INVALID',
+        message: expect.stringContaining('cannot set baseUrl, apiKeyEnv') as unknown,
+      });
+
+      await writeFile(path.join(directory, '.open-ocr-cli.json'), JSON.stringify({ gateway: 'cloudflare' }));
+      await expect(loadCliConfig(directory)).rejects.toMatchObject({ message: expect.stringContaining('cannot set gateway') as unknown });
+
+      // Non-routing settings, and pinning the default direct route, stay allowed.
+      await writeFile(path.join(directory, '.open-ocr-cli.json'), JSON.stringify({
+        provider: 'kimi', gateway: 'direct', concurrency: 3,
+      }));
+      await expect(loadCliConfig(directory)).resolves.toMatchObject({ provider: 'kimi', concurrency: 3 });
+
+      // The same file passed explicitly is the user's own choice.
+      await writeFile(path.join(directory, 'routing.json'), JSON.stringify({ baseUrl: 'https://proxy.example/v1' }));
+      await expect(loadCliConfig(directory, 'routing.json', true)).resolves.toMatchObject({
+        baseUrl: 'https://proxy.example/v1',
+      });
+    } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });

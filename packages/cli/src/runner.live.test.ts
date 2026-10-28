@@ -132,7 +132,7 @@ describe('CLI live batch orchestration', () => {
         thrown = error;
       }
       expect(thrown).toBeInstanceOf(Error);
-      expect((thrown as Error).message).toContain('Batch output directory is already in use');
+      expect((thrown as Error).message).toContain('Batch output directory is in use by running PID');
       expect(cliExitCode(thrown)).toBe(2);
       expect(mockExtractTextFromFile).not.toHaveBeenCalled();
     } finally {

@@ -57,12 +57,13 @@
     "exitCodes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["success","incomplete","invalid","interrupted","terminated"],
+      "required": ["success","incomplete","invalid","interrupted","brokenPipe","terminated"],
       "properties": {
         "success": {"const":0},
         "incomplete": {"const":1},
         "invalid": {"const":2},
         "interrupted": {"const":130},
+        "brokenPipe": {"const":141},
         "terminated": {"const":143}
       }
     },

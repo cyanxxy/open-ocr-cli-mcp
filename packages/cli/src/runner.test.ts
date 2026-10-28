@@ -86,6 +86,35 @@ describe('CLI batch runner', () => {
     expect(JSON.stringify(events)).toContain('does not match its declared type');
   });
 
+  it('still reports failures under --quiet when no --jsonl stream carries them', async () => {
+    await writeFile(path.join(directory, 'good.jpg'), JPEG_BYTES);
+    await writeFile(path.join(directory, 'spoofed.jpg'), 'plain text');
+    const options = resolveCliOptions({ dryRun: true, quiet: true }, {}, directory);
+    const inputs = await discoverInputs(['.'], options);
+    const stderr: string[] = [];
+
+    await runBatch(inputs, options, {
+      abortController: new AbortController(),
+      writeStdout: () => undefined,
+      writeStderr: (text) => stderr.push(text),
+    });
+
+    // Only the failure is printed; the validated document stays quiet.
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toContain('spoofed.jpg');
+    expect(stderr[0]).toContain('[INPUT_INVALID]');
+    expect(stderr[0]).toContain('hint: ');
+
+    const jsonlStderr: string[] = [];
+    await runBatch(inputs, { ...options, jsonl: true }, {
+      abortController: new AbortController(),
+      eventSink: () => undefined,
+      writeStdout: () => undefined,
+      writeStderr: (text) => jsonlStderr.push(text),
+    });
+    expect(jsonlStderr).toEqual([]);
+  });
+
   it('makes a failed document and a shrunken input set machine-readable in --jsonl', async () => {
     await writeFile(path.join(directory, 'good.jpg'), JPEG_BYTES);
     await writeFile(path.join(directory, 'spoofed.jpg'), 'plain text');

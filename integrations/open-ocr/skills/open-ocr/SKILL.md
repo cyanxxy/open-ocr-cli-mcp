@@ -187,7 +187,7 @@ or text feedback and do not treat missing `structuredContent` as success.
 - `NOT_RUN`: report a fail-fast remainder and rerun only after addressing the triggering failure.
 - `PROVIDER_FAILURE`, `INTERNAL`: report the typed error and relevant non-secret diagnostics; avoid unbounded retries.
 
-Exit status `0` means success or clean validation/resume, `1` means failed, partial, or cost-limited work, `2` means request/configuration failure, `130` means SIGINT, and `143` means SIGTERM.
+Exit status `0` means success or clean validation/resume, `1` means failed, partial, or cost-limited work, `2` means request/configuration failure, `130` means SIGINT, `141` means stdout was closed by its reader (the run was cancelled), and `143` means SIGTERM.
 
 ## Complete the Task
 

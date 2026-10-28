@@ -331,6 +331,7 @@ export interface OcrCapabilities {
     incomplete: 1;
     invalid: 2;
     interrupted: 130;
+    brokenPipe: 141;
     terminated: 143;
   };
   providers: Array<{
@@ -1243,6 +1244,7 @@ export function createOcrCapabilities(cliVersion: string): OcrCapabilities {
       incomplete: 1,
       invalid: 2,
       interrupted: 130,
+      brokenPipe: 141,
       terminated: 143,
     },
     providers: Object.values(PROVIDER_PROFILES).map((profile) => ({

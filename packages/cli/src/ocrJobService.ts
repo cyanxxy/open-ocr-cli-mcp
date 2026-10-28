@@ -75,7 +75,24 @@ export type OcrDocumentExtractor = (
   signal: AbortSignal,
   onStep: (step: AgentStep) => void,
   providerRuntime: ProviderExecutionContext,
+  /** Epoch ms by which a self-budgeting (agentic) extraction must return. */
+  budgetDeadline: number,
 ) => Promise<OcrExtractionResult>;
+
+/** Upper bound on how early an agent's own budget ends before the hard timeout. */
+const AGENT_FINALIZE_MARGIN_MS = 2_000;
+
+/**
+ * The deadline an agentic extraction budgets against. The hard document
+ * timeout starts before the input is read; an agent given the same duration
+ * starts later, so the hard timer always won and the partial fields the agent
+ * had collected were discarded as a TIMEOUT. Ending the agent's budget first
+ * (by at most 2s, or a tenth of short timeouts) lets it stop at
+ * `budget_exhausted` and return them as a `time_budget_reached` partial.
+ */
+export function agentBudgetDeadline(startedAtMs: number, timeoutMs: number): number {
+  return startedAtMs + timeoutMs - Math.min(AGENT_FINALIZE_MARGIN_MS, Math.floor(timeoutMs / 10));
+}
 
 export interface OcrJobServiceDependencies {
   extractDocument: OcrDocumentExtractor;
@@ -417,10 +434,7 @@ export class OcrJobService {
       plan = await this.planOutput(inputs, options, runtime);
       if (plan.needsManifest && !options.dryRun) {
         try {
-          batchLock = await BatchOutputLock.acquire(defaultOutputDirectory(options), {
-            forceUnlock: options.forceUnlock,
-            onWarning: warn,
-          });
+          batchLock = await BatchOutputLock.acquire(defaultOutputDirectory(options), { onWarning: warn });
         } catch (error) {
           throw asCliExitError(error, 2);
         }
@@ -630,6 +644,7 @@ export class OcrJobService {
           runtime.abortController.signal.addEventListener('abort', relayAbort, { once: true });
           if (runtime.abortController.signal.aborted) relayAbort();
           let timedOut = false;
+          const budgetDeadline = agentBudgetDeadline(Date.now(), options.timeoutSeconds * 1000);
           const timeout = setTimeout(() => {
             timedOut = true;
             timeoutController.abort(new Error(`Timed out after ${options.timeoutSeconds}s`));
@@ -664,6 +679,7 @@ export class OcrJobService {
                 }
               },
               providerRuntime,
+              budgetDeadline,
             );
             // Agent runtimes may preserve partial memory by returning normally
             // after their signal fires. The document boundary owns timeout and

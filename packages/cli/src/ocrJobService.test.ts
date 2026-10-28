@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveCliOptions } from './config';
 import { discoverInputSet } from './inputs';
 import {
+  agentBudgetDeadline,
   agentProgressMessage,
   normalizeAgentProgressText,
   OcrJobService,
@@ -319,6 +320,41 @@ describe('OcrJobService', () => {
       retryable: true,
     });
     expect(execution.result.documents[0]?.error?.hint).toContain('--timeout');
+  });
+
+  it('ends an agent budget before the hard timeout so its partial fields survive', async () => {
+    expect(agentBudgetDeadline(1_000, 120_000)).toBe(1_000 + 118_000);
+    expect(agentBudgetDeadline(1_000, 1_000)).toBe(1_000 + 900);
+
+    const documentPath = path.join(directory, 'hard.jpg');
+    await writeFile(documentPath, JPEG_BYTES);
+    const baseOptions = resolveCliOptions({ dryRun: true, mode: 'agentic' }, {}, directory);
+    const options = {
+      ...baseOptions, apiKey: 'test-key', dryRun: false, quiet: true, timeoutSeconds: 0.3,
+    };
+    const inputs = await discoverInputs([documentPath], options);
+    // Stands in for the agent loop: it works until its own budget runs out and
+    // then returns the fields it has, the way `budget_exhausted` does.
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (
+      _input, _options, signal, _onStep, _runtime, budgetDeadline,
+    ) => {
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, budgetDeadline - Date.now())));
+      signal.throwIfAborted();
+      const json = { stopReason: 'budget_exhausted', fields: { total: { value: '42.00' } } };
+      return { artifacts: { markdown: '# partial', json }, attempts: 1 };
+    });
+
+    const execution = await new OcrJobService({ extractDocument }).run(inputs, options, {
+      runId: 'agent-budget-run',
+      abortController: new AbortController(),
+      deliveryMode: 'inline',
+    });
+
+    expect(execution.result.documents[0]).toMatchObject({
+      status: 'partial',
+      partialReason: 'time_budget_reached',
+      nextAction: 'increase_timeout',
+    });
   });
 
   it('reports an interrupted active document as cancelled instead of failed', async () => {
