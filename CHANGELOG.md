@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 4.3.0 - 2026-10-28
+
+The 4.2.0 tag was created, but its release run failed before publishing, so
+4.2.0 never reached npm, GHCR, or GitHub Releases. 4.3.0 is the first published
+release with the 4.2.0 changes listed below it.
 
 ### Changed
 
@@ -51,6 +55,11 @@
 - Fallback cost estimates: Claude Sonnet 5.5 cached input ($0.10, was $0.20)
   and OpenRouter Kimi K3 (Moonshot's $3 / $0.30 / $15). OpenRouter's reported
   `usage.cost` still takes precedence.
+- CI now builds the release notes for the current version on every pull
+  request, so a changelog section that the release workflow would reject fails
+  before merge instead of after tagging.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.1.0...v4.3.0)
 
 ## 4.2.0 - 2026-10-28
 
@@ -101,6 +110,8 @@ those settings to your user config, a `--config` file, or flags.
   first and last 5,000 characters) becomes a compact list of failures and of
   the artifacts already produced, so they are not re-run; the JSON text mirror
   of a successful result collapses to a summary above 40,000 characters.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.1.0...v4.2.0)
 
 ## 4.1.0 - 2026-10-03
 

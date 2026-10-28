@@ -49,7 +49,11 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
    docker build --tag open-ocr-cli:release-candidate .
    VERSION=$(node -p "require('./packages/cli/package.json').version")
    node scripts/assert-release-version.mjs "v$VERSION"
+   node scripts/extract-release-notes.mjs "v$VERSION" /tmp/release-notes.md
    ```
+
+   The release section needs at least one `###` heading and a
+   `[Full comparison](...)` link; the release workflow refuses it otherwise.
 
 3. When provider credentials are available, run the canary evaluation matrix
    with a private copy of `evals/providers.example.json`. Review quality,
