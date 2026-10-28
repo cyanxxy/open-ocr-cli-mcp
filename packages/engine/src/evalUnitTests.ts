@@ -260,9 +260,11 @@ function parseMarkdownTables(content: string): TableData[] {
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
 function htmlText(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
+  const normalized = html.replace(/<br\s*\/?>/gi, '\n');
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(`<body>${normalized}</body>`, 'text/html');
+  const text = doc.body?.textContent ?? '';
+  return text
     .replace(/&(#\d+|#x[\da-f]+|\w+);/gi, (entity, code: string) => {
       if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(Number.parseInt(code.slice(2), 16));
       if (code.startsWith('#')) return String.fromCodePoint(Number.parseInt(code.slice(1), 10));
