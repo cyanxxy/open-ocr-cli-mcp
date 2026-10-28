@@ -48,6 +48,8 @@ describe('olmOCR-style unit tests', () => {
       + '<tr><td rowspan="2">Q1</td><td>10 &amp; 11</td></tr><tr><td>12</td></tr></table>';
     expect(runOcrUnitTest({ id: 'a', type: 'table', cell: '10 & 11', topHeading: 'Totals', left: 'Q1' }, html)).toBe(true);
     expect(runOcrUnitTest({ id: 'b', type: 'table', cell: '12', left: 'Q1', up: '10 & 11' }, html)).toBe(true);
+    const malformed = '<table><tr><td>Total<b>x</b> 5 &lt; 6<script</td><td>9</td></tr></table>';
+    expect(runOcrUnitTest({ id: 'c', type: 'table', cell: 'Totalx 5 < 6script', right: '9' }, malformed)).toBe(true);
   });
 
   it('scores the pass rate across tests and validates the stored shape', () => {

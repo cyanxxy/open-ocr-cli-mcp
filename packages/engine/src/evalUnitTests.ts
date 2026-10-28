@@ -260,9 +260,12 @@ function parseMarkdownTables(content: string): TableData[] {
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
 function htmlText(html: string): string {
+  // Drop complete tags, then any unterminated fragment such as `a<script`, so no
+  // markup survives; entities decode last, so an escaped `&lt;` stays literal text.
   return html
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
+    .replace(/<[^>]*>/g, '')
+    .replaceAll('<', '')
     .replace(/&(#\d+|#x[\da-f]+|\w+);/gi, (entity, code: string) => {
       if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(Number.parseInt(code.slice(2), 16));
       if (code.startsWith('#')) return String.fromCodePoint(Number.parseInt(code.slice(1), 10));
