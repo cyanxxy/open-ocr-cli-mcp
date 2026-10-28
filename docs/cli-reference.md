@@ -147,6 +147,24 @@ Dry runs validate even resumed inputs and write no files.
 
 ## Machine requests and events
 
+A complete request (remove `dryRun` to perform OCR):
+
+```json
+{
+  "protocolVersion": 2,
+  "operation": "extract",
+  "noConfig": true,
+  "inputs": [{ "type": "path", "path": "invoice.pdf" }],
+  "extraction": { "mode": "template", "preset": "invoice", "contentFormat": "json" },
+  "execution": { "maxFiles": 50, "maxTotalMb": 200, "timeoutSeconds": 120 },
+  "delivery": { "mode": "reference", "outputDirectory": "./results", "resume": true },
+  "dryRun": true
+}
+```
+
+Dry runs need no key, make no provider calls, and write no artifacts. Without
+an output directory, reference jobs write to `.open-ocr-results/<runId>`.
+
 Inputs use `type`: `{ "type": "path", "path": "invoice.pdf" }` or
 `{ "type": "url", "url": "https://example.com" }`. URLs cannot mix with local
 inputs. Binary stdin needs `{ "type": "stdin", "name": "scan.png" }` and a
