@@ -259,13 +259,21 @@ function parseMarkdownTables(content: string): TableData[] {
 
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
+/** Text outside markup: drops each `<...>` span, and an unterminated `<...` to the end. */
+function stripTags(html: string): string {
+  let text = '';
+  let inTag = false;
+  for (const character of html) {
+    if (inTag) inTag = character !== '>';
+    else if (character === '<') inTag = true;
+    else text += character;
+  }
+  return text;
+}
+
 function htmlText(html: string): string {
-  // Drop complete tags, then any unterminated fragment such as `a<script`, so no
-  // markup survives; entities decode last, so an escaped `&lt;` stays literal text.
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]*>/g, '')
-    .replaceAll('<', '')
+  // Entities decode after tags are gone, so an escaped `&lt;` stays literal text.
+  return stripTags(html.replace(/<br\s*\/?>/gi, '\n'))
     .replace(/&(#\d+|#x[\da-f]+|\w+);/gi, (entity, code: string) => {
       if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(Number.parseInt(code.slice(2), 16));
       if (code.startsWith('#')) return String.fromCodePoint(Number.parseInt(code.slice(1), 10));
