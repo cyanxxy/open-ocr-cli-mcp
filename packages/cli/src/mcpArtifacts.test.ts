@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { MCP_ARTIFACT_CHUNK_BYTES, MCP_ARTIFACT_DEFAULT_CHUNK_BYTES, McpArtifactRegistry } from './mcpArtifacts';
+import { MCP_ARTIFACT_CHUNK_BYTES, McpArtifactRegistry } from './mcpArtifacts';
 import type { OcrMachineResult } from './protocol';
 
 describe('MCP artifact reads', () => {
@@ -59,11 +59,9 @@ describe('MCP artifact reads', () => {
   it('caps default reads, validates offsets, and refuses invalid UTF-8 boundaries', async () => {
     const { registry, uri } = await fixture(`😀${'x'.repeat(MCP_ARTIFACT_CHUNK_BYTES)}`);
     const first = await registry.read(uri);
-    expect(Buffer.byteLength(first.text)).toBe(MCP_ARTIFACT_DEFAULT_CHUNK_BYTES);
+    expect(Buffer.byteLength(first.text)).toBe(MCP_ARTIFACT_CHUNK_BYTES);
     expect(first.eof).toBe(false);
-    const largest = await registry.read(uri, 0, MCP_ARTIFACT_CHUNK_BYTES);
-    expect(Buffer.byteLength(largest.text)).toBe(MCP_ARTIFACT_CHUNK_BYTES);
-    expect(await registry.read(uri, largest.nextOffset)).toMatchObject({ text: 'xxxx', eof: true });
+    expect(await registry.read(uri, first.nextOffset)).toMatchObject({ text: 'xxxx', eof: true });
     await expect(registry.read(uri, 1)).rejects.toThrow('not valid UTF-8');
     await expect(registry.read(uri, -1)).rejects.toThrow('offset');
     await expect(registry.read(uri, first.totalBytes + 1)).rejects.toThrow('offset');

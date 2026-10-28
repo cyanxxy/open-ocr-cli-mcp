@@ -110,6 +110,11 @@ export interface ExtractCommandFlags {
   defaultExcludes?: boolean;
   resume?: boolean;
   overwrite?: boolean;
+  /**
+   * Accepted for compatibility. A same-host lock whose owner is dead is now
+   * reclaimed automatically, which is everything this flag used to do.
+   */
+  forceUnlock?: boolean;
   failFast?: boolean;
   jsonl?: boolean;
   dryRun?: boolean;

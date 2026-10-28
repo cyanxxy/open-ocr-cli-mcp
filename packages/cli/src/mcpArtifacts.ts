@@ -4,14 +4,7 @@ import { pathToFileURL } from 'node:url';
 
 import type { OcrMachineResult } from './protocol';
 
-/** The largest chunk a caller may ask for, and the whole-file limit for resources/read. */
 export const MCP_ARTIFACT_CHUNK_BYTES = 64 * 1024;
-/**
- * The chunk a read returns when the caller names no size. It is half the
- * maximum so a default read stays well under Claude Code's 50,000-character
- * inline limit even after JSON escaping, and costs half the context.
- */
-export const MCP_ARTIFACT_DEFAULT_CHUNK_BYTES = 32 * 1024;
 export const MCP_ARTIFACT_REGISTRY_LIMIT = 10_000;
 
 interface RegisteredArtifact {
@@ -77,7 +70,7 @@ export class McpArtifactRegistry {
     return warnings;
   }
 
-  async read(uri: string, offset = 0, maxBytes = MCP_ARTIFACT_DEFAULT_CHUNK_BYTES): Promise<McpArtifactChunk> {
+  async read(uri: string, offset = 0, maxBytes = MCP_ARTIFACT_CHUNK_BYTES): Promise<McpArtifactChunk> {
     const artifact = this.artifacts.get(uri);
     if (!artifact) {
       throw new Error('Artifact URI is not retained by this MCP process. Use a file:// link from a recent OCR result, or read its path with a local filesystem tool.');

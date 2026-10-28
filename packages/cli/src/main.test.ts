@@ -117,6 +117,8 @@ describe('CLI command exit contracts', () => {
         'extract',
         input,
         '--quiet',
+        // Still accepted after automatic stale-lock recovery made it redundant.
+        '--force-unlock',
       ]);
     } catch (error) {
       thrown = error;

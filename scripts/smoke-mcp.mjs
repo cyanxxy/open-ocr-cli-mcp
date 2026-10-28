@@ -66,9 +66,7 @@ try {
     name: 'ocr_extract',
     arguments: { inputs: [{ type: 'path', path: 'scan.jpg' }, { type: 'path', path: 'invalid.png' }], dryRun: true, noConfig: true },
   });
-  // A partial run is a result, not a tool error: only `failed` sets isError.
-  assert.equal(partial.isError, undefined);
-  assert.equal(partial.structuredContent.ok, false);
+  assert.equal(partial.isError, true);
   assert.equal(partial.structuredContent.status, 'partial');
   assert.equal(partial.structuredContent.documents.length, 2);
   const forbidden = await client.callTool({ name: 'ocr_read_artifact', arguments: { uri: 'file:///etc/passwd' } });

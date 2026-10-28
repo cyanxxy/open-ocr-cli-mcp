@@ -148,7 +148,7 @@ async function withInterruptHandling<T>(
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
   // A reader that stops listening is cancelled like any interrupt, so the
-  // batch still releases its lock and writes its summary before exiting 141.
+  // batch still releases its lock and writes its summary before it exits.
   const stopWatchingStdout = onStdoutClosed(() => interrupt('SIGPIPE'));
   try {
     return await operation({ abortController, interruptedExitCode: () => exitCode });
@@ -235,6 +235,7 @@ function addExtractOptions(command: Command): Command {
     .option('--resume', 'skip unchanged documents recorded in the batch manifest')
     .option('--no-resume', 'process documents even when the manifest marks them complete')
     .option('--overwrite', 'replace existing output artifacts')
+    .option('--force-unlock', 'no longer needed: a same-host lock left by a dead process is reclaimed automatically')
     .option('--fail-fast', 'stop scheduling new documents after the first failure')
     .option('--jsonl', 'emit protocol v2 lifecycle events on stdout, one JSON object per line, ending in exactly one run.completed or run.failed event — the same stream as `run --response-format jsonl`')
     .option('--dry-run', 'resolve and validate the job without calling a provider or writing files')

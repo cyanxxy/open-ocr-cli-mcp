@@ -117,28 +117,41 @@ describe('Open OCR MCP server', () => {
       documents: [],
     } as unknown as OcrMachineResult);
 
-    // `isError` is the spec's tool execution error. Partial, cancelled and
-    // cost-limited runs delivered usable, paid work; as errors, Claude Code
-    // reduced them to a truncated error string and the model re-ran it.
-    it('reports only a failed run as a tool error', () => {
-      expect(mcpResult(resultWithStatus('failed', false)).isError).toBe(true);
+    it.each([
+      ['partial', false],
+      ['failed', false],
+      ['cancelled', false],
+      ['cost_limited', false],
+    ] as const)('reports %s as a tool error', (status, ok) => {
+      expect(mcpResult(resultWithStatus(status, ok)).isError).toBe(true);
     });
 
     it.each([
-      ['partial', false],
-      ['cancelled', false],
-      ['cost_limited', false],
       ['succeeded', true],
       ['validated', true],
-    ] as const)('does not report %s as a tool error but keeps ok in the envelope', (status, ok) => {
-      const built = mcpResult(resultWithStatus(status, ok));
-      expect(built.isError).toBeUndefined();
-      expect(built.structuredContent).toMatchObject({ status, ok });
+    ] as const)('does not report %s as a tool error', (status, ok) => {
+      expect(mcpResult(resultWithStatus(status, ok)).isError).toBeUndefined();
     });
 
-    it('keeps the error text of a large failed batch whole and under the host cut', () => {
-      const documents = Array.from({ length: 200 }, (_, index) => ({
-        source: `scans/page-${index}.png`,
+    it('never disagrees with the ok field it is derived from', () => {
+      for (const ok of [true, false]) {
+        const built = mcpResult(resultWithStatus('partial', ok));
+        expect(built.isError === true).toBe(!ok);
+        expect(built.structuredContent.ok).toBe(ok);
+      }
+    });
+
+    it('keeps a small error as its JSON mirror', () => {
+      const built = mcpResult(resultWithStatus('partial', false));
+      expect(JSON.parse((built.content[0] as { text: string }).text)).toMatchObject({ status: 'partial' });
+    });
+
+    // Claude Code shows the model only the text of an error and keeps just the
+    // first and last 5,000 characters past ~11,000: the middle documents, and
+    // the artifacts already paid for, were lost and the model re-ran them.
+    it('fits a large partial batch error whole, keeping failures and produced artifacts', () => {
+      const failed = Array.from({ length: 100 }, (_, index) => ({
+        source: `scans/bad-${index}.png`,
         status: 'failed',
         artifacts: [],
         plannedArtifacts: [],
@@ -150,16 +163,24 @@ describe('Open OCR MCP server', () => {
           hint: 'Check the provider status.',
         },
       }));
+      const produced = Array.from({ length: 100 }, (_, index) => ({
+        source: `scans/good-${index}.png`,
+        status: 'succeeded',
+        artifacts: [{ path: `/results/good-${index}.md`, mediaType: 'text/markdown', kind: 'markdown' }],
+        plannedArtifacts: [],
+      }));
       const built = mcpResult({
-        protocolVersion: 2, type: 'run.result', ok: false, runId: 'r1', status: 'failed',
-        total: 200, succeeded: 0, partial: 0, failed: 200, skipped: 0, documents,
+        protocolVersion: 2, type: 'run.result', ok: false, runId: 'r1', status: 'partial',
+        total: 200, succeeded: 100, partial: 0, failed: 100, skipped: 0, documents: [...failed, ...produced],
       } as unknown as OcrMachineResult);
+      expect(built.isError).toBe(true);
       const text = (built.content[0] as { text: string }).text;
-      // Claude Code keeps only the ends of error text over ~11,000 characters.
       expect(text.length).toBeLessThan(11_000);
-      expect(text).toMatch(/^Run r1 failed: 0 succeeded, 0 partial, 200 failed/u);
-      expect(text).toContain('- scans/page-0.png: [PROVIDER_FAILURE]');
-      expect(text).toMatch(/… \d+ more failed document\(s\) in structuredContent\.documents\.$/u);
+      expect(text).toMatch(/^Run r1 partial: 100 succeeded, 0 partial, 100 failed/u);
+      expect(text).toContain('- scans/bad-0.png: [PROVIDER_FAILURE]');
+      expect(text).toContain('more failed document(s) in structuredContent.documents.');
+      expect(text).toContain('Produced (keep these; do not re-run them):');
+      expect(text).toContain('- scans/good-0.png (succeeded): /results/good-0.md');
     });
   });
 
@@ -530,7 +551,7 @@ describe('Open OCR MCP server', () => {
       });
     });
 
-    it('reports a partially failed run as a result, not a tool error', async () => {
+    it('reports a partially failed run as a tool error', async () => {
       const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-'));
       cleanupPaths.push(directory);
       await writeFile(path.join(directory, 'invoice.jpg'), JPEG_BYTES);
@@ -557,7 +578,7 @@ describe('Open OCR MCP server', () => {
       };
       expect(structured.status).toBe('partial');
       expect(structured.ok).toBe(false);
-      expect(result.result?.isError).toBeUndefined();
+      expect(result.result?.isError).toBe(true);
       expect(structured.documents.some((document) => document.status === 'failed')).toBe(true);
     });
 
@@ -877,7 +898,9 @@ describe('Open OCR MCP server', () => {
       // Still exactly one text block: a host that renders content only must not
       // be handed an empty response for a failure.
       expect(built.content).toHaveLength(1);
-      expect((built.content[0] as { text: string }).text).toBe('Run r1 failed: [INTERNAL] boom\nHint: h');
+      expect(JSON.parse((built.content[0] as { text: string }).text)).toMatchObject({
+        error: { code: 'INTERNAL' },
+      });
     });
 
     it('summarises rather than mirrors the envelope when documents carry inline bodies', () => {

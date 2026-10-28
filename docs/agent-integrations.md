@@ -50,9 +50,9 @@ Claude Code saves a successful text result over 50,000 characters to a file and
 keeps only the first and last 5,000 characters of error text over about 11,000.
 The server is shaped for both: `ocr_read_artifact` declares
 `anthropic/maxResultSizeChars` so a full chunk stays inline, the JSON text mirror
-of an OCR result collapses to a summary above 40,000 characters, and a failed
-run's error text lists failures compactly with the full envelope in
-`structuredContent`.
+of an OCR result collapses to a summary above 40,000 characters, and error text
+too long to arrive whole becomes a compact list of failures and of the artifacts
+already produced, with the full envelope in `structuredContent`.
 
 ## Codex
 
@@ -126,15 +126,15 @@ Supply a progress token to receive lifecycle notifications. Propagate
 cancellation through the client SDK. The MCP Tasks extension is not implemented.
 
 OCR execution results include `structuredContent`; saved artifacts also have
-`resource_link` blocks. `isError` is set only for a `failed` run, where nothing
-usable was produced. A `partial`, `cancelled`, or `cost_limited` run is a normal
-result with `ok: false`: check `status` and every document outcome, and keep the
-artifacts it did produce instead of re-running them.
+`resource_link` blocks. Check `isError`, the OCR envelope's `ok`/`status`, and
+every document outcome. `isError` follows `ok: false`, so a `partial`,
+`cancelled`, or `cost_limited` run is also an error result; keep the artifacts
+it did produce instead of re-running them.
 Protocol errors, tool-argument validation failures, and artifact-read failures
 do not necessarily carry the OCR envelope or its typed `error` object. Use
 `ocr_read_artifact` with `uri`, optional `offset` (bytes), and `maxBytes`
 (4–65,536). Continue at the returned `nextOffset` until `eof` is true; reads
-default to **32 KiB**. Artifacts up to 64 KiB can also be read
+default to **64 KiB**. Small artifacts can also be read
 through MCP resources. Only unchanged files written by successful or partial
 extractions in this server process are eligible; the latest **10,000** artifact
 URIs are retained and restarting the server clears that registry. A resumed

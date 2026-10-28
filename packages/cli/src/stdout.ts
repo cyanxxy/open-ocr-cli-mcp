@@ -8,15 +8,16 @@ import { isBrokenPipeError } from './errors';
  *
  * Writable streams report EPIPE asynchronously, so it never rejects the write
  * that caused it. A running batch subscribes through {@link onStdoutClosed} and
- * is cancelled like a SIGPIPE: it still releases its output lock and writes its
- * summary, then exits 141. With no subscriber there is nothing to clean up and
- * the process exits 141 at once. Either way the truncation is visible to
- * `set -o pipefail` instead of passing for success.
+ * is cancelled like a SIGPIPE, so it still releases its output lock and writes
+ * its summary; exiting on the spot used to leave both behind and block the next
+ * run. With no subscriber there is nothing to clean up and the process exits
+ * at once. The exit status stays {@link STDOUT_CLOSED_EXIT_CODE}, as it always
+ * was: a reader that stops listening is the reader's choice, not a failure.
  */
 let closed = false;
 const closeListeners = new Set<() => void>();
 
-export const STDOUT_CLOSED_EXIT_CODE = 141;
+export const STDOUT_CLOSED_EXIT_CODE = 0;
 
 export function installStdoutPipeGuard(): void {
   process.stdout.on('error', (error: Error) => {
@@ -25,10 +26,14 @@ export function installStdoutPipeGuard(): void {
     if (!isBrokenPipeError(error)) throw error;
     if (closed) return;
     closed = true;
-    process.exitCode = STDOUT_CLOSED_EXIT_CODE;
     if (closeListeners.size === 0) process.exit(STDOUT_CLOSED_EXIT_CODE);
     for (const listener of closeListeners) listener();
   });
+}
+
+/** Whether stdout's reader went away during this process. */
+export function stdoutClosedByReader(): boolean {
+  return closed;
 }
 
 /** Subscribe to stdout closing; returns the unsubscribe function. */

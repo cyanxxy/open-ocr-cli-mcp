@@ -129,7 +129,8 @@ Machine/MCP reference jobs default to `.open-ocr-results/<runId>`.
 Directories with resume metadata contain `.open-ocr-manifest.json` and
 `batch-summary.json`; `.open-ocr.lock` marks the directory's owning process. A
 lock left by a dead process on the same host is reclaimed automatically with a
-warning; a live, cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
+warning, so `--force-unlock` is accepted but no longer needed; a live,
+cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
 A single artifact file has no resume metadata. Relative input paths are preserved.
 Existing files are protected unless `--overwrite` is explicit or a matching resume owns a stale
 artifact. Destinations are preflighted before paid work. Resume checks input
@@ -198,8 +199,9 @@ Results/events go to stdout; diagnostics go to stderr. `--quiet` never suppresse
 machine results, and without `--jsonl` it still prints failed and partial
 documents with their error code and hint.
 Exit codes: **0** success/clean validation/resume; **1** failed, partial, or
-cost-limited; **2** invalid command/config; **130** SIGINT; **141** stdout closed
-by its reader (the run is cancelled and cleaned up); **143** SIGTERM.
+cost-limited; **2** invalid command/config; **130** SIGINT; **143** SIGTERM.
+If stdout's reader closes the pipe, the run is cancelled, releases its lock,
+writes its summary, and exits **0**.
 
 ## Distribution
 
