@@ -149,6 +149,29 @@ describe('eval utilities', () => {
     expect(result.execution?.durationMs).toBe(25);
   });
 
+  it('scores olmOCR-style unit tests as a pass-rate metric', () => {
+    const evalCase = validateEvalCase({
+      id: 'olmocr-style',
+      mode: 'simple',
+      inputPath: 'evals/cache/olmocrbench/pdfs/000.pdf',
+      reference: { unitTestsPath: 'evals/cache/olmocrbench/references/000.tests.json' },
+      expectedAssertions: [{ type: 'metric_min', metric: 'unit_test_pass_rate', value: 0.6 }],
+      tags: ['olmocrbench'],
+    });
+    expect(evalCase.reference?.unitTestsPath).toBe('evals/cache/olmocrbench/references/000.tests.json');
+
+    const result = evaluateEvalCase(evalCase, { markdown: 'Dear friend, the school begins in January.' }, {
+      unitTests: [
+        { id: 'a', type: 'present', text: 'the school begins' },
+        { id: 'b', type: 'order', before: 'Dear friend', after: 'January' },
+        { id: 'c', type: 'present', text: 'missing sentence' },
+      ],
+    });
+
+    expect(result.metrics?.unit_test_pass_rate).toBeCloseTo(2 / 3);
+    expect(result.passed).toBe(true);
+  });
+
   it('treats missing JSON paths and undefined values differently', () => {
     const evalCase = validateEvalCase({
       id: 'agentic-output',

@@ -3,7 +3,28 @@
     "dataset": "naver-clova-ix/cord-v2",
     "revision": "7f0115a4b758a71d6473b8d085751692da2fef98",
     "split": "test",
-    "indices": [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95],
+    "indices": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      25,
+      30,
+      35,
+      40,
+      45,
+      50,
+      55,
+      60,
+      65,
+      70,
+      75,
+      80,
+      85,
+      90,
+      95
+    ],
     "license": "CC-BY-4.0",
     "source": "https://huggingface.co/datasets/naver-clova-ix/cord-v2"
   },
@@ -15,5 +36,26 @@
     "samplesPerDocumentType": 2,
     "source": "https://huggingface.co/datasets/opendatalab/OmniDocBench",
     "termsNote": "Upstream does not declare a machine-readable dataset license. Review its terms before redistributing data. This setup keeps files local and untracked."
+  },
+  "olmocrbench": {
+    "dataset": "allenai/olmOCR-bench",
+    "revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711",
+    "seed": "open-ocr-olmocr-v1",
+    "pdfsPerCategory": 5,
+    "minTestsPerPdf": 3,
+    "testTypes": [
+      "present",
+      "order",
+      "table"
+    ],
+    "categories": {
+      "old_scans": "0cb14b2a5c3a08383f256931f79d1deea737e2635e0f1766b0fe0377f9416a0d",
+      "multi_column": "50192fd72f18434f3303b501bc9347763fb4b865238b7636604d3f6ebdf01595",
+      "long_tiny_text": "9ebe6a5fa690e78098e088b9eb677c4bb4212ed9b946be80b2d79a1a6c2a0e1a",
+      "table_tests": "e37a99bd60de56c62cd3f4c1b7910b603641901c15ae119f849ffefa86cde120"
+    },
+    "license": "ODC-BY-1.0",
+    "source": "https://huggingface.co/datasets/allenai/olmOCR-bench",
+    "selectionNote": "Math categories need LaTeX rendering to grade, and headers_footers plus absent tests reward dropping page furniture, which this OCR tool deliberately transcribes. Only verified present, order, and table tests are used."
   }
 }

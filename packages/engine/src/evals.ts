@@ -5,6 +5,7 @@ import {
   type EvalMetricName,
   type EvalMetricScores,
 } from './evalMetrics';
+import { scoreOcrUnitTests, type OcrUnitTest } from './evalUnitTests';
 import type { PresetRunResult } from './gemini/types';
 
 export type EvalMode = 'simple' | 'template' | 'agentic';
@@ -25,6 +26,8 @@ export type EvalAssertion =
 export interface EvalReference {
   textPath?: string;
   jsonPath?: string;
+  /** JSON array of olmOCR-style pass/fail checks scored as `unit_test_pass_rate`. */
+  unitTestsPath?: string;
   referenceFieldsPath?: string;
   predictedFieldsPath?: string;
   referenceRowsPath?: string;
@@ -35,6 +38,7 @@ export interface EvalReference {
 export interface EvalGroundTruth {
   text?: string;
   json?: Record<string, unknown> | null;
+  unitTests?: OcrUnitTest[];
 }
 
 export interface EvalCase {
@@ -168,6 +172,7 @@ function isEvalMetricName(value: unknown): value is EvalMetricName {
     'field_f1',
     'critical_field_exact_match',
     'table_cell_f1',
+    'unit_test_pass_rate',
   ].includes(value);
 }
 
@@ -204,6 +209,7 @@ function validateReference(value: unknown, caseId: string): EvalReference | unde
   const stringKeys = [
     'textPath',
     'jsonPath',
+    'unitTestsPath',
     'referenceFieldsPath',
     'predictedFieldsPath',
     'referenceRowsPath',
@@ -221,6 +227,7 @@ function validateReference(value: unknown, caseId: string): EvalReference | unde
   return {
     textPath: typeof value.textPath === 'string' ? value.textPath : undefined,
     jsonPath: typeof value.jsonPath === 'string' ? value.jsonPath : undefined,
+    unitTestsPath: typeof value.unitTestsPath === 'string' ? value.unitTestsPath : undefined,
     referenceFieldsPath: typeof value.referenceFieldsPath === 'string' ? value.referenceFieldsPath : undefined,
     predictedFieldsPath: typeof value.predictedFieldsPath === 'string' ? value.predictedFieldsPath : undefined,
     referenceRowsPath: typeof value.referenceRowsPath === 'string' ? value.referenceRowsPath : undefined,
@@ -339,6 +346,9 @@ function formatAssertionFailure(assertion: EvalAssertion): string {
 function computeMetrics(evalCase: EvalCase, output: EvalRunOutput, groundTruth?: EvalGroundTruth): EvalMetricScores {
   const metrics: EvalMetricScores = {};
   if (typeof groundTruth?.text === 'string') Object.assign(metrics, scoreOcrText(groundTruth.text, output.markdown));
+  if (groundTruth?.unitTests?.length) {
+    metrics.unit_test_pass_rate = scoreOcrUnitTests(groundTruth.unitTests, output.markdown).passRate;
+  }
 
   if (groundTruth?.json && evalCase.reference?.jsonPath) {
     const referenceFields = getValueAtPath(groundTruth.json, evalCase.reference.referenceFieldsPath ?? 'fields');
@@ -513,6 +523,7 @@ export function buildEvalSummary(
 
 const PERCENT_METRICS = new Set<EvalMetricName>([
   'normalized_edit_similarity', 'text_coverage', 'field_precision', 'field_recall', 'field_f1', 'critical_field_exact_match', 'table_cell_f1',
+  'unit_test_pass_rate',
 ]);
 
 function formatMetric(name: EvalMetricName, value: number): string {

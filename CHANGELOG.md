@@ -33,6 +33,14 @@
   input there); an explicit model ID still works. The OpenRouter eval canary
   and examples use `anthropic/claude-sonnet-5.5`.
 
+### Added
+
+- Evals: an olmOCR-bench subset (ODC-BY 1.0, pinned revision and checksums)
+  installed by `npm run evals:setup`. It adds 20 single-page PDFs from old
+  scans, multi-column, tiny-text, and table categories, the first public cases
+  that exercise native PDF input. Their verified pass/fail checks are scored as
+  the new `unit_test_pass_rate` metric through `reference.unitTestsPath`.
+
 ### Fixed
 
 - OpenRouter requests send `max_tokens` instead of `max_completion_tokens`.

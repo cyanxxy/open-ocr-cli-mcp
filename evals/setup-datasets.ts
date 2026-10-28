@@ -22,6 +22,40 @@ interface DatasetManifest {
     source: string;
     termsNote: string;
   };
+  olmocrbench: {
+    dataset: string;
+    revision: string;
+    seed: string;
+    pdfsPerCategory: number;
+    minTestsPerPdf: number;
+    testTypes: string[];
+    categories: Record<string, string>;
+    license: string;
+    source: string;
+    selectionNote: string;
+  };
+}
+
+interface OlmocrTest {
+  pdf: string;
+  page: number;
+  id: string;
+  type: string;
+  checked?: string | null;
+  max_diffs?: number;
+  text?: string;
+  case_sensitive?: boolean;
+  first_n?: number | null;
+  last_n?: number | null;
+  before?: string;
+  after?: string;
+  cell?: string;
+  up?: string | null;
+  down?: string | null;
+  left?: string | null;
+  right?: string | null;
+  top_heading?: string | null;
+  left_heading?: string | null;
 }
 
 interface CordWord {
@@ -278,20 +312,96 @@ async function setupOmniDocBench(manifest: DatasetManifest['omnidocbench']): Pro
   return selectedPages.length;
 }
 
+/** Convert olmOCR's snake_case test records to the engine's OcrUnitTest shape. */
+function toUnitTest(test: OlmocrTest): Record<string, unknown> {
+  const optional = (value: string | number | boolean | null | undefined): string | number | boolean | undefined =>
+    value === null || value === '' ? undefined : value;
+  const base = { id: test.id, type: test.type, maxDiffs: test.max_diffs ?? 0 };
+  if (test.type === 'order') return { ...base, before: test.before, after: test.after };
+  if (test.type === 'table') {
+    return {
+      ...base,
+      cell: test.cell,
+      up: optional(test.up),
+      down: optional(test.down),
+      left: optional(test.left),
+      right: optional(test.right),
+      topHeading: optional(test.top_heading),
+      leftHeading: optional(test.left_heading),
+    };
+  }
+  return {
+    ...base,
+    text: test.text,
+    caseSensitive: test.case_sensitive ?? true,
+    firstN: optional(test.first_n),
+    lastN: optional(test.last_n),
+  };
+}
+
+async function setupOlmocrBench(manifest: DatasetManifest['olmocrbench']): Promise<number> {
+  const root = `https://huggingface.co/datasets/${manifest.dataset}/resolve/${manifest.revision}/bench_data`;
+  let caseIndex = 0;
+  for (const [category, expectedSha256] of Object.entries(manifest.categories)) {
+    const bytes = await fetchBytes(`${root}/${category}.jsonl?download=true`);
+    const digest = sha256(bytes);
+    if (digest !== expectedSha256) {
+      throw new Error(`olmOCR-bench ${category} checksum mismatch: expected ${expectedSha256}, received ${digest}`);
+    }
+    const byPdf = new Map<string, OlmocrTest[]>();
+    for (const line of new TextDecoder().decode(bytes).split('\n')) {
+      if (!line.trim()) continue;
+      const test = JSON.parse(line) as OlmocrTest;
+      if (test.checked !== 'verified' || !manifest.testTypes.includes(test.type) || test.page !== 1) continue;
+      byPdf.set(test.pdf, [...(byPdf.get(test.pdf) ?? []), test]);
+    }
+    const selected = [...byPdf.entries()]
+      .filter(([, tests]) => tests.length >= manifest.minTestsPerPdf)
+      .sort(([left], [right]) => sha256(`${manifest.seed}${left}`).localeCompare(sha256(`${manifest.seed}${right}`)))
+      .slice(0, manifest.pdfsPerCategory);
+
+    for (const [categoryIndex, [pdf, tests]] of selected.entries()) {
+      const id = String(caseIndex).padStart(3, '0');
+      const pdfRelative = localPath('olmocrbench', 'pdfs', `${id}.pdf`);
+      const testsRelative = localPath('olmocrbench', 'references', `${id}.tests.json`);
+      await Promise.all([
+        downloadFile(`${root}/pdfs/${encodeRemotePath(pdf)}?download=true`, path.resolve(repoRoot, pdfRelative)),
+        writeJson(path.resolve(repoRoot, testsRelative), tests.map(toUnitTest)),
+      ]);
+      await writeJson(path.resolve(cacheRoot, 'cases', `olmocrbench-simple-${id}.json`), {
+        id: `olmocrbench-simple-${id}`,
+        mode: 'simple',
+        inputPath: pdfRelative,
+        reference: { unitTestsPath: testsRelative },
+        expectedAssertions: [
+          { type: 'metric_min', metric: 'unit_test_pass_rate', value: 0.6 },
+        ],
+        tags: ['external', 'olmocrbench', category, 'pdf', 'real-ocr'],
+        suites: categoryIndex < 2 ? ['canary', 'full', 'benchmark'] : ['full', 'benchmark'],
+      });
+      caseIndex += 1;
+    }
+  }
+  return caseIndex;
+}
+
 async function main(): Promise<void> {
   const manifest = await readManifest();
   await fs.rm(cacheRoot, { recursive: true, force: true });
   await fs.mkdir(cacheRoot, { recursive: true });
   console.log(`CORD: ${manifest.cord.license}; ${manifest.cord.source}`);
   console.log(`OmniDocBench: ${manifest.omnidocbench.termsNote} ${manifest.omnidocbench.source}`);
+  console.log(`olmOCR-bench: ${manifest.olmocrbench.license}; ${manifest.olmocrbench.source}`);
   const cordCount = await setupCord(manifest.cord);
   const omniCount = await setupOmniDocBench(manifest.omnidocbench);
+  const olmocrCount = await setupOlmocrBench(manifest.olmocrbench);
   await writeJson(path.resolve(cacheRoot, 'installed.json'), {
     installedAt: new Date().toISOString(),
     cord: { revision: manifest.cord.revision, cases: cordCount },
     omnidocbench: { revision: manifest.omnidocbench.revision, cases: omniCount },
+    olmocrbench: { revision: manifest.olmocrbench.revision, cases: olmocrCount },
   });
-  console.log(`Prepared ${cordCount + omniCount} public eval cases in ${path.relative(repoRoot, cacheRoot)}.`);
+  console.log(`Prepared ${cordCount + omniCount + olmocrCount} public eval cases in ${path.relative(repoRoot, cacheRoot)}.`);
 }
 
 main().catch((error) => {
