@@ -27,13 +27,13 @@ describe('provider runtime pricing', () => {
     const runtime = createProviderExecutionContext();
     const separateJob = createProviderExecutionContext();
     providerRuntimeConfig(resolveCliOptions({
-      model: 'gemini-3.5-flash', inputPrice: '100', outputPrice: '200', dryRun: true,
+      model: 'gemini-3.8-flash', inputPrice: '100', outputPrice: '200', dryRun: true,
     }, {}, '/workspace'), runtime);
     const response = { usageMetadata: { promptTokenCount: 1_000, candidatesTokenCount: 100 } };
-    recordGeminiUsage(response, 'gemini-3.1-flash-lite', runtime);
-    recordGeminiUsage(response, 'gemini-3.5-flash', separateJob);
-    expect(runtime.getUsage().estimatedCostUsd).toBe(0.0004);
-    expect(separateJob.getUsage().estimatedCostUsd).toBe(0.0024);
+    recordGeminiUsage(response, 'gemini-3.5-flash-lite', runtime);
+    recordGeminiUsage(response, 'gemini-3.5-flash-lite', separateJob);
+    expect(runtime.getUsage().estimatedCostUsd).toBe(0.00055);
+    expect(separateJob.getUsage().estimatedCostUsd).toBe(0.00055);
   });
 
   it('creates independent contexts and applies cost policy when callers omit a runtime', async () => {

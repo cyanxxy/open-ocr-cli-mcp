@@ -144,7 +144,7 @@ export function knownModelThinkingLevels(provider: ProviderId, model: string): r
     ? model
     : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
   if (geminiModel && (GEMINI_MODELS as readonly string[]).includes(geminiModel)) {
-    return ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-pro-preview'].includes(geminiModel)
+    return geminiModel === 'gemini-3.8-flash' || geminiModel === 'gemini-4-argon'
       ? ['LOW', 'MEDIUM', 'HIGH']
       : ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'];
   }
@@ -176,8 +176,7 @@ export function providerDefaultThinkingLevel(provider: ProviderId, model: string
   const geminiModel = provider === 'gemini'
     ? model
     : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
-  if (geminiModel === 'gemini-3.5-flash-lite' || geminiModel === 'gemini-3.1-flash-lite') return 'MINIMAL';
-  if (geminiModel === 'gemini-3.1-pro-preview' || geminiModel === 'gemini-3-flash-preview') return 'HIGH';
+  if (geminiModel === 'gemini-3.5-flash-lite') return 'MINIMAL';
   if (provider === 'openrouter' && routedModel.startsWith('anthropic/claude-')) return 'HIGH';
   return 'MEDIUM';
 }
@@ -293,35 +292,16 @@ export function providerTokenPrice(
     // Standard paid-tier rates: https://ai.google.dev/gemini-api/docs/pricing
     // The published introductory discount ends at the start of 2027 (UTC).
     case 'gemini-3.8-flash':
-    case 'gemini-3.7-flash':
-    case 'gemini-3.6-flash':
       return now < Date.UTC(2027, 0, 1)
         ? { inputPerMillionUsd: 0.75, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 3.75 }
         : { inputPerMillionUsd: 1.5, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 7.5 };
+    // Published rates double on 2026-12-01 (UTC). Implicit caching only.
+    case 'gemini-4-argon':
+      return now < Date.UTC(2026, 11, 1)
+        ? { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10 }
+        : { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
     case 'gemini-3.5-flash-lite':
       return { inputPerMillionUsd: 0.3, cachedInputPerMillionUsd: 0.03, outputPerMillionUsd: 2.5 };
-    case 'gemini-3.5-flash':
-      return {
-        inputPerMillionUsd: 1.5,
-        cachedInputPerMillionUsd: 0.15,
-        outputPerMillionUsd: 9,
-      };
-    case 'gemini-3.1-flash-lite':
-      return {
-        inputPerMillionUsd: 0.25,
-        cachedInputPerMillionUsd: 0.025,
-        outputPerMillionUsd: 1.5,
-      };
-    case 'gemini-3-flash-preview':
-      return {
-        inputPerMillionUsd: 0.5,
-        cachedInputPerMillionUsd: 0.05,
-        outputPerMillionUsd: 3,
-      };
-    case 'gemini-3.1-pro-preview':
-      return inputTokens > 200_000
-        ? { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.4, outputPerMillionUsd: 18 }
-        : { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 12 };
     // https://dev.meta.ai/docs/pricing-rate-limits (verified 2026-10-03).
     case 'muse-spark-1.3':
     case 'muse-spark-1.2':

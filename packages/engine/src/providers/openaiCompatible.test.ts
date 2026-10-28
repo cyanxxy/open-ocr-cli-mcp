@@ -746,7 +746,7 @@ describe('OpenAI-compatible transport', () => {
 
   it.each([
     ['kimi', 'kimi-k3', 'https://api.moonshot.ai/v1'],
-    ['openrouter', 'google/gemini-3.5-flash', 'https://openrouter.ai/api/v1'],
+    ['openrouter', 'google/gemini-3.8-flash', 'https://openrouter.ai/api/v1'],
   ] as const)('sends the output cap as max_completion_tokens on %s', async (provider, model, baseUrl) => {
     const fetchMock = vi.fn((_input: FetchInput, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
@@ -974,7 +974,7 @@ describe('OpenAI-compatible transport', () => {
     const openRouter = config({
       provider: 'openrouter',
       apiKeyEnv: 'OPENROUTER_API_KEY',
-      model: 'google/gemini-3.5-flash',
+      model: 'google/gemini-3.8-flash',
       baseUrl: 'https://openrouter.ai/api/v1',
     });
 

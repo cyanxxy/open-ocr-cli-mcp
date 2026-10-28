@@ -268,9 +268,7 @@ export function isRetryableGeminiError(error: unknown): boolean {
 /**
  * Model-aware default thinking level when the host has not set one.
  * - Flash-Lite: minimal (API default; cheap/high-volume)
- * - Stable Flash: medium
- * - 3 Flash Preview: high
- * - 3.1 Pro: high
+ * - 3.8 Flash and 4 Argon: medium
  */
 export function defaultThinkingLevelForModel(modelName: GeminiModel): ThinkingLevel {
   return providerDefaultThinkingLevel('gemini', modelName);

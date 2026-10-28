@@ -50,13 +50,13 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'comparison',
-        'gemini-3.5-flash',
+        'gemini-3.8-flash',
       ),
     ).resolves.toEqual({
       comparisonAnalysis: 'Verified comparison output',
     });
     expect(mockRunModelInteraction).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
     }));
   });
 
@@ -74,7 +74,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com'],
         'test-api-key',
         'combined',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL retrieval could not be verified for this response. Web OCR only returns content when URL-context retrieval reports success for every URL; it does not guess content.',
@@ -95,7 +95,7 @@ describe('extractTextFromUrls', () => {
       ['https://example.com'],
       'test-api-key',
       'combined',
-      'gemini-3.5-flash',
+      'gemini-3.8-flash',
     )).rejects.toThrow(/ended with status "requires_action"/i);
   });
 
@@ -113,7 +113,7 @@ describe('extractTextFromUrls', () => {
       ['https://example.com'],
       'test-api-key',
       'combined',
-      'gemini-3.5-flash',
+      'gemini-3.8-flash',
     )).rejects.toThrow(/model output failed: generation failed/i);
   });
 
@@ -138,7 +138,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'comparison',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL retrieval failed for https://example.org (error). Web OCR only returns content when URL-context retrieval reports success for every URL; it does not guess content.',
@@ -160,7 +160,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'comparison',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL retrieval verified an unexpected URL (https://unexpected.example).',
@@ -182,7 +182,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'comparison',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL retrieval returned a duplicate result for https://example.com.',
@@ -224,7 +224,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'individual',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL extraction did not return a complete result for every requested URL. Web OCR only returns content when URL-context retrieval reports success for every URL; it does not guess content.',
@@ -266,7 +266,7 @@ describe('extractTextFromUrls', () => {
       ['https://example.com', 'https://example.org'],
       'test-api-key',
       'individual',
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
     );
 
     const byUrl = Object.fromEntries((result.results ?? []).map((r) => [r.url, r.content]));
@@ -306,7 +306,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'individual',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL extraction returned a result for an unexpected URL (https://evil.example.net).',
@@ -339,7 +339,7 @@ describe('extractTextFromUrls', () => {
       ['http://example.com', 'https://example.com'],
       'test-api-key',
       'individual',
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
     );
 
     const byUrl = Object.fromEntries((result.results ?? []).map((r) => [r.url, r.content]));
@@ -374,7 +374,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com'],
         'test-api-key',
         'individual',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL extraction returned a result for an unexpected URL (https://www.example.com).',
@@ -410,7 +410,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com', 'https://example.org'],
         'test-api-key',
         'individual',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow(
       'Grounded URL extraction returned a result for an unexpected URL (https://example.com).',
@@ -437,7 +437,7 @@ describe('extractTextFromUrls', () => {
       ],
     });
 
-    await extractTextFromUrls(urls, 'test-api-key', 'individual', 'gemini-3-flash-preview');
+    await extractTextFromUrls(urls, 'test-api-key', 'individual', 'gemini-3.5-flash-lite');
 
     const call = mockRunModelInteraction.mock.calls[0][0];
     // 10 URLs * 2048 = 20480 (> the old fixed 8192 budget). The generation
@@ -455,7 +455,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com'],
         'test-api-key',
         'combined',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow('500 Internal server error');
   });
@@ -469,7 +469,7 @@ describe('extractTextFromUrls', () => {
         ['https://example.com'],
         'test-api-key',
         'combined',
-        'gemini-3-flash-preview',
+        'gemini-3.5-flash-lite',
       ),
     ).rejects.toThrow('Grounded URL retrieval is unavailable for this API key, model, or region.');
   });

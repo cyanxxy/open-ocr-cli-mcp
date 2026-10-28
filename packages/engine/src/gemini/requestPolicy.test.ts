@@ -62,7 +62,7 @@ describe('Gemini request policy', () => {
     await waitForGeminiRequestSlot();
     recordGeminiUsage({
       usageMetadata: { promptTokenCount: 1_000, candidatesTokenCount: 100, totalTokenCount: 1_100 },
-    }, 'gemini-3.5-flash');
+    }, 'gemini-3.8-flash');
 
     await expect(waitForGeminiRequestSlot()).rejects.toBeInstanceOf(GeminiCostLimitError);
   });

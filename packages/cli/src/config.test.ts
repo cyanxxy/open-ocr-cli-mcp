@@ -67,13 +67,13 @@ describe('CLI configuration', () => {
 
   it('lets CLI flags override environment and file configuration', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    process.env.OPEN_OCR_MODEL = 'gemini-3-flash-preview';
+    process.env.OPEN_OCR_MODEL = 'gemini-3.5-flash-lite';
     const options = resolveCliOptions(
-      { model: 'gemini-3.1-pro-preview', thinking: 'high', concurrency: '6' },
-      { model: 'gemini-3.1-flash-lite', thinking: 'LOW', concurrency: 3 },
+      { model: 'gemini-4-argon', thinking: 'high', concurrency: '6' },
+      { model: 'gemini-3.5-flash-lite', thinking: 'LOW', concurrency: 3 },
       '/workspace',
     );
-    expect(options.model).toBe('gemini-3.1-pro-preview');
+    expect(options.model).toBe('gemini-4-argon');
     expect(options.thinking).toBe('HIGH');
     expect(options.concurrency).toBe(6);
   });
@@ -253,7 +253,7 @@ describe('CLI configuration', () => {
   it('does not carry provider-coupled settings across a provider switch', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     const options = resolveCliOptions({ provider: 'kimi' }, {
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-3.5-flash-lite',
       apiKeyEnv: 'GEMINI_API_KEY',
       baseUrl: 'https://gemini.example/v1',
       thinking: 'MINIMAL',
@@ -543,16 +543,15 @@ describe('CLI configuration', () => {
 
   it('preserves an explicit minimal effort for agentic Flash models that support it', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    expect(resolveCliOptions({ model: 'gemini-3.6-flash', mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
+    expect(resolveCliOptions({ model: 'gemini-3.5-flash-lite', mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
   });
 
-  it('uses model-aware Gemini defaults and rejects unsupported Pro minimal effort', () => {
+  it('uses model-aware Gemini defaults and rejects unsupported Argon minimal effort', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    expect(resolveCliOptions({ model: 'gemini-3.1-flash-lite' }, {}, '/workspace').thinking).toBe('MINIMAL');
-    expect(resolveCliOptions({ model: 'gemini-3-flash-preview' }, {}, '/workspace').thinking).toBe('HIGH');
-    expect(resolveCliOptions({ model: 'gemini-3.1-pro-preview' }, {}, '/workspace').thinking).toBe('HIGH');
+    expect(resolveCliOptions({ model: 'gemini-3.5-flash-lite' }, {}, '/workspace').thinking).toBe('MINIMAL');
+    expect(resolveCliOptions({ model: 'gemini-4-argon' }, {}, '/workspace').thinking).toBe('MEDIUM');
     expect(() => resolveCliOptions(
-      { model: 'gemini-3.1-pro-preview', thinking: 'minimal' },
+      { model: 'gemini-4-argon', thinking: 'minimal' },
       {},
       '/workspace',
     )).toThrow('minimal is not supported');

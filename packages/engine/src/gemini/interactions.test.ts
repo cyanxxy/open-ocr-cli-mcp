@@ -149,7 +149,7 @@ describe('runModelInteraction', () => {
 
     await expect(runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
     })).resolves.toEqual(expect.objectContaining({
       output_text: 'SDK convenience output',
@@ -189,7 +189,7 @@ describe('runModelInteraction', () => {
 
     const result = await runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       runtime,
       onProgress: (delta) => deltas.push(delta),
@@ -233,7 +233,7 @@ describe('runModelInteraction', () => {
 
     await expect(runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       onProgress: () => undefined,
     })).resolves.toMatchObject({ output_text: 'Terminal convenience text' });
@@ -255,7 +255,7 @@ describe('runModelInteraction', () => {
 
     await expect(runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       runtime,
       onProgress: () => undefined,
@@ -287,7 +287,7 @@ describe('runModelInteraction', () => {
 
     await runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       runtime,
       onProgress: () => undefined,
@@ -323,7 +323,7 @@ describe('runModelInteraction', () => {
 
     await runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       onProgress: (delta) => stepIds.push(delta.stepId),
     });
@@ -344,7 +344,7 @@ describe('runModelInteraction', () => {
 
     await expect(runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Extract text',
       onProgress: () => undefined,
     })).rejects.toThrow(/without a terminal interaction\.completed/u);
@@ -378,13 +378,13 @@ describe('runModelInteraction', () => {
 
     await runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'First turn',
       runtime,
     });
     await runModelInteraction({
       apiKey: 'test-key',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       input: 'Second turn',
       previousInteractionId: 'interaction-1',
       runtime,
@@ -403,53 +403,50 @@ describe('runModelInteraction', () => {
 describe('createInteractionGenerationConfig', () => {
   it('maps each thinking level to its model-gated lowercase wire value', () => {
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'MEDIUM' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'MEDIUM' }).thinking_level,
     ).toBe('medium');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3.1-pro-preview', { level: 'MEDIUM' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-4-argon', { level: 'MEDIUM' }).thinking_level,
     ).toBe('medium');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'MINIMAL' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'MINIMAL' }).thinking_level,
     ).toBe('minimal');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3.1-flash-lite', { level: 'MINIMAL' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'MINIMAL' }).thinking_level,
     ).toBe('minimal');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'LOW' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'LOW' }).thinking_level,
     ).toBe('low');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'HIGH' }).thinking_level,
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'HIGH' }).thinking_level,
     ).toBe('high');
   });
 
   it('rejects MINIMAL when the model does not support it (Pro)', () => {
     expect(() => (
-      createInteractionGenerationConfig({}, 'gemini-3.1-pro-preview', { level: 'MINIMAL' })
-    )).toThrow('gemini-3.1-pro-preview supports thinking levels low, medium, high');
+      createInteractionGenerationConfig({}, 'gemini-4-argon', { level: 'MINIMAL' })
+    )).toThrow('gemini-4-argon supports thinking levels low, medium, high');
   });
 
   it('defaults thinking when no thinking config is given', () => {
-    const flash = createInteractionGenerationConfig({}, 'gemini-3.5-flash');
+    const flash = createInteractionGenerationConfig({}, 'gemini-3.8-flash');
     expect(flash.thinking_level).toBe('medium');
     expect(flash.thinking_summaries).toBe('none');
 
-    const lite = createInteractionGenerationConfig({}, 'gemini-3.1-flash-lite');
+    const lite = createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite');
     expect(lite.thinking_level).toBe('minimal');
 
-    const pro = createInteractionGenerationConfig({}, 'gemini-3.1-pro-preview');
-    expect(pro.thinking_level).toBe('high');
-
-    const preview = createInteractionGenerationConfig({}, 'gemini-3-flash-preview');
-    expect(preview.thinking_level).toBe('high');
+    const argon = createInteractionGenerationConfig({}, 'gemini-4-argon');
+    expect(argon.thinking_level).toBe('medium');
   });
 
   it('enables thought summaries only when includeThoughts is set', () => {
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'HIGH', includeThoughts: true })
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'HIGH', includeThoughts: true })
         .thinking_summaries,
     ).toBe('auto');
     expect(
-      createInteractionGenerationConfig({}, 'gemini-3-flash-preview', { level: 'HIGH', includeThoughts: false })
+      createInteractionGenerationConfig({}, 'gemini-3.5-flash-lite', { level: 'HIGH', includeThoughts: false })
         .thinking_summaries,
     ).toBe('none');
   });
@@ -457,7 +454,7 @@ describe('createInteractionGenerationConfig', () => {
   it('passes through generation parameters using Interactions snake_case keys without top_p', () => {
     const config = createInteractionGenerationConfig(
       { temperature: 0.4, maxOutputTokens: 2048, topP: 0.8, toolChoice: 'validated' },
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
     );
     expect(config.temperature).toBe(0.4);
     expect(config.max_output_tokens).toBe(2048);

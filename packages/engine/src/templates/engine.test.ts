@@ -53,7 +53,7 @@ vi.mock('@google/genai', async (importOriginal) => {
 
 const testClientConfig = {
   apiKey: 'test-key',
-  model: 'gemini-3.5-flash' as const,
+  model: 'gemini-3.5-flash-lite' as const,
   thinkingConfig: { level: 'MINIMAL' as const, includeThoughts: false },
 };
 
@@ -170,7 +170,7 @@ describe('template engine helpers', () => {
       'application/pdf',
       {
         apiKey: 'test-key',
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.5-flash-lite',
         thinkingConfig: { level: 'MINIMAL', includeThoughts: false },
       },
       preset,
@@ -179,7 +179,7 @@ describe('template engine helpers', () => {
     expect(result.json.fields.total?.value).toBe('1471.50');
     expect(result.json.fields.currency?.value).toBe('USD');
     expect(mockTemplateGenerateContent).toHaveBeenLastCalledWith(expect.objectContaining({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.5-flash-lite',
       config: expect.objectContaining({
         responseMimeType: 'application/json',
         responseJsonSchema: expect.objectContaining({

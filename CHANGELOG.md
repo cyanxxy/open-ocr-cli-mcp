@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Gemini now offers three models: `gemini-3.8-flash` (default),
+  `gemini-4-argon`, and `gemini-3.5-flash-lite`. A config or `--model` naming
+  any other Gemini model fails with `CONFIG_INVALID`.
+  - `gemini-3.7-flash` and `gemini-3.5-flash` were removed because Google now
+    routes them to 3.8 Flash and 3.6 Flash.
+  - `gemini-3.6-flash` and `gemini-3-flash-preview` were removed (Google
+    recommends 3.6 Flash in place of the preview).
+  - `gemini-3.1-flash-lite` (shuts down 2027-05-07) and
+    `gemini-3.1-pro-preview` were also removed.
+- `gemini-4-argon` accepts thinking `low`, `medium` (default), or `high`.
+  Cost is estimated at $2 / $0.10 cached / $10 per million tokens through
+  2026-11-30, and $4 / $0.20 / $20 from 2026-12-01 (UTC).
+
 ## 4.2.0 - 2026-10-28
 
 ### Security

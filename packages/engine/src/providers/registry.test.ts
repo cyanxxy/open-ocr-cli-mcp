@@ -17,7 +17,7 @@ describe('provider registry routing', () => {
     expect(providerProfile('openrouter').defaultModel).toBe('google/gemini-3.8-flash');
     expect(providerProfile('muse').defaultModel).toBe('muse-spark-1.3');
     expect(providerProfile('muse').models.some((model) => model.endsWith('-contributor'))).toBe(false);
-    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash']) {
+    for (const model of ['gemini-3.8-flash', 'gemini-4-argon']) {
       expect(knownModelThinkingLevels('gemini', model)).toEqual(['LOW', 'MEDIUM', 'HIGH']);
       expect(knownModelThinkingLevels('openrouter', `google/${model}:nitro`)).toEqual(['LOW', 'MEDIUM', 'HIGH']);
     }
@@ -108,28 +108,21 @@ describe('provider registry routing', () => {
     )).toBe(1.1525);
   });
 
-  it('uses the published Gemini standard context-cache rates', () => {
-    expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-3.5-flash' }, 0)).toEqual({
-      inputPerMillionUsd: 1.5,
-      cachedInputPerMillionUsd: 0.15,
-      outputPerMillionUsd: 9,
-    });
-    expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-3.1-pro-preview' }, 200_001)).toEqual({
-      inputPerMillionUsd: 4,
-      cachedInputPerMillionUsd: 0.4,
-      outputPerMillionUsd: 18,
-    });
-  });
-
   it('applies scheduled Gemini price changes at the published UTC boundary', () => {
-    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash']) {
-      expect(providerTokenPrice({ provider: 'gemini', model }, 0, Date.UTC(2026, 11, 31, 23, 59, 59))).toEqual({
-        inputPerMillionUsd: 0.75, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 3.75,
-      });
-      expect(providerTokenPrice({ provider: 'gemini', model }, 0, Date.UTC(2027, 0, 1))).toEqual({
-        inputPerMillionUsd: 1.5, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 7.5,
-      });
-    }
+    const flash = { provider: 'gemini', model: 'gemini-3.8-flash' } as const;
+    expect(providerTokenPrice(flash, 0, Date.UTC(2026, 11, 31, 23, 59, 59))).toEqual({
+      inputPerMillionUsd: 0.75, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 3.75,
+    });
+    expect(providerTokenPrice(flash, 0, Date.UTC(2027, 0, 1))).toEqual({
+      inputPerMillionUsd: 1.5, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 7.5,
+    });
+    const argon = { provider: 'gemini', model: 'gemini-4-argon' } as const;
+    expect(providerTokenPrice(argon, 1_000_000, Date.UTC(2026, 10, 30, 23, 59, 59))).toEqual({
+      inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10,
+    });
+    expect(providerTokenPrice(argon, 0, Date.UTC(2026, 11, 1))).toEqual({
+      inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20,
+    });
     expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-3.5-flash-lite' }, 0)).toEqual({
       inputPerMillionUsd: 0.3, cachedInputPerMillionUsd: 0.03, outputPerMillionUsd: 2.5,
     });

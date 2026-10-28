@@ -563,9 +563,6 @@ export function resolveCliOptions(
   if (provider !== 'openrouter' && provider !== 'muse' && thinking === 'XHIGH') {
     throw configurationError(`${thinkingLabel} xhigh is supported by Muse and model-dependent OpenRouter routes`);
   }
-  if (provider === 'gemini' && model === 'gemini-3.1-pro-preview' && thinking === 'MINIMAL') {
-    throw configurationError(`Gemini 3.1 Pro supports ${thinkingLabel} low, medium, or high; minimal is not supported`);
-  }
   if (isKimiK3 && thinking === 'MEDIUM') {
     throw configurationError(`Kimi K3 supports ${thinkingLabel} low, high, or max; medium would be an ambiguous silent upgrade`);
   }

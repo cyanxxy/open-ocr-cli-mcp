@@ -564,7 +564,7 @@ describe('CLI output', () => {
       failed: 0,
       skipped: 0,
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       usage: {
         requests: 0,
         inputTokens: 0,

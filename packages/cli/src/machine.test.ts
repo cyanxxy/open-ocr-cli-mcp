@@ -47,7 +47,7 @@ describe('machine request execution', () => {
     await writeFile(path.join(directory, 'invoice.jpg'), JPEG_BYTES);
     await writeFile(path.join(directory, 'agent-config.json'), JSON.stringify({
       concurrency: 7,
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-3.5-flash-lite',
     }));
     await writeFile(path.join(directory, '.open-ocr-cli.json'), JSON.stringify({
       provider: 'kimi',
@@ -71,7 +71,7 @@ describe('machine request execution', () => {
 
     expect(execution.summary).toMatchObject({
       provider: 'gemini',
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-3.5-flash-lite',
       mode: 'simple',
       failed: 0,
     });

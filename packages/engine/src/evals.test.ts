@@ -178,7 +178,7 @@ describe('eval utilities', () => {
 
   it('builds summaries and renders markdown reports', () => {
     const summary = buildEvalSummary(
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
       [
         { id: 'invoice', passed: true, weight: 2, failedAssertions: [] },
         { id: 'resume', passed: false, weight: 1, failedAssertions: ['Expected JSON path "fields.email.value" to exist.'] },
@@ -201,7 +201,7 @@ describe('eval utilities', () => {
 
   it('falls back to pass rate when all eval weights are zero', () => {
     const summary = buildEvalSummary(
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
       [
         { id: 'case-1', passed: true, weight: 0, failedAssertions: [] },
         { id: 'case-2', passed: false, weight: 0, failedAssertions: ['failed'] },
