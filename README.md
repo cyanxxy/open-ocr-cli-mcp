@@ -21,6 +21,11 @@ The repository is `open-ocr-cli-mcp`; the npm package and executable are
 **`open-ocr-cli`**. Credentials stay in environment variables. Run
 `open-ocr-cli init` for guided setup or `doctor --json` for diagnostics.
 
+A repository you run in is untrusted: its `.open-ocr-cli.json` cannot set
+endpoints, key variables, gateways, or `overwrite`, or write output outside the
+project, and its `.env` may only supply the default provider keys. Put custom
+routing in your user config with `open-ocr-cli init --global`.
+
 ## For agents
 
 Discover the contract, validate a request, then extract:
@@ -61,7 +66,9 @@ Tools: `ocr_capabilities`, `ocr_extract`, `ocr_run_agentic`, `ocr_web`, and
 `ocr_read_artifact`. Call capabilities first; pass absolute paths and bound
 batches. The artifact reader returns bounded chunks from artifacts written by
 the running server. Resumed artifacts from an earlier server process need local
-filesystem access.
+filesystem access. `isError` marks only a failed run; a partial, cancelled, or
+cost-limited run returns `ok: false` with the artifacts it produced, so check
+`status` and keep that work instead of re-running it.
 
 The server uses **MCP 2026-07-28** with SDK **2.3.0**. Client configuration and
 revision support matter; see the [Codex and Claude Code setup](docs/agent-integrations.md).

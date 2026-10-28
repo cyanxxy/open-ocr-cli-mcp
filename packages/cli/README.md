@@ -19,6 +19,10 @@ Credential defaults are `MOONSHOT_API_KEY`, `META_API_KEY`, `OPENROUTER_API_KEY`
 and `OPEN_OCR_API_KEY`. Compatible endpoints need `--model`; `--base-url`
 defaults to `http://localhost:11434/v1`, where no API key is required.
 Use `init` for guided setup; API keys never belong in flags or JSON config.
+A project's `.open-ocr-cli.json` cannot set endpoints, key variables, gateways,
+or `overwrite`, or write output outside the project, and its `.env` may only
+supply the default keys; put custom routing in your user config with
+`init --global`.
 
 ## Agent workflow
 
@@ -51,6 +55,8 @@ directory, reference jobs use `.open-ocr-results/<runId>`.
 
 Launch `open-ocr-cli mcp` from your client. It exposes `ocr_capabilities`,
 `ocr_extract`, `ocr_run_agentic`, `ocr_web`, and `ocr_read_artifact`.
+`isError` marks only a failed run; partial, cancelled, and cost-limited runs
+return `ok: false` with the artifacts they produced.
 
 The client must support **MCP 2026-07-28**. Follow the
 [Codex / Claude Code setup](https://github.com/cyanxxy/open-ocr-cli-mcp/blob/main/docs/agent-integrations.md)
