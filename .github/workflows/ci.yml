@@ -57,7 +57,9 @@ jobs:
       - name: Check release notes for the current version
         run: |
           VERSION=$(node -p "require('./packages/cli/package.json').version")
-          node scripts/assert-release-version.mjs "v$VERSION"
+          # The script prefers GITHUB_REF_NAME (a tag in release runs); on a PR
+          # that is "<n>/merge", so point it at the version being released.
+          GITHUB_REF_NAME="v$VERSION" node scripts/assert-release-version.mjs
           node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
 
       - name: Type check
