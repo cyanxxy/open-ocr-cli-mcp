@@ -126,7 +126,7 @@ describe('CLI init', () => {
     const result = await runInit({ skipValidation: true }, {
       cwd: directory,
       env: {},
-      prompter: answers(['2', '5', 'kimi-custom-vision', '3']),
+      prompter: answers(['2', '4', 'kimi-custom-vision', '3']),
       writeOutput: (text) => output.push(text),
     });
 
@@ -134,7 +134,7 @@ describe('CLI init', () => {
     const config = JSON.parse(await readFile(result.configPath, 'utf8')) as Record<string, unknown>;
     expect(config.model).toBe('kimi-custom-vision');
     expect(output.join('')).toContain('1. kimi-k3 (default)');
-    expect(output.join('')).toContain('5. Enter a custom model ID');
+    expect(output.join('')).toContain('4. Enter a custom model ID');
   });
 
   it('uses Kimi K3 reasoning and published pricing defaults during setup', async () => {

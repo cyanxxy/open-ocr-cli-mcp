@@ -221,23 +221,10 @@ function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
     );
   };
   if (config.provider === 'kimi') {
-    if (/^kimi-k3(?:$|-)/u.test(config.model)) {
-      return { reasoning_effort: kimiK3Effort() };
-    }
-    if (/^kimi-k2\.7-code/u.test(config.model)) {
-      return { thinking: { type: 'enabled', keep: 'all' } };
-    }
-    return level === 'MINIMAL'
-      ? { thinking: { type: 'disabled' } }
-      : { thinking: { type: 'enabled', keep: 'all' } };
+    // Unlisted Kimi models get no reasoning field and keep the API default.
+    return isKimiK3Route(config.provider, config.model) ? { reasoning_effort: kimiK3Effort() } : {};
   }
   if (config.provider === 'openrouter') {
-    const routedModel = config.model.split(':')[0];
-    if (/^moonshotai\/kimi-k2\.7-code/u.test(routedModel) || routedModel === 'moonshotai/kimi-k2.6') {
-      // These K2 routes expose a reasoning toggle, not an effort budget. K2.7
-      // always reasons; K2.6 minimal maps to its instant mode explicitly.
-      return { reasoning: { enabled: level !== 'MINIMAL', exclude: false } };
-    }
     return {
       // OpenRouter requires reasoning_details to be replayed unchanged during
       // tool use. Visibility is handled by progress policy, never transport.
@@ -421,13 +408,13 @@ function completionRequestBody(
     ...extraBody,
     model: config.model,
     messages: request.messages.map(messageForWire),
-    // Both named routes have deprecated `max_tokens` in favour of the OpenAI
-    // spelling: Kimi's Chat API across every model family, and OpenRouter's
-    // reference, which now documents `max_tokens` as "deprecated, use
-    // max_completion_tokens". A generic compatible endpoint keeps `max_tokens`,
-    // because a local server built against the older spec is the common case and
-    // an unrecognised field there would silently drop the output cap.
-    ...(config.provider === 'kimi' || config.provider === 'openrouter'
+    // Kimi's Chat API has deprecated `max_tokens` in favour of the OpenAI
+    // spelling. OpenRouter keeps `max_tokens`: it is the only token cap every
+    // Gemini, Muse, and Kimi endpoint lists in `supported_parameters`, and
+    // structured/tool requests set `require_parameters`, which would otherwise
+    // filter those endpoints out. Generic endpoints keep `max_tokens` because a
+    // local server built against the older spec is the common case.
+    ...(config.provider === 'kimi'
       ? { max_completion_tokens: request.maxTokens }
       : { max_tokens: request.maxTokens }),
     stream,

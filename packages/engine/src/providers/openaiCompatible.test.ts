@@ -22,7 +22,7 @@ function config(overrides: Partial<ProviderRuntimeConfig> = {}): ProviderRuntime
     gateway: 'direct',
     apiKey: 'secret',
     apiKeyEnv: 'MOONSHOT_API_KEY',
-    model: 'kimi-k2.6',
+    model: 'kimi-k3.1-pro',
     baseUrl: 'https://api.moonshot.ai/v1',
     thinkingConfig: { level: 'HIGH', includeThoughts: true },
     ...overrides,
@@ -72,20 +72,37 @@ describe('OpenAI-compatible transport', () => {
   });
 
   it.each([
-    ['moonshotai/kimi-k2.7-code', 'HIGH', true],
-    ['moonshotai/kimi-k2.6', 'HIGH', true],
-    ['moonshotai/kimi-k2.6', 'MINIMAL', false],
-  ] as const)('uses the reasoning toggle for %s %s', async (model, level, enabled) => {
+    ['kimi', 'kimi-k3.1-pro', 'MINIMAL', { reasoning_effort: 'low' }],
+    ['kimi', 'kimi-k3.1-pro-highspeed', 'MAX', { reasoning_effort: 'max' }],
+    ['openrouter', 'moonshotai/kimi-k3.1-pro', 'HIGH', { reasoning: { effort: 'high', exclude: false } }],
+  ] as const)('uses the K3-series effort contract for %s %s %s', async (provider, model, level, expected) => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
     }));
     vi.stubGlobal('fetch', fetchMock);
-    await createChatCompletion(config({ provider: 'openrouter', model, thinkingConfig: { level } }), {
+    await createChatCompletion(config({ provider, model, thinkingConfig: { level } }), {
       messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
     });
     const wireBody = fetchMock.mock.calls[0]?.[1]?.body;
     if (typeof wireBody !== 'string') throw new Error('Expected JSON request body');
-    expect(JSON.parse(wireBody) as unknown).toMatchObject({ reasoning: { enabled, exclude: false } });
+    const body = JSON.parse(wireBody) as Record<string, unknown>;
+    expect(body).toMatchObject(expected);
+    expect(body).not.toHaveProperty('thinking');
+  });
+
+  it('sends no reasoning field for an unlisted direct Kimi model', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await createChatCompletion(config({ model: 'kimi-future' }), {
+      messages: [{ role: 'user', content: 'Extract' }], maxTokens: 1024,
+    });
+    const wireBody = fetchMock.mock.calls[0]?.[1]?.body;
+    if (typeof wireBody !== 'string') throw new Error('Expected JSON request body');
+    const body = JSON.parse(wireBody) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('reasoning_effort');
+    expect(body).not.toHaveProperty('thinking');
   });
 
   it.each([undefined, 'budget_exceeded', 'paused'])('rejects unconfirmed completion %s from a generic endpoint', async (finishReason) => {
@@ -682,8 +699,8 @@ describe('OpenAI-compatible transport', () => {
     expect(new Headers(request.headers).get('authorization')).toBe('Bearer secret');
     if (typeof request.body !== 'string') throw new Error('Expected a string request body');
     expect(JSON.parse(request.body) as unknown).toMatchObject({
-      model: 'kimi-k2.6',
-      thinking: { type: 'enabled', keep: 'all' },
+      model: 'kimi-k3.1-pro',
+      reasoning_effort: 'high',
       max_completion_tokens: 1000,
     });
     expect(JSON.parse(request.body)).not.toHaveProperty('max_tokens');
@@ -745,9 +762,9 @@ describe('OpenAI-compatible transport', () => {
   });
 
   it.each([
-    ['kimi', 'kimi-k3', 'https://api.moonshot.ai/v1'],
-    ['openrouter', 'google/gemini-3.8-flash', 'https://openrouter.ai/api/v1'],
-  ] as const)('sends the output cap as max_completion_tokens on %s', async (provider, model, baseUrl) => {
+    ['kimi', 'kimi-k3', 'https://api.moonshot.ai/v1', 'max_completion_tokens', 'max_tokens'],
+    ['openrouter', 'google/gemini-3.8-flash', 'https://openrouter.ai/api/v1', 'max_tokens', 'max_completion_tokens'],
+  ] as const)('sends the output cap on %s as the field its endpoints accept', async (provider, model, baseUrl, field, absent) => {
     const fetchMock = vi.fn((_input: FetchInput, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -757,15 +774,16 @@ describe('OpenAI-compatible transport', () => {
     await createChatCompletion(config({ provider, model, baseUrl }), {
       messages: [{ role: 'user', content: 'Extract this' }],
       maxTokens: 1000,
+      responseSchema: { type: 'object', properties: {}, additionalProperties: false },
     });
 
     const init = fetchMock.mock.calls[0]?.[1];
     if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
-    // Both routes deprecate `max_tokens`. Sending only the deprecated spelling
-    // risks the cap being ignored, which turns a bounded run into an unbounded
-    // billed one, so the field is pinned rather than left to the transport.
-    expect(JSON.parse(init.body)).toMatchObject({ max_completion_tokens: 1000 });
-    expect(JSON.parse(init.body)).not.toHaveProperty('max_tokens');
+    // Kimi deprecates `max_tokens`; OpenRouter's Gemini/Muse/Kimi endpoints list
+    // only `max_tokens`, and structured requests set require_parameters. Sending
+    // the wrong spelling either drops the cap or leaves no routable endpoint.
+    expect(JSON.parse(init.body)).toMatchObject({ [field]: 1000 });
+    expect(JSON.parse(init.body)).not.toHaveProperty(absent);
   });
 
   it('uses Cloudflare gateway authentication and omits provider auth in BYOK mode', async () => {
@@ -778,7 +796,7 @@ describe('OpenAI-compatible transport', () => {
     await createChatCompletion(config({
       provider: 'openrouter',
       gateway: 'cloudflare',
-      model: 'moonshotai/kimi-k2.6',
+      model: 'moonshotai/kimi-k3.1-pro',
       baseUrl: 'https://gateway.ai.cloudflare.com/v1/a/g/openrouter',
       gatewayToken: 'gateway-secret',
       cloudflareByok: true,
@@ -817,7 +835,7 @@ describe('OpenAI-compatible transport', () => {
 
     const result = await createChatCompletion(config({
       provider: 'openrouter',
-      model: 'moonshotai/kimi-k2.6',
+      model: 'moonshotai/kimi-k3.1-pro',
       baseUrl: 'https://openrouter.ai/api/v1',
       thinkingConfig: { level: 'MINIMAL', includeThoughts: true },
     }), {
@@ -832,7 +850,7 @@ describe('OpenAI-compatible transport', () => {
     const request = fetchMock.mock.calls[0][1] as RequestInit;
     if (typeof request.body !== 'string') throw new Error('Expected a string request body');
     expect(JSON.parse(request.body) as unknown).toMatchObject({
-      reasoning: { enabled: false, exclude: false },
+      reasoning: { effort: 'low', exclude: false },
     });
     expect(new Headers(request.headers).get('http-referer')).toBe('https://github.com/cyanxxy/open-ocr-cli-mcp');
     // cost:0 with known Kimi pricing falls back to a local estimate so --max-cost cannot fail open.

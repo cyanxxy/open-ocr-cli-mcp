@@ -16,6 +16,30 @@
 - `gemini-4-argon` accepts thinking `low`, `medium` (default), or `high`.
   Cost is estimated at $2 / $0.10 cached / $10 per million tokens through
   2026-11-30, and $4 / $0.20 / $20 from 2026-12-01 (UTC).
+- Kimi offers `kimi-k3` (default), `kimi-k3.1-pro`, and
+  `kimi-k3.1-pro-highspeed`. The K3.1 models use K3's `low`/`high`/`max`
+  effort (default `max`). K2 models (`kimi-k2.7-code`, `-highspeed`,
+  `kimi-k2.6`) were removed: Kimi closes them to new accounts on 2026-10-31
+  and retires them by the end of December 2026.
+- Muse offers `muse-spark-1.3` (default) and `muse-wonder-1.0` (preview,
+  `minimal` to `max`). Spark 1.1 and 1.2 were removed; only the 1.3
+  contributor variant keeps a built-in price.
+- OpenRouter's suggested routes are now the current models that read images
+  and PDFs natively, plus Kimi K3/K3.1 Pro: the three Gemini models, Muse
+  Spark 1.3 and Wonder, GPT-6.1 Sol and Terra, GPT-6 Luna and Astra, Claude
+  Opus/Sonnet/Haiku 5.5 and Fable 5.1, Grok 4.7, and Mistral Medium 3.5. Each
+  route validates thinking against OpenRouter's published efforts and default.
+
+### Fixed
+
+- OpenRouter requests send `max_tokens` instead of `max_completion_tokens`.
+  Gemini, Muse, and Kimi endpoints list only `max_tokens`, so structured and
+  tool requests (which set `require_parameters`) could find no endpoint.
+- `kimi-k3.1-pro` used to receive the K2 `thinking` toggle instead of
+  `reasoning_effort`.
+- Fallback cost estimates: Claude Sonnet 5.5 cached input ($0.10, was $0.20)
+  and OpenRouter Kimi K3 (Moonshot's $3 / $0.30 / $15). OpenRouter's reported
+  `usage.cost` still takes precedence.
 
 ## 4.2.0 - 2026-10-28
 

@@ -77,12 +77,12 @@ describe('provider usage accounting', () => {
     }, {
       ...openRouterConfig,
       provider: 'kimi',
-      model: 'kimi-k2.6',
+      model: 'kimi-k3.1-pro',
     });
 
     expect(getProviderUsage()).toMatchObject({
       cachedTokens: 250_000,
-      estimatedCostUsd: 1.1525,
+      estimatedCostUsd: 2.55,
     });
   });
 

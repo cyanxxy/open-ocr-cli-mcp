@@ -33,7 +33,7 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
     defaultModel: 'kimi-k3',
     defaultBaseUrl: 'https://api.moonshot.ai/v1',
     defaultApiKeyEnv: 'MOONSHOT_API_KEY',
-    models: ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k2.6'],
+    models: ['kimi-k3', 'kimi-k3.1-pro', 'kimi-k3.1-pro-highspeed'],
     inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
     capabilities: {
       images: true,
@@ -52,7 +52,7 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
     defaultApiKeyEnv: 'META_API_KEY',
     // Contributor variants permit training on submitted documents. They remain
     // available by explicit model ID, but are not suggested during discovery.
-    models: ['muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1'],
+    models: ['muse-spark-1.3', 'muse-wonder-1.0'],
     inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
     capabilities: {
       images: true,
@@ -72,17 +72,23 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
     defaultApiKeyEnv: 'OPENROUTER_API_KEY',
     models: [
+      // Current models that natively read both images and PDFs, plus Kimi
+      // K3 (images natively; OpenRouter parses PDFs for it).
       ...GEMINI_MODELS.map((model) => `google/${model}`),
       'meta/muse-spark-1.3',
-      'meta/muse-spark-1.2',
+      'meta/muse-wonder',
       'openai/gpt-6.1-sol',
-      'openai/gpt-6-astra',
+      'openai/gpt-6.1-terra',
       'openai/gpt-6-luna',
+      'openai/gpt-6-astra',
+      'anthropic/claude-opus-5.5',
       'anthropic/claude-sonnet-5.5',
+      'anthropic/claude-haiku-5.5',
       'anthropic/claude-fable-5.1',
+      'x-ai/grok-4.7',
+      'mistralai/mistral-medium-3-5',
       'moonshotai/kimi-k3',
-      'moonshotai/kimi-k2.7-code',
-      'moonshotai/kimi-k2.6',
+      'moonshotai/kimi-k3.1-pro',
     ],
     inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
     capabilities: {
@@ -127,14 +133,36 @@ export function providerDefaultBaseUrl(provider: ProviderId): string {
   return providerProfile(provider).defaultBaseUrl;
 }
 
-/** True when the selected route targets Kimi K3's current reasoning contract. */
+/** True when the selected route targets the Kimi K3-series reasoning contract (K3, K3.1 Pro). */
 export function isKimiK3Route(provider: ProviderId, model: string): boolean {
-  if (provider === 'kimi') return /^kimi-k3(?:$|-)/u.test(model);
+  if (provider === 'kimi') return /^kimi-k3(?:$|[-.])/u.test(model);
   // OpenRouter model variants use a colon suffix (for example routing
   // variants). They still target K3 and therefore keep K3's exact effort
   // contract instead of the gateway's generic effort vocabulary.
-  return provider === 'openrouter' && /^moonshotai\/kimi-k3(?:$|[-:])/u.test(model);
+  return provider === 'openrouter' && /^moonshotai\/kimi-k3(?:$|[-.:])/u.test(model);
 }
+
+const FULL_EFFORTS: readonly ThinkingLevel[] = ['LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'];
+
+/**
+ * OpenRouter's published reasoning contract per route (`reasoning.supported_efforts`
+ * and `default_effort` in https://openrouter.ai/api/v1/models, 2026-10-28).
+ * `none` is omitted: it disables reasoning and has no host-level equivalent.
+ */
+const OPENROUTER_REASONING: Record<string, { levels: readonly ThinkingLevel[]; defaultLevel: ThinkingLevel }> = {
+  'openai/gpt-6.1-sol': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  'openai/gpt-6.1-terra': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  'openai/gpt-6-luna': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  'openai/gpt-6-astra': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  'anthropic/claude-opus-5.5': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
+  'anthropic/claude-sonnet-5.5': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
+  'anthropic/claude-haiku-5.5': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  'anthropic/claude-fable-5.1': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
+  'x-ai/grok-4.7': { levels: ['LOW', 'MEDIUM', 'HIGH', 'XHIGH'], defaultLevel: 'HIGH' },
+  'mistralai/mistral-medium-3-5': { levels: ['HIGH'], defaultLevel: 'HIGH' },
+};
+
+const MUSE_EFFORTS: readonly ThinkingLevel[] = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'];
 
 /** Current, verified reasoning contracts; unlisted gateway models remain model-dependent. */
 export function knownModelThinkingLevels(provider: ProviderId, model: string): readonly ThinkingLevel[] | undefined {
@@ -148,36 +176,24 @@ export function knownModelThinkingLevels(provider: ProviderId, model: string): r
       ? ['LOW', 'MEDIUM', 'HIGH']
       : ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'];
   }
-  const kimiModel = provider === 'kimi'
-    ? model
-    : provider === 'openrouter' && routedModel.startsWith('moonshotai/') ? routedModel.slice(11) : undefined;
-  if (kimiModel && /^kimi-k2\.7-code/u.test(kimiModel)) return ['HIGH'];
-  if (kimiModel === 'kimi-k2.6') return ['MINIMAL', 'HIGH'];
   const museModel = provider === 'muse'
     ? model
     : provider === 'openrouter' && routedModel.startsWith('meta/') ? routedModel.slice(5) : undefined;
-  if (museModel && ['muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1', 'muse-spark-1.3-contributor', 'muse-spark-1.2-contributor'].includes(museModel)) {
-    return museModel === 'muse-spark-1.3'
-      ? ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX']
-      : ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'];
-  }
-  if (provider === 'openrouter' && [
-    'openai/gpt-6.1-sol', 'openai/gpt-6-astra', 'openai/gpt-6-luna',
-    'anthropic/claude-sonnet-5.5', 'anthropic/claude-fable-5.1',
-  ].includes(routedModel)) return ['LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'];
+  // Contributor mode does not offer `max` (https://dev.meta.ai/docs/models).
+  if (museModel === 'muse-spark-1.3-contributor') return MUSE_EFFORTS.filter((level) => level !== 'MAX');
+  if (museModel && ['muse-spark-1.3', 'muse-wonder-1.0', 'muse-wonder'].includes(museModel)) return MUSE_EFFORTS;
+  if (provider === 'openrouter') return OPENROUTER_REASONING[routedModel]?.levels;
   return undefined;
 }
 
 export function providerDefaultThinkingLevel(provider: ProviderId, model: string): ThinkingLevel {
   if (isKimiK3Route(provider, model)) return 'MAX';
-  if (provider === 'kimi' && (/^kimi-k2\.7-code/u.test(model) || model === 'kimi-k2.6')) return 'HIGH';
   const routedModel = provider === 'openrouter' ? model.split(':')[0] : model;
-  if (provider === 'openrouter' && /^moonshotai\/kimi-k2\.(?:7-code|6$)/u.test(routedModel)) return 'HIGH';
   const geminiModel = provider === 'gemini'
     ? model
     : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
   if (geminiModel === 'gemini-3.5-flash-lite') return 'MINIMAL';
-  if (provider === 'openrouter' && routedModel.startsWith('anthropic/claude-')) return 'HIGH';
+  if (provider === 'openrouter') return OPENROUTER_REASONING[routedModel]?.defaultLevel ?? 'MEDIUM';
   return 'MEDIUM';
 }
 
@@ -245,7 +261,7 @@ export function providerTokenPrice(
   // billing rate. Only named provider routes may use the verified price table.
   if (config.provider === 'openai-compatible') return undefined;
   const explicitMuseContributor = config.provider === 'muse'
-    && ['muse-spark-1.3-contributor', 'muse-spark-1.2-contributor'].includes(config.model);
+    && config.model === 'muse-spark-1.3-contributor';
   if (config.provider !== 'openrouter' && !explicitMuseContributor && !providerProfile(config.provider).models.includes(config.model)) {
     return undefined;
   }
@@ -253,42 +269,16 @@ export function providerTokenPrice(
     ? config.model.replace(/^google\//, '').replace(/^moonshotai\//, '').replace(/^meta\//, '')
     : config.model;
   switch (model) {
-    // Verified against https://platform.kimi.ai/docs/pricing/chat on 2026-10-03.
-    // The default K3 5-minute cache-write price equals uncached input ($3/M).
+    // Verified against https://platform.kimi.ai/docs/pricing/chat on 2026-10-28.
+    // Cached input is billed at the cache-hit price only. OpenRouter routes use
+    // Moonshot's first-party rate: its catalog headline is the cheapest of many
+    // third-party hosts, and the response's actual cost takes precedence anyway.
     case 'kimi-k3':
-      if (config.provider === 'openrouter') return {
-        inputPerMillionUsd: 2.7,
-        cachedInputPerMillionUsd: 0.27,
-        outputPerMillionUsd: 13.5,
-      };
-      return {
-        inputPerMillionUsd: 3,
-        cachedInputPerMillionUsd: 0.3,
-        outputPerMillionUsd: 15,
-      };
-    case 'kimi-k2.7-code':
-      if (config.provider === 'openrouter') return {
-        inputPerMillionUsd: 0.6712,
-        cachedInputPerMillionUsd: 0.18,
-        outputPerMillionUsd: 3.35,
-      };
-      return {
-        inputPerMillionUsd: 0.95,
-        cachedInputPerMillionUsd: 0.19,
-        outputPerMillionUsd: 4,
-      };
-    case 'kimi-k2.7-code-highspeed':
-      return {
-        inputPerMillionUsd: 1.9,
-        cachedInputPerMillionUsd: 0.38,
-        outputPerMillionUsd: 8,
-      };
-    case 'kimi-k2.6':
-      return {
-        inputPerMillionUsd: 0.95,
-        cachedInputPerMillionUsd: 0.16,
-        outputPerMillionUsd: 4,
-      };
+      return { inputPerMillionUsd: 3, cachedInputPerMillionUsd: 0.3, outputPerMillionUsd: 15 };
+    case 'kimi-k3.1-pro':
+      return { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 10 };
+    case 'kimi-k3.1-pro-highspeed':
+      return { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
     // Standard paid-tier rates: https://ai.google.dev/gemini-api/docs/pricing
     // The published introductory discount ends at the start of 2027 (UTC).
     case 'gemini-3.8-flash':
@@ -302,20 +292,24 @@ export function providerTokenPrice(
         : { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
     case 'gemini-3.5-flash-lite':
       return { inputPerMillionUsd: 0.3, cachedInputPerMillionUsd: 0.03, outputPerMillionUsd: 2.5 };
-    // https://dev.meta.ai/docs/pricing-rate-limits (verified 2026-10-03).
+    // https://dev.meta.ai/docs/pricing-rate-limits (verified 2026-10-28).
     case 'muse-spark-1.3':
-    case 'muse-spark-1.2':
-    case 'muse-spark-1.1':
       return { inputPerMillionUsd: 1.25, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 4.25 };
     case 'muse-spark-1.3-contributor':
-    case 'muse-spark-1.2-contributor':
       return { inputPerMillionUsd: 0.1, cachedInputPerMillionUsd: 0.002, outputPerMillionUsd: 0.2 };
-    // OpenRouter catalog prices, https://openrouter.ai/api/v1/models (2026-10-03).
+    case 'muse-wonder-1.0':
+    case 'muse-wonder':
+      return { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
+    // OpenRouter catalog prices, https://openrouter.ai/api/v1/models (2026-10-28).
     // Actual response cost takes precedence over these estimates.
     case 'openai/gpt-6.1-sol':
       return inputTokens >= 272_000
         ? { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 15 }
         : { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10 };
+    case 'openai/gpt-6.1-terra':
+      return inputTokens >= 272_000
+        ? { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 7.5 }
+        : { inputPerMillionUsd: 1, cachedInputPerMillionUsd: 0.05, outputPerMillionUsd: 5 };
     case 'openai/gpt-6-astra':
       return inputTokens >= 272_000
         ? { inputPerMillionUsd: 20, cachedInputPerMillionUsd: 2, outputPerMillionUsd: 75 }
@@ -324,10 +318,22 @@ export function providerTokenPrice(
       return inputTokens >= 272_000
         ? { inputPerMillionUsd: 0.2, cachedInputPerMillionUsd: 0.02, outputPerMillionUsd: 0.75 }
         : { inputPerMillionUsd: 0.1, cachedInputPerMillionUsd: 0.01, outputPerMillionUsd: 0.5 };
+    case 'anthropic/claude-opus-5.5':
+      return { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
     case 'anthropic/claude-sonnet-5.5':
-      return { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 10 };
+      return { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10 };
+    case 'anthropic/claude-haiku-5.5':
+      return inputTokens >= 100_000
+        ? { inputPerMillionUsd: 0.5, cachedInputPerMillionUsd: 0.05, outputPerMillionUsd: 2.5 }
+        : { inputPerMillionUsd: 0.1, cachedInputPerMillionUsd: 0.01, outputPerMillionUsd: 0.5 };
     case 'anthropic/claude-fable-5.1':
       return { inputPerMillionUsd: 10, cachedInputPerMillionUsd: 0.25, outputPerMillionUsd: 50 };
+    case 'x-ai/grok-4.7':
+      return inputTokens >= 200_000
+        ? { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 1, outputPerMillionUsd: 12 }
+        : { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.5, outputPerMillionUsd: 6 };
+    case 'mistralai/mistral-medium-3-5':
+      return { inputPerMillionUsd: 1.5, outputPerMillionUsd: 7.5 };
     default:
       return undefined;
   }

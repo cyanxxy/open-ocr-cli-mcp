@@ -273,19 +273,16 @@ describe('CLI configuration', () => {
     });
   });
 
-  it('does not invent effort tiers for direct Kimi models with boolean or mandatory thinking', () => {
+  it('applies the K3-series effort contract to Kimi K3.1 Pro', () => {
     expect(resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.7-code', dryRun: true,
-    }, {}, '/workspace')).toMatchObject({ thinking: 'HIGH' });
-    expect(() => resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.7-code', thinking: 'low', dryRun: true,
-    }, {}, '/workspace')).toThrow('does not expose configurable reasoning effort');
+      provider: 'kimi', model: 'kimi-k3.1-pro', dryRun: true,
+    }, {}, '/workspace')).toMatchObject({ thinking: 'MAX' });
     expect(resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.6', thinking: 'minimal', dryRun: true,
-    }, {}, '/workspace')).toMatchObject({ thinking: 'MINIMAL' });
+      provider: 'kimi', model: 'kimi-k3.1-pro', thinking: 'minimal', dryRun: true,
+    }, {}, '/workspace')).toMatchObject({ thinking: 'LOW' });
     expect(() => resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.6', thinking: 'medium', dryRun: true,
-    }, {}, '/workspace')).toThrow('instant mode');
+      provider: 'kimi', model: 'kimi-k3.1-pro', thinking: 'medium', dryRun: true,
+    }, {}, '/workspace')).toThrow('low, high, or max');
   });
 
   it('does not carry a direct base URL across a gateway switch', () => {

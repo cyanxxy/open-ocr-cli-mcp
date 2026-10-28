@@ -557,8 +557,8 @@ export function resolveCliOptions(
     DEFAULT_CONFIG.progress,
   );
 
-  if (!isKimiK3 && provider !== 'openrouter' && !(provider === 'muse' && model === 'muse-spark-1.3') && thinking === 'MAX') {
-    throw configurationError(`${thinkingLabel} max is supported by Kimi K3, Muse Spark 1.3 Standard, and model-dependent OpenRouter routes`);
+  if (!isKimiK3 && provider !== 'openrouter' && !(provider === 'muse' && ['muse-spark-1.3', 'muse-wonder-1.0'].includes(model)) && thinking === 'MAX') {
+    throw configurationError(`${thinkingLabel} max is supported by Kimi K3/K3.1, Muse Spark 1.3 Standard, Muse Wonder, and model-dependent OpenRouter routes`);
   }
   if (provider !== 'openrouter' && provider !== 'muse' && thinking === 'XHIGH') {
     throw configurationError(`${thinkingLabel} xhigh is supported by Muse and model-dependent OpenRouter routes`);
@@ -571,12 +571,6 @@ export function resolveCliOptions(
   }
   if (isKimiK3 && thinking === 'MINIMAL') {
     thinking = 'LOW';
-  }
-  if (provider === 'kimi' && /^kimi-k2\.7-code/u.test(model) && thinking !== 'HIGH') {
-    throw configurationError(`Kimi K2.7 Code always thinks and does not expose configurable reasoning effort; use ${thinkingLabel} high`);
-  }
-  if (provider === 'kimi' && model === 'kimi-k2.6' && thinking !== 'MINIMAL' && thinking !== 'HIGH') {
-    throw configurationError(`Direct Kimi K2.6 supports only instant mode (${thinkingLabel} minimal) or thinking mode (${thinkingLabel} high)`);
   }
   const knownThinking = knownModelThinkingLevels(provider, model);
   if (knownThinking && !knownThinking.includes(thinking)) {
@@ -619,14 +613,6 @@ export function resolveCliOptions(
     OCR_REQUEST_LIMITS.maxTokens.min,
     provider === 'gemini' ? 65536 : OCR_REQUEST_LIMITS.maxTokens.max,
   );
-  if (
-    effectiveMode === 'agentic'
-    && thinking !== 'MINIMAL'
-    && model.includes('kimi-k2.6')
-    && maxTokens < 16_000
-  ) {
-    throw configurationError(`${name('maxTokens')} must be at least 16000 for Kimi K2.6 agentic tool use with thinking enabled`);
-  }
 
   const cloudflareAccountId = flags.cloudflareAccountId
     ?? env.CLOUDFLARE_ACCOUNT_ID

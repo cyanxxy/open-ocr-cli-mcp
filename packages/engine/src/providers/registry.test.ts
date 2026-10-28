@@ -25,8 +25,29 @@ describe('provider registry routing', () => {
     expect(knownModelThinkingLevels('muse', 'muse-spark-1.3')).toContain('MAX');
     expect(knownModelThinkingLevels('muse', 'muse-spark-1.3-contributor')).not.toContain('MAX');
     expect(knownModelThinkingLevels('openrouter', 'openai/gpt-6.1-sol')).not.toContain('MINIMAL');
-    expect(knownModelThinkingLevels('openrouter', 'moonshotai/kimi-k2.7-code')).toEqual(['HIGH']);
-    expect(knownModelThinkingLevels('openrouter', 'moonshotai/kimi-k2.6')).toEqual(['MINIMAL', 'HIGH']);
+    for (const [provider, model] of [
+      ['kimi', 'kimi-k3'], ['kimi', 'kimi-k3.1-pro'], ['kimi', 'kimi-k3.1-pro-highspeed'],
+      ['openrouter', 'moonshotai/kimi-k3.1-pro'],
+    ] as const) {
+      expect(knownModelThinkingLevels(provider, model)).toEqual(['LOW', 'HIGH', 'MAX']);
+      expect(providerDefaultThinkingLevel(provider, model)).toBe('MAX');
+    }
+    expect(knownModelThinkingLevels('muse', 'muse-wonder-1.0')).toContain('MAX');
+    expect(knownModelThinkingLevels('openrouter', 'meta/muse-wonder')).toContain('MINIMAL');
+    expect(providerDefaultThinkingLevel('openrouter', 'anthropic/claude-opus-5.5')).toBe('HIGH');
+    expect(providerDefaultThinkingLevel('openrouter', 'anthropic/claude-haiku-5.5')).toBe('MEDIUM');
+    expect(knownModelThinkingLevels('openrouter', 'x-ai/grok-4.7')).toEqual(['LOW', 'MEDIUM', 'HIGH', 'XHIGH']);
+    expect(providerDefaultThinkingLevel('openrouter', 'x-ai/grok-4.7')).toBe('HIGH');
+    expect(knownModelThinkingLevels('openrouter', 'mistralai/mistral-medium-3-5')).toEqual(['HIGH']);
+    expect(knownModelThinkingLevels('openrouter', 'some/unlisted-model')).toBeUndefined();
+  });
+
+  it('lists only current OpenRouter routes with reasoning contracts and prices', () => {
+    for (const model of providerProfile('openrouter').models) {
+      expect(knownModelThinkingLevels('openrouter', model), model).toBeDefined();
+      expect(providerTokenPrice({ provider: 'openrouter', model }, 0), model).toBeDefined();
+    }
+    expect(providerProfile('kimi').models.some((model) => model.startsWith('kimi-k2'))).toBe(false);
   });
 
   it('recognizes IPv6 loopback without classifying other IPv6 hosts as local', () => {
@@ -89,23 +110,29 @@ describe('provider registry routing', () => {
       cachedInputPerMillionUsd: 0.15,
       outputPerMillionUsd: 4.25,
     });
-    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k2.6' }, 0)).toEqual({
-      inputPerMillionUsd: 0.95,
-      cachedInputPerMillionUsd: 0.16,
-      outputPerMillionUsd: 4,
+    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k3.1-pro' }, 0)).toEqual({
+      inputPerMillionUsd: 2,
+      cachedInputPerMillionUsd: 0.2,
+      outputPerMillionUsd: 10,
     });
-    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k2.7-code-highspeed' }, 0)).toEqual({
-      inputPerMillionUsd: 1.9,
-      cachedInputPerMillionUsd: 0.38,
-      outputPerMillionUsd: 8,
+    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k3.1-pro-highspeed' }, 0)).toEqual({
+      inputPerMillionUsd: 4,
+      cachedInputPerMillionUsd: 0.2,
+      outputPerMillionUsd: 20,
+    });
+    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k2.6' }, 0)).toBeUndefined();
+    expect(providerTokenPrice({ provider: 'muse', model: 'muse-wonder-1.0' }, 0)).toEqual({
+      inputPerMillionUsd: 4,
+      cachedInputPerMillionUsd: 0.2,
+      outputPerMillionUsd: 20,
     });
     expect(estimateProviderRequestCostUsd(
-      { provider: 'kimi', model: 'kimi-k2.6' },
+      { provider: 'kimi', model: 'kimi-k3.1-pro' },
       1_000_000,
       100_000,
       0,
       250_000,
-    )).toBe(1.1525);
+    )).toBe(2.55);
   });
 
   it('applies scheduled Gemini price changes at the published UTC boundary', () => {
@@ -130,7 +157,13 @@ describe('provider registry routing', () => {
 
   it('uses route-specific prices and never assumes billing for a generic endpoint', () => {
     expect(providerTokenPrice({ provider: 'openrouter', model: 'moonshotai/kimi-k3' }, 0)).toEqual({
-      inputPerMillionUsd: 2.7, cachedInputPerMillionUsd: 0.27, outputPerMillionUsd: 13.5,
+      inputPerMillionUsd: 3, cachedInputPerMillionUsd: 0.3, outputPerMillionUsd: 15,
+    });
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'anthropic/claude-sonnet-5.5' }, 0)).toEqual({
+      inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10,
+    });
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'anthropic/claude-haiku-5.5' }, 100_000)).toEqual({
+      inputPerMillionUsd: 0.5, cachedInputPerMillionUsd: 0.05, outputPerMillionUsd: 2.5,
     });
     expect(providerTokenPrice({ provider: 'muse', model: 'muse-spark-1.3-contributor' }, 0)).toEqual({
       inputPerMillionUsd: 0.1, cachedInputPerMillionUsd: 0.002, outputPerMillionUsd: 0.2,
