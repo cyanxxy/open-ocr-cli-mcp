@@ -24,11 +24,14 @@
 - Muse offers `muse-spark-1.3` (default) and `muse-wonder-1.0` (preview,
   `minimal` to `max`). Spark 1.1 and 1.2 were removed; only the 1.3
   contributor variant keeps a built-in price.
-- OpenRouter's suggested routes are now the current models that read images
-  and PDFs natively, plus Kimi K3/K3.1 Pro: the three Gemini models, Muse
+- OpenRouter's suggested routes are now only the current models that read
+  images and PDFs natively: the three Gemini models, Muse
   Spark 1.3 and Wonder, GPT-6.1 Sol and Terra, GPT-6 Luna and Astra, Claude
   Opus/Sonnet/Haiku 5.5 and Fable 5.1, Grok 4.7, and Mistral Medium 3.5. Each
   route validates thinking against OpenRouter's published efforts and default.
+  `moonshotai/kimi-*` routes are no longer suggested (Kimi has no native PDF
+  input there); an explicit model ID still works. The OpenRouter eval canary
+  and examples use `anthropic/claude-sonnet-5.5`.
 
 ### Fixed
 

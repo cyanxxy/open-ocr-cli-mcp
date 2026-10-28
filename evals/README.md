@@ -63,7 +63,7 @@ contains images and is suitable for comparing compatible vision endpoints.
 
 ```bash
 EVAL_PROVIDER=kimi npm run evals:canary
-EVAL_PROVIDER=openrouter OPEN_OCR_MODEL=moonshotai/kimi-k3 npm run evals:canary
+EVAL_PROVIDER=openrouter OPEN_OCR_MODEL=anthropic/claude-sonnet-5.5 npm run evals:canary
 ```
 
 `EVAL_GATEWAY=cloudflare` uses `CLOUDFLARE_ACCOUNT_ID` and

@@ -72,8 +72,7 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
     defaultApiKeyEnv: 'OPENROUTER_API_KEY',
     models: [
-      // Current models that natively read both images and PDFs, plus Kimi
-      // K3 (images natively; OpenRouter parses PDFs for it).
+      // Current models that natively read both images and PDFs.
       ...GEMINI_MODELS.map((model) => `google/${model}`),
       'meta/muse-spark-1.3',
       'meta/muse-wonder',
@@ -87,8 +86,6 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
       'anthropic/claude-fable-5.1',
       'x-ai/grok-4.7',
       'mistralai/mistral-medium-3-5',
-      'moonshotai/kimi-k3',
-      'moonshotai/kimi-k3.1-pro',
     ],
     inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
     capabilities: {

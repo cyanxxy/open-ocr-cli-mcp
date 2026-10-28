@@ -13,9 +13,9 @@
       "apiKeyEnv": "MOONSHOT_API_KEY"
     },
     {
-      "id": "kimi-openrouter",
+      "id": "claude-openrouter",
       "provider": "openrouter",
-      "model": "moonshotai/kimi-k3",
+      "model": "anthropic/claude-sonnet-5.5",
       "apiKeyEnv": "OPENROUTER_API_KEY"
     },
     {
@@ -34,7 +34,7 @@
     {
       "id": "openrouter-cloudflare",
       "provider": "openrouter",
-      "model": "moonshotai/kimi-k3",
+      "model": "anthropic/claude-sonnet-5.5",
       "gateway": "cloudflare",
       "apiKeyEnv": "OPENROUTER_API_KEY"
     },
