@@ -1,6 +1,6 @@
 {
   "name": "open-ocr-cli",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "description": "Agent-first OCR CLI and MCP server. Extract images, PDFs, and URLs with Gemini, Kimi, Muse, OpenRouter, or compatible APIs.",
   "license": "MIT",
   "type": "module",
@@ -62,7 +62,7 @@
     ]
   },
   "devDependencies": {
-    "@open-ocr/engine": "4.1.0",
+    "@open-ocr/engine": "4.2.0",
     "@types/html-to-text": "^9.0.4",
     "tsup": "^8.5.1",
     "typescript": "^5.8.3"
@@ -79,7 +79,7 @@
     "ipaddr.js": "^2.4.0",
     "pdfjs-dist": "5.5.207",
     "sharp": "^0.35.5",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "publishConfig": {
     "access": "public"

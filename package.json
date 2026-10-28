@@ -1,7 +1,7 @@
 {
   "name": "open-ocr-workspace",
   "private": true,
-  "version": "4.1.0",
+  "version": "4.2.0",
   "description": "Agent-first OCR CLI and MCP server for images, PDFs, URLs, structured data, and resumable batches.",
   "license": "MIT",
   "type": "module",
@@ -46,7 +46,7 @@
   ],
   "overrides": {
     "esbuild": "^0.28.1",
-    "fast-uri": "3.1.8"
+    "fast-uri": "3.1.9"
   },
   "scripts": {
     "lint": "eslint .",
@@ -74,14 +74,14 @@
     "@eslint/js": "^10.0.1",
     "@modelcontextprotocol/client": "2.3.0",
     "@types/node": "^20.19.43",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^4.1.12",
     "audit-ci": "^7.1.0",
     "eslint": "^10.8.1",
     "globals": "^17.3.0",
     "tsx": "^4.20.5",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.3.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "allowScripts": {
     "fsevents@2.3.3": true,
