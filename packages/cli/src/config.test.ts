@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -11,7 +11,7 @@ import {
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
   loadCliConfig,
-  loadLocalEnv,
+  localEnvironment,
   resolveCliOptions,
   suppliedModeScopedFlags,
 } from './config';
@@ -746,12 +746,17 @@ describe('CLI configuration', () => {
         'PROJECT_GEMINI_KEY=unrelated',
         '',
       ].join('\n'));
-      loadLocalEnv(directory);
-      expect(process.env.GEMINI_API_KEY).toBe('from-project-env');
-      expect(process.env.OPEN_OCR_GATEWAY).toBeUndefined();
-      expect(process.env.CLOUDFLARE_ACCOUNT_ID).toBeUndefined();
-      expect(process.env.OPEN_OCR_MCP_CONFIRM).toBeUndefined();
-      expect(process.env.PROJECT_GEMINI_KEY).toBeUndefined();
+      const env = localEnvironment(directory);
+      expect(env.GEMINI_API_KEY).toBe('from-project-env');
+      expect(env.OPEN_OCR_GATEWAY).toBeUndefined();
+      expect(env.CLOUDFLARE_ACCOUNT_ID).toBeUndefined();
+      expect(env.OPEN_OCR_MCP_CONFIRM).toBeUndefined();
+      expect(env.PROJECT_GEMINI_KEY).toBeUndefined();
+      // Never installed process-wide: a long-lived MCP server would otherwise
+      // hand the key to every later noConfig request.
+      expect(process.env.GEMINI_API_KEY).toBeUndefined();
+      expect(resolveCliOptions({}, {}, directory, 'flag', env).apiKey).toBe('from-project-env');
+      expect(resolveCliOptions({}, {}, directory, 'flag', localEnvironment(directory, true)).apiKey).toBe('');
       expect(warning).toHaveBeenCalledWith(
         expect.stringContaining('ignoring CLOUDFLARE_ACCOUNT_ID, OPEN_OCR_GATEWAY, OPEN_OCR_MCP_CONFIRM'),
       );
@@ -767,8 +772,7 @@ describe('CLI configuration', () => {
     process.env.GEMINI_API_KEY = 'from-shell';
     try {
       await writeFile(path.join(directory, '.env'), 'GEMINI_API_KEY=from-project-env\n');
-      loadLocalEnv(directory);
-      expect(process.env.GEMINI_API_KEY).toBe('from-shell');
+      expect(localEnvironment(directory).GEMINI_API_KEY).toBe('from-shell');
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -807,6 +811,43 @@ describe('CLI configuration', () => {
     }
   });
 
+  it('keeps project-configured output inside the project and never lets it overwrite', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-output-'));
+    const outsideDirectory = await mkdtemp(path.join(tmpdir(), 'open-ocr-outside-'));
+    const write = (config: Record<string, unknown>): Promise<void> => (
+      writeFile(path.join(directory, '.open-ocr-cli.json'), JSON.stringify(config))
+    );
+    try {
+      await write({ output: 'results/batch' });
+      await expect(loadCliConfig(directory)).resolves.toMatchObject({ output: 'results/batch' });
+
+      for (const output of ['../escape', path.join(outsideDirectory, 'x'), '.git/hooks/pre-commit', 'a/../../b']) {
+        await write({ output });
+        await expect(loadCliConfig(directory)).rejects.toMatchObject({
+          code: 'CONFIG_INVALID',
+          message: expect.stringContaining('must stay inside the project') as unknown,
+        });
+      }
+
+      // A symbolic link inside the project cannot smuggle output out of it.
+      await symlink(outsideDirectory, path.join(directory, 'linked'));
+      await write({ output: 'linked/results' });
+      await expect(loadCliConfig(directory)).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+
+      await write({ overwrite: true });
+      await expect(loadCliConfig(directory)).rejects.toMatchObject({
+        message: expect.stringContaining('cannot set overwrite') as unknown,
+      });
+
+      // An explicit --config file is the user's own choice.
+      await writeFile(path.join(directory, 'mine.json'), JSON.stringify({ output: '../anywhere', overwrite: true }));
+      await expect(loadCliConfig(directory, 'mine.json', true)).resolves.toMatchObject({ overwrite: true });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+      await rm(outsideDirectory, { recursive: true, force: true });
+    }
+  });
+
   it('supports hermetic runs that ignore config files and project .env', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-hermetic-'));
     delete process.env.HERMETIC_TEST_KEY;
@@ -815,13 +856,11 @@ describe('CLI configuration', () => {
       await writeFile(path.join(directory, '.env'), 'HERMETIC_TEST_KEY=from-project-env\n');
       process.env.OPEN_OCR_NO_CONFIG = '1';
       expect(await loadCliConfig(directory)).toEqual({});
-      loadLocalEnv(directory);
-      expect(process.env.HERMETIC_TEST_KEY).toBeUndefined();
+      expect(localEnvironment(directory).HERMETIC_TEST_KEY).toBeUndefined();
 
       delete process.env.OPEN_OCR_NO_CONFIG;
       expect(await loadCliConfig(directory, undefined, true)).toEqual({});
-      loadLocalEnv(directory, true);
-      expect(process.env.HERMETIC_TEST_KEY).toBeUndefined();
+      expect(localEnvironment(directory, true).HERMETIC_TEST_KEY).toBeUndefined();
     } finally {
       delete process.env.HERMETIC_TEST_KEY;
       await rm(directory, { recursive: true, force: true });
@@ -842,8 +881,7 @@ describe('CLI configuration', () => {
       process.env.OPEN_OCR_NO_CONFIG = '1';
 
       expect(await loadCliConfig(directory, configPath)).toEqual({ concurrency: 7 });
-      loadLocalEnv(directory, false);
-      expect(process.env.EXPLICIT_CONFIG_TEST_KEY).toBeUndefined();
+      expect(localEnvironment(directory, false).EXPLICIT_CONFIG_TEST_KEY).toBeUndefined();
     } finally {
       delete process.env.EXPLICIT_CONFIG_TEST_KEY;
       await rm(directory, { recursive: true, force: true });

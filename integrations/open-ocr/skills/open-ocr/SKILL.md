@@ -152,7 +152,7 @@ Over MCP, call `ocr_capabilities` first: its `structuredContent` is `{ workingDi
 When the host cannot read server-local paths, use `ocr_read_artifact` with the
 exact `resource_link` URI issued by the running MCP server. Start at `offset: 0`,
 then pass the previous `nextOffset` until `eof` is true. `maxBytes` accepts 4–65,536
-and defaults to 64 KiB; preserve each returned `text` exactly. Only unchanged
+and defaults to 32 KiB; preserve each returned `text` exactly. Only unchanged
 artifacts written by successful or partial extractions in this process are
 eligible, with the latest 10,000 URIs retained. Resumed artifacts from an earlier
 process require local filesystem access; follow the result warning instead of
@@ -171,8 +171,10 @@ modest inline responses also include a text copy.
 ## Handle Typed Errors
 
 For OCR result envelopes, use `error.code`, `error.retryable`, and `error.hint`
-rather than matching prose. On MCP, check `isError` as well as the OCR result's
-`ok`, `status`, and per-document errors. Protocol/argument-validation errors and
+rather than matching prose. On MCP, `isError` marks only a `failed` run; a
+`partial`, `cancelled`, or `cost_limited` run returns normally with `ok: false`,
+so always check `ok`, `status`, and per-document errors, and keep the artifacts
+already produced instead of repeating paid OCR. Protocol/argument-validation errors and
 `ocr_read_artifact` failures may contain no OCR envelope; inspect their MCP error
 or text feedback and do not treat missing `structuredContent` as success.
 

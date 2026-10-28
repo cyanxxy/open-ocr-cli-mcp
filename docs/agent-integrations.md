@@ -33,21 +33,26 @@ Register a locally installed executable:
 claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
-Start Claude with the provider key already in its environment and enable the
-current protocol in the **host** environment:
-
-```bash
-MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude
-```
-
-Anthropic documents the v2 runtime for all session types from **2.1.274**.
-Explicit `auto` enables stdio revision probing; automatic rollout begins at
-**2.1.285**. Use `/mcp` to verify connection and discovery. Set a per-server
+Start Claude with the provider key already in its environment. Claude Code
+uses its v2 MCP runtime, which asks stdio servers for revision 2026-07-28, from
+**2.1.232** in sessions that fetch feature flags and from **2.1.274** in the
+others (Bedrock, Vertex, Foundry, telemetry off); nothing needs to be set.
+`MCP_SDK_GENERATION=v1` or `MCP_PROTOCOL_NEGOTIATION=legacy` keeps a session on
+the earlier handshake, which this server rejects. Use `/mcp` to verify
+connection and discovery. Set a per-server
 `timeout` in milliseconds if batches exceed the client's call deadline;
 progress does not extend that deadline. Claude may background a long call,
 but that host feature does not turn it into an MCP Tasks operation.
 These settings come from [Claude Code's MCP documentation](https://code.claude.com/docs/en/mcp#mcp-client-runtimes),
-checked **2026-10-03**; an actual Claude OCR session was not run in this audit.
+checked **2026-10-28**; an actual Claude OCR session was not run in this audit.
+
+Claude Code saves a successful text result over 50,000 characters to a file and
+keeps only the first and last 5,000 characters of error text over about 11,000.
+The server is shaped for both: `ocr_read_artifact` declares
+`anthropic/maxResultSizeChars` so a full chunk stays inline, the JSON text mirror
+of an OCR result collapses to a summary above 40,000 characters, and a failed
+run's error text lists failures compactly with the full envelope in
+`structuredContent`.
 
 ## Codex
 
@@ -121,13 +126,15 @@ Supply a progress token to receive lifecycle notifications. Propagate
 cancellation through the client SDK. The MCP Tasks extension is not implemented.
 
 OCR execution results include `structuredContent`; saved artifacts also have
-`resource_link` blocks. Check `isError`, the OCR envelope's `ok`/`status`, and
-every document outcome. Partial or cancelled work may retain useful artifacts.
+`resource_link` blocks. `isError` is set only for a `failed` run, where nothing
+usable was produced. A `partial`, `cancelled`, or `cost_limited` run is a normal
+result with `ok: false`: check `status` and every document outcome, and keep the
+artifacts it did produce instead of re-running them.
 Protocol errors, tool-argument validation failures, and artifact-read failures
 do not necessarily carry the OCR envelope or its typed `error` object. Use
 `ocr_read_artifact` with `uri`, optional `offset` (bytes), and `maxBytes`
 (4–65,536). Continue at the returned `nextOffset` until `eof` is true; reads
-default to **64 KiB**. Small artifacts can also be read
+default to **32 KiB**. Artifacts up to 64 KiB can also be read
 through MCP resources. Only unchanged files written by successful or partial
 extractions in this server process are eligible; the latest **10,000** artifact
 URIs are retained and restarting the server clears that registry. A resumed
@@ -136,9 +143,15 @@ its result contains a link; read the accompanying warning. Large inline results 
 available in structured content; prefer references to avoid context overload.
 
 Set `OPEN_OCR_MCP_CONFIRM=1` in the server environment for operator-controlled
-confirmation before provider calls. The client must support form elicitation
-through the current protocol's continuation mechanism. Dry runs need none.
-Never put this switch under model control.
+confirmation before provider calls. The server plans the request locally first,
+so the prompt names the real document count after folder and glob expansion,
+the resolved provider/model, and the effective cost ceiling; a request that
+would send nothing is answered without a prompt, and if the plan changes before
+the confirmed retry the server asks again. The client must support form
+elicitation through the current protocol's continuation mechanism; Claude Code
+answers it only in interactive sessions, so `claude -p` and Agent SDK runs
+cannot confirm. Dry runs need none. Only the server's own environment enables
+it; a project `.env` cannot. Never put this switch under model control.
 
 ## Other runtimes and verification
 

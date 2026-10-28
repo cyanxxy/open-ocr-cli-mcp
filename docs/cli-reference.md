@@ -77,8 +77,10 @@ Configure credentials with `apiKeyEnv`, the environment variable name. Raw key
 fields and other unknown config keys are warned about and ignored.
 
 A project is untrusted input: `.open-ocr-cli.json` cannot set `baseUrl`,
-`apiKeyEnv`, a non-`direct` `gateway`, or any `cloudflare*` key (the run fails
-with `CONFIG_INVALID`), and a project `.env` supplies only the default
+`apiKeyEnv`, a non-`direct` `gateway`, any `cloudflare*` key, or `overwrite`,
+and its `output` must resolve (symbolic links included) inside the project and
+outside `.git`; otherwise the run fails with `CONFIG_INVALID`. A project `.env`
+is read per run, never installed into the process environment, and supplies only the default
 credential variables (`GEMINI_API_KEY`, `MOONSHOT_API_KEY`, `META_API_KEY`,
 `OPENROUTER_API_KEY`, `OPEN_OCR_API_KEY`, `CLOUDFLARE_AI_GATEWAY_TOKEN`). Put
 routing in the user config, an explicit `--config` file, or flags. `--no-config` or protocol

@@ -10,6 +10,11 @@
   credential variables and the default gateway token. Project `init` no longer
   asks for routing; use `init --global` for a custom endpoint, key variable, or
   gateway.
+- A project `.open-ocr-cli.json` can no longer set `overwrite`, and its `output`
+  must stay inside the project (symbolic links resolved) and outside `.git`.
+- MCP `isError` now marks only a `failed` run. `partial`, `cancelled`, and
+  `cost_limited` runs return normally with `ok: false`.
+- `ocr_read_artifact` reads default to 32 KiB (maximum still 64 KiB).
 - `--force-unlock` is removed. A lock left by a dead process on the same host is
   reclaimed automatically with a warning; live, cross-host, and unreadable locks
   remain `OUTPUT_CONFLICT` with a precise recovery hint.
@@ -30,6 +35,16 @@
   `time_budget_reached` instead of a `TIMEOUT` failure.
 - `doctor --json` reports an unreadable config as a failed JSON check, and
   `status --json` answers failures with a typed JSON error.
+- A project `.env` is no longer installed into `process.env`, so in a
+  long-lived MCP server a later `noConfig` call cannot inherit its credentials.
+- The MCP confirmation prompt is built from a local dry run: it states the real
+  document count after folder/glob expansion, the resolved provider/model, and
+  the effective cost ceiling, skips the prompt when nothing would be sent, and
+  asks again when the plan changes before the confirmed retry.
+- MCP error text for a failed run is a compact failure list that fits Claude
+  Code's error-text limit whole; the JSON text mirror collapses to a summary
+  above 40,000 characters, and `ocr_read_artifact` declares
+  `anthropic/maxResultSizeChars` so chunks are not saved to a file.
 
 ## 4.1.0 - 2026-10-03
 

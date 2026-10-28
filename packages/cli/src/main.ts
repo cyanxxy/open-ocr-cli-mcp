@@ -21,7 +21,7 @@ import {
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
   loadCliConfig,
-  loadLocalEnv,
+  localEnvironment,
   resolveCliOptions,
   suppliedModeScopedFlags,
 } from './config';
@@ -354,7 +354,7 @@ then CLI flags. Later sources win.
           assertConfigFlagsDoNotConflict(command);
           const cwd = process.cwd();
           const noConfig = cliConfigDisabled(flags.config);
-          loadLocalEnv(cwd, noConfig);
+          const env = localEnvironment(cwd, noConfig);
           const fileConfig = await loadCliConfig(
             cwd,
             typeof flags.config === 'string' ? flags.config : undefined,
@@ -372,7 +372,7 @@ then CLI flags. Later sources win.
             const schemaWarning = customSchemaCompatibilityWarning(customSchema);
             if (schemaWarning) process.stderr.write(`${schemaWarning}\n`);
           }
-          const resolvedOptions = resolveCliOptions(flags, fileConfig, cwd);
+          const resolvedOptions = resolveCliOptions(flags, fileConfig, cwd, 'flag', env);
           const options = customSchema
             ? { ...resolvedOptions, customSchema }
             : resolvedOptions;
@@ -596,7 +596,7 @@ then CLI flags. Later sources win.
       assertConfigFlagsDoNotConflict(command);
       const cwd = process.cwd();
       const noConfig = cliConfigDisabled(flags.config);
-      loadLocalEnv(cwd, noConfig);
+      const env = localEnvironment(cwd, noConfig);
       const fileConfig = await loadCliConfig(
         cwd,
         typeof flags.config === 'string' ? flags.config : undefined,
@@ -616,6 +616,8 @@ then CLI flags. Later sources win.
           format: fileConfig.format === 'json' ? 'json' : 'markdown',
         },
         cwd,
+        'flag',
+        env,
       );
       // Narrowing only. Both inputs to `format` are already constrained to
       // markdown/json — Commander rejects any other `--format` value, and the
@@ -740,18 +742,19 @@ then CLI flags. Later sources win.
       const cwd = process.cwd();
       const noConfig = cliConfigDisabled(flags.config);
       let config: CliConfigFile = {};
+      let env: NodeJS.ProcessEnv = process.env;
       let resolvedConfig: ReturnType<typeof resolveCliOptions> | undefined;
       let configurationError: OcrErrorPayload | undefined;
       // A malformed or refused config file is the case doctor exists for, so
       // it is reported as a failed check (in JSON under --json), not thrown.
       try {
-        loadLocalEnv(cwd, noConfig);
+        env = localEnvironment(cwd, noConfig);
         config = await loadCliConfig(
           cwd,
           typeof flags.config === 'string' ? flags.config : undefined,
           noConfig,
         );
-        resolvedConfig = resolveCliOptions({ dryRun: true }, config, cwd);
+        resolvedConfig = resolveCliOptions({ dryRun: true }, config, cwd, 'flag', env);
       } catch (error) {
         configurationError = ocrErrorPayload(error);
       }
@@ -767,7 +770,7 @@ then CLI flags. Later sources win.
         ));
       const gatewayTokenRequired = resolvedConfig?.gateway === 'cloudflare'
         && resolvedConfig.cloudflareByok;
-      const gatewayTokenConfigured = Boolean(process.env[gatewayTokenEnv]);
+      const gatewayTokenConfigured = Boolean(env[gatewayTokenEnv]);
       let credentialProbe: {
         status: 'not_requested' | 'passed' | 'failed' | 'skipped';
         error?: string;
@@ -775,7 +778,7 @@ then CLI flags. Later sources win.
       if (flags.checkCredentials) {
         if (!resolvedConfig || configurationError) {
           credentialProbe = { status: 'skipped', error: 'Configuration is invalid.' };
-        } else if (!providerKeyOptional && !process.env[apiKeyEnv]) {
+        } else if (!providerKeyOptional && !env[apiKeyEnv]) {
           credentialProbe = { status: 'skipped', error: `${apiKeyEnv} is not configured.` };
         } else if (gatewayTokenRequired && !gatewayTokenConfigured) {
           credentialProbe = { status: 'skipped', error: `${gatewayTokenEnv} is not configured.` };
@@ -803,7 +806,7 @@ then CLI flags. Later sources win.
         },
         provider,
         gateway: resolvedConfig?.gateway ?? config.gateway ?? 'direct',
-        apiKey: { ok: providerKeyOptional || Boolean(process.env[apiKeyEnv]), environmentVariable: apiKeyEnv },
+        apiKey: { ok: providerKeyOptional || Boolean(env[apiKeyEnv]), environmentVariable: apiKeyEnv },
         gatewayToken: {
           ok: !gatewayTokenRequired || gatewayTokenConfigured,
           required: gatewayTokenRequired,
@@ -879,8 +882,7 @@ then CLI flags. Later sources win.
     .option('--yes', 'accept recommended defaults without prompting')
     .option('--skip-validation', 'do not make the credential validation request')
     .action(async (flags: InitFlags) => {
-      loadLocalEnv(process.cwd());
-      await runInit(flags);
+      await runInit(flags, { env: localEnvironment(process.cwd()) });
     });
 
   program.command('interactive')

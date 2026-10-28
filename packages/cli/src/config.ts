@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -266,7 +266,53 @@ export async function loadCliConfig(
     readConfigFile(projectPath, false),
   ]);
   assertProjectConfigDoesNotRoute(project);
+  await assertProjectOutputStaysInProject(project, cwd);
   return { ...user, ...project, ...explicit };
+}
+
+/** Resolve symbolic links in the longest existing prefix of a path that may not exist yet. */
+async function realpathOfNearestAncestor(target: string): Promise<string> {
+  const missing: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      return path.join(await realpath(current), ...missing.reverse());
+    } catch (error) {
+      const parent = path.dirname(current);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === current) throw error;
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * The write-side twin of {@link assertProjectConfigDoesNotRoute}. A cloned
+ * repository that could set `output` and `overwrite` could aim OCR text at
+ * `~/.bashrc` or its own `.git/hooks`. So a project file may only send output
+ * somewhere inside the project, outside `.git`, with symbolic links resolved,
+ * and replacing existing files stays a decision the user makes themselves.
+ */
+async function assertProjectOutputStaysInProject(project: CliConfigFile, cwd: string): Promise<void> {
+  const refuse = (message: string): CliExitError => new CliExitError(message, 2, {
+    code: 'CONFIG_INVALID',
+    category: 'configuration',
+    retryable: false,
+    hint: 'Pass --output/--overwrite explicitly, set them in ~/.config/open-ocr-cli/config.json or a file passed with --config, or run with --no-config.',
+  });
+  if (project.overwrite !== undefined) {
+    throw refuse('.open-ocr-cli.json cannot set overwrite: replacing existing files must be the caller\'s own choice');
+  }
+  if (project.output === undefined) return;
+  const root = await realpath(cwd);
+  const target = await realpathOfNearestAncestor(path.resolve(cwd, project.output));
+  const relative = path.relative(root, target);
+  const outside = relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+  if (outside || relative.split(path.sep).includes('.git')) {
+    throw refuse(
+      `.open-ocr-cli.json output must stay inside the project and outside .git: ${project.output} resolves to ${target}`,
+    );
+  }
 }
 
 /**
@@ -313,17 +359,25 @@ export const PROJECT_ENV_CREDENTIALS: readonly string[] = [
   ...new Set([...PROVIDER_IDS.map(providerDefaultApiKeyEnv), 'CLOUDFLARE_AI_GATEWAY_TOKEN']),
 ];
 
-export function loadLocalEnv(cwd: string, disabled = false): void {
+/**
+ * The environment one request resolves its options against: the process
+ * environment plus the project `.env` credentials, without writing either into
+ * `process.env`. A long-lived MCP server serves many requests from one process;
+ * once a `.env` value lands in `process.env`, every later `noConfig` request
+ * inherits it, so the project file is read per request and never installed.
+ */
+export function localEnvironment(cwd: string, disabled = false): NodeJS.ProcessEnv {
   // Ambient OPEN_OCR_NO_CONFIG always blocks project .env, even when a caller
   // passes an explicit config path for option resolution.
-  if (disabled || environmentDisablesConfig()) return;
+  if (disabled || environmentDisablesConfig()) return { ...process.env };
   const envPath = path.join(cwd, '.env');
-  if (!existsSync(envPath)) return;
+  if (!existsSync(envPath)) return { ...process.env };
   const parsed = parseEnv(readFileSync(envPath, 'utf8'));
+  const environment: NodeJS.ProcessEnv = { ...process.env };
   // Values already in the environment win, matching `process.loadEnvFile`.
   for (const name of PROJECT_ENV_CREDENTIALS) {
     const value = parsed[name];
-    if (value !== undefined && process.env[name] === undefined) process.env[name] = value;
+    if (value !== undefined && environment[name] === undefined) environment[name] = value;
   }
   const ignored = Object.keys(parsed).filter((name) => (
     !PROJECT_ENV_CREDENTIALS.includes(name) && /^(?:OPEN_OCR_|CLOUDFLARE_)/.test(name)
@@ -333,6 +387,7 @@ export function loadLocalEnv(cwd: string, disabled = false): void {
       `${envPath}: ignoring ${ignored.join(', ')}; a project .env may only supply ${PROJECT_ENV_CREDENTIALS.join(', ')}\n`,
     );
   }
+  return environment;
 }
 
 export function credentialSetupGuidance(apiKeyEnv: string, cwd: string, provider = 'provider'): string {
@@ -420,13 +475,14 @@ export function resolveCliOptions(
   fileConfig: CliConfigFile,
   cwd: string,
   vocabulary: OptionVocabulary = 'flag',
+  env: NodeJS.ProcessEnv = process.env,
 ): ResolvedCliOptions {
   const name = (key: keyof typeof OPTION_NAMES): string => OPTION_NAMES[key][vocabulary === 'flag' ? 0 : 1];
   // OPEN_OCR_* variables are a layer of their own between flags and files. An
   // error about one names the variable: the caller never typed the flag, and
   // "fix --model" sends them looking in the wrong place.
-  const envProvider = process.env.OPEN_OCR_PROVIDER;
-  const envGateway = process.env.OPEN_OCR_GATEWAY;
+  const envProvider = env.OPEN_OCR_PROVIDER;
+  const envGateway = env.OPEN_OCR_GATEWAY;
   const configuredProvider = fileConfig.provider ?? DEFAULT_CONFIG.provider;
   const selectedProvider = flags.provider ?? envProvider;
   const provider = oneOf<ProviderId>(
@@ -451,7 +507,7 @@ export function resolveCliOptions(
   // `kimi/gemini-3.8-flash` validates locally and fails upstream.
   const envContextMatches = flags.provider === undefined
     || flags.provider === (envProvider ?? configuredProvider);
-  const envModel = envContextMatches ? process.env.OPEN_OCR_MODEL : undefined;
+  const envModel = envContextMatches ? env.OPEN_OCR_MODEL : undefined;
   const selectedModel = flags.model ?? envModel;
   const configuredModel = providerContextMatches
     ? fileConfig.model ?? providerDefaultModel(provider)
@@ -467,7 +523,7 @@ export function resolveCliOptions(
   const modelContextMatches = providerContextMatches
     && (selectedModel === undefined || selectedModel === configuredModel);
   const envThinking = envContextMatches && (flags.model === undefined || flags.model === (envModel ?? configuredModel))
-    ? process.env.OPEN_OCR_THINKING
+    ? env.OPEN_OCR_THINKING
     : undefined;
   const configuredThinking = flags.thinking
     ?? envThinking
@@ -576,10 +632,10 @@ export function resolveCliOptions(
   }
 
   const cloudflareAccountId = flags.cloudflareAccountId
-    ?? process.env.CLOUDFLARE_ACCOUNT_ID
+    ?? env.CLOUDFLARE_ACCOUNT_ID
     ?? fileConfig.cloudflareAccountId;
   const cloudflareGatewayId = flags.cloudflareGatewayId
-    ?? process.env.CLOUDFLARE_AI_GATEWAY_ID
+    ?? env.CLOUDFLARE_AI_GATEWAY_ID
     ?? fileConfig.cloudflareGatewayId;
   const cloudflareProvider = flags.cloudflareProvider
     ?? (providerContextMatches ? fileConfig.cloudflareProvider : undefined);
@@ -595,7 +651,7 @@ export function resolveCliOptions(
   const apiKeyEnv = flags.apiKeyEnv
     ?? (providerContextMatches ? fileConfig.apiKeyEnv : undefined)
     ?? providerDefaultApiKeyEnv(provider);
-  const apiKey = process.env[apiKeyEnv]?.trim() || '';
+  const apiKey = env[apiKeyEnv]?.trim() || '';
   const cloudflareByok = flags.cloudflareByok
     ?? (providerContextMatches && gatewayContextMatches ? fileConfig.cloudflareByok : undefined)
     ?? false;
@@ -610,7 +666,7 @@ export function resolveCliOptions(
   const gatewayTokenEnv = flags.cloudflareTokenEnv
     ?? fileConfig.cloudflareTokenEnv
     ?? 'CLOUDFLARE_AI_GATEWAY_TOKEN';
-  const gatewayToken = gateway === 'cloudflare' ? process.env[gatewayTokenEnv]?.trim() : undefined;
+  const gatewayToken = gateway === 'cloudflare' ? env[gatewayTokenEnv]?.trim() : undefined;
   const hasFlagPrice = flags.inputPrice !== undefined || flags.outputPrice !== undefined;
   const inputPricePerMillionUsd = optionalNumberInRange(
     hasFlagPrice

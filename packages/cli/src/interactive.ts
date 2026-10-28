@@ -12,7 +12,7 @@ import {
   cliThinkingLevels,
   defaultCliThinkingLevel,
   loadCliConfig,
-  loadLocalEnv,
+  localEnvironment,
 } from './config';
 import {
   isPromptAbort,
@@ -401,8 +401,7 @@ async function webArguments(
 
 export async function promptInteractiveArguments(runtime: InteractiveRuntime = {}): Promise<string[] | undefined> {
   const cwd = runtime.cwd ?? process.cwd();
-  if (runtime.env === undefined) loadLocalEnv(cwd);
-  const env = runtime.env ?? process.env;
+  const env = runtime.env ?? localEnvironment(cwd);
   const config = runtime.config ?? await loadCliConfig(cwd);
   const writeOutput = runtime.writeOutput ?? ((text: string) => process.stderr.write(text));
   const ownsPrompter = runtime.prompter === undefined;

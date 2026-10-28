@@ -26,7 +26,7 @@ vi.mock('./config', async (importOriginal) => {
   return {
     ...actual,
     loadCliConfig: vi.fn(() => Promise.resolve({})),
-    loadLocalEnv: vi.fn(),
+    localEnvironment: vi.fn(() => process.env),
   };
 });
 
