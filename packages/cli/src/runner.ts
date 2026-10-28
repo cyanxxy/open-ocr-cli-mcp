@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { once } from 'node:events';
 import process from 'node:process';
 
 import { agentLoop } from '@open-ocr/engine/agentLoop';
@@ -22,6 +21,7 @@ import { assertCustomSchemaOutput } from './schema';
 import { primaryArtifact } from './output';
 import type { OcrJobEventSink } from './protocol';
 import { providerRuntimeConfig } from './providerRuntime';
+import { writeStdout as writeProcessStdout } from './stdout';
 import { runWithProviderRetries } from './providerRetries';
 import type {
   AgenticExtractionResult,
@@ -136,8 +136,12 @@ async function runAgentic(
   signal: AbortSignal,
   onStep: (step: AgentStep) => void,
   runtime: ProviderExecutionContext,
+  budgetDeadline: number,
 ): Promise<OcrArtifacts> {
   const config = providerRuntimeConfig(options, runtime);
+  // Measured from the document's own deadline, not restarted here, so the
+  // agent stops first and keeps its partial fields (see agentBudgetDeadline).
+  const maxDurationMs = Math.max(1, budgetDeadline - Date.now());
   const generator = options.provider === 'gemini' ? agentLoop(
     { name: input.name, type: input.mimeType },
     dataUrl,
@@ -158,7 +162,7 @@ async function runAgentic(
       maxIterations: options.maxIterations,
       confidenceThreshold: options.confidenceThreshold,
       maxTokens: options.maxTokens,
-      maxDurationMs: options.timeoutSeconds * 1000,
+      maxDurationMs,
       throwOnFailure: true,
     },
   ) : providerAgentLoop(
@@ -169,7 +173,7 @@ async function runAgentic(
       maxIterations: options.maxIterations,
       confidenceThreshold: options.confidenceThreshold,
       maxTokens: options.maxTokens,
-      maxDurationMs: options.timeoutSeconds * 1000,
+      maxDurationMs,
       throwOnFailure: true,
     },
     nodeRegionCropper,
@@ -202,6 +206,7 @@ async function extractOnce(
   signal: AbortSignal,
   onStep: (step: AgentStep) => void,
   runtime: ProviderExecutionContext,
+  budgetDeadline: number,
 ): Promise<OcrArtifacts> {
   const { dataUrl } = await readAndValidateInput(input);
   const clientConfig = providerRuntimeConfig(options, runtime);
@@ -217,7 +222,9 @@ async function extractOnce(
     );
     return { markdown: result.markdown, json: result.json, csv: result.csv };
   }
-  if (options.mode === 'agentic') return runAgentic(input, dataUrl, options, signal, onStep, runtime);
+  if (options.mode === 'agentic') {
+    return runAgentic(input, dataUrl, options, signal, onStep, runtime, budgetDeadline);
+  }
 
   const instructions: ExtractionInstruction[] = options.instructions.map((prompt) => ({ prompt }));
   if (options.customSchema) {
@@ -262,11 +269,12 @@ async function extractWithRetries(
   signal: AbortSignal,
   onStep: (step: AgentStep) => void,
   runtime: ProviderExecutionContext,
+  budgetDeadline: number,
 ): Promise<{ artifacts: OcrArtifacts; attempts: number }> {
   const result = await runWithProviderRetries(
     options,
     signal,
-    () => extractOnce(input, options, signal, onStep, runtime),
+    () => extractOnce(input, options, signal, onStep, runtime, budgetDeadline),
   );
   return { artifacts: result.value, attempts: result.attempts };
 }
@@ -283,8 +291,13 @@ function statusLine(index: number, total: number, result: OcrJobResult): string 
   const reason = result.skipReason === 'validated'
     ? ' — validated (dry run)'
     : result.skipReason === 'resumed' ? ' — unchanged (resume)' : '';
-  const error = result.error ? ` — ${result.error}` : '';
-  return `[${index}/${total}] ${icon} ${result.input.displayPath}${destination} (${seconds}s)${reason}${error}`;
+  const code = result.errorDetails?.code ? ` [${result.errorDetails.code}]` : '';
+  const error = result.error ? ` —${code} ${result.error}` : '';
+  const partial = result.partialReason
+    ? ` — partial: ${result.partialReason}${result.nextAction ? `; next: ${result.nextAction}` : ''}`
+    : '';
+  const hint = result.errorDetails?.hint ? `\n    hint: ${result.errorDetails.hint}` : '';
+  return `[${index}/${total}] ${icon} ${result.input.displayPath}${destination} (${seconds}s)${reason}${partial}${error}${hint}`;
 }
 
 interface BatchRuntime {
@@ -311,10 +324,7 @@ export async function runBatch(
   options: ResolvedCliOptions,
   runtime: BatchRuntime,
 ): Promise<BatchSummary> {
-  const writeStdout = runtime.writeStdout ?? (async (text: string): Promise<void> => {
-    if (process.stdout.write(text)) return;
-    await once(process.stdout, 'drain');
-  });
+  const writeStdout = runtime.writeStdout ?? writeProcessStdout;
   const writeStderr = runtime.writeStderr ?? ((text: string) => process.stderr.write(text));
   const service = createOcrJobService();
   const { summary } = await service.run(inputs, options, {
@@ -329,7 +339,12 @@ export async function runBatch(
       }
     },
     onDocumentResult: (index, total, result): void => {
-      if (!options.quiet) writeStderr(`${statusLine(index, total, result)}\n`);
+      // --quiet silences progress, never an outcome the caller has to act on:
+      // without --jsonl this line is the only report a failure gets.
+      const needsAttention = result.status === 'failed' || result.status === 'partial';
+      if (!options.quiet || (needsAttention && !options.jsonl)) {
+        writeStderr(`${statusLine(index, total, result)}\n`);
+      }
     },
   });
   const shouldWriteFiles = inputs.length > 1 || Boolean(options.output) || options.format === 'all';

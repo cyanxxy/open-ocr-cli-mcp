@@ -1,5 +1,55 @@
 # Changelog
 
+## 4.2.0 - 2026-10-28
+
+### Security
+
+These close holes that let a repository you run in act on your behalf. A
+project that relied on them now fails with `CONFIG_INVALID` and a hint; move
+those settings to your user config, a `--config` file, or flags.
+
+- A project `.open-ocr-cli.json` can no longer set `baseUrl`, `apiKeyEnv`, a
+  non-`direct` `gateway`, or any `cloudflare*` key, which let a cloned
+  repository send any environment secret and your documents to its own host.
+- A project `.open-ocr-cli.json` can no longer set `overwrite`, and its `output`
+  must stay inside the project (symbolic links resolved) and outside `.git`.
+- A project `.env` supplies only the default provider credentials and gateway
+  token, and is never installed into `process.env`. Project `init` keeps the
+  default endpoint and key variable; `init --global` configures custom routing.
+
+### Changed
+
+- A lock left by a dead process on the same host is reclaimed automatically
+  with a warning; `--force-unlock` remains accepted and is no longer needed.
+- `ocr_read_artifact` declares `anthropic/maxResultSizeChars`, so a full chunk
+  is not saved to a file by Claude Code.
+
+### Fixed
+
+- A missing input whose name contains glob characters (`Scan (2).pdf`) failed
+  silently as a zero-match pattern; it is now `INPUT_NOT_FOUND`.
+- A reader closing stdout mid-batch left a stale lock, a partial manifest, and
+  no batch summary; the run is now cancelled and cleaned up (exit status still
+  `0`).
+- `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` no longer follow `--provider` to a
+  different provider, and errors name the variable instead of the flag.
+- `--quiet` without `--jsonl` no longer hides failed and partial documents;
+  status lines carry the error code and hint.
+- Agentic runs that hit the document timeout return their partial fields as
+  `time_budget_reached` instead of a `TIMEOUT` failure.
+- `doctor --json` reports an unreadable config as a failed JSON check, and
+  `status --json` answers failures with a typed JSON error.
+- A project `.env` is no longer installed into `process.env`, so in a
+  long-lived MCP server a later `noConfig` call cannot inherit its credentials.
+- The MCP confirmation prompt is built from a local dry run: it states the real
+  document count after folder/glob expansion, the resolved provider/model, and
+  the effective cost ceiling, skips the prompt when nothing would be sent, and
+  asks again when the plan changes before the confirmed retry.
+- MCP error text too long for Claude Code's error limit (which kept only its
+  first and last 5,000 characters) becomes a compact list of failures and of
+  the artifacts already produced, so they are not re-run; the JSON text mirror
+  of a successful result collapses to a summary above 40,000 characters.
+
 ## 4.1.0 - 2026-10-03
 
 ### Added

@@ -1,5 +1,5 @@
 import { webcrypto } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -139,6 +139,48 @@ describe('Open OCR MCP server', () => {
         expect(built.isError === true).toBe(!ok);
         expect(built.structuredContent.ok).toBe(ok);
       }
+    });
+
+    it('keeps a small error as its JSON mirror', () => {
+      const built = mcpResult(resultWithStatus('partial', false));
+      expect(JSON.parse((built.content[0] as { text: string }).text)).toMatchObject({ status: 'partial' });
+    });
+
+    // Claude Code shows the model only the text of an error and keeps just the
+    // first and last 5,000 characters past ~11,000: the middle documents, and
+    // the artifacts already paid for, were lost and the model re-ran them.
+    it('fits a large partial batch error whole, keeping failures and produced artifacts', () => {
+      const failed = Array.from({ length: 100 }, (_, index) => ({
+        source: `scans/bad-${index}.png`,
+        status: 'failed',
+        artifacts: [],
+        plannedArtifacts: [],
+        error: {
+          code: 'PROVIDER_FAILURE',
+          category: 'provider',
+          message: `Provider rejected page ${index} ${'x'.repeat(120)}`,
+          retryable: false,
+          hint: 'Check the provider status.',
+        },
+      }));
+      const produced = Array.from({ length: 100 }, (_, index) => ({
+        source: `scans/good-${index}.png`,
+        status: 'succeeded',
+        artifacts: [{ path: `/results/good-${index}.md`, mediaType: 'text/markdown', kind: 'markdown' }],
+        plannedArtifacts: [],
+      }));
+      const built = mcpResult({
+        protocolVersion: 2, type: 'run.result', ok: false, runId: 'r1', status: 'partial',
+        total: 200, succeeded: 100, partial: 0, failed: 100, skipped: 0, documents: [...failed, ...produced],
+      } as unknown as OcrMachineResult);
+      expect(built.isError).toBe(true);
+      const text = (built.content[0] as { text: string }).text;
+      expect(text.length).toBeLessThan(11_000);
+      expect(text).toMatch(/^Run r1 partial: 100 succeeded, 0 partial, 100 failed/u);
+      expect(text).toContain('- scans/bad-0.png: [PROVIDER_FAILURE]');
+      expect(text).toContain('more failed document(s) in structuredContent.documents.');
+      expect(text).toContain('Produced (keep these; do not re-run them):');
+      expect(text).toContain('- scans/good-0.png (succeeded): /results/good-0.md');
     });
   });
 
@@ -575,6 +617,106 @@ describe('Open OCR MCP server', () => {
         ok: false,
         error: { code: 'AUTH_MISSING' },
       });
+    });
+
+    const clearCredentials = (): void => {
+      for (const key of [
+        'GEMINI_API_KEY', 'OPEN_OCR_API_KEY', 'MOONSHOT_API_KEY',
+        'META_API_KEY', 'OPENROUTER_API_KEY', 'CLOUDFLARE_AI_GATEWAY_TOKEN',
+      ]) vi.stubEnv(key, undefined);
+    };
+
+    it('asks about the planned run, not the raw arguments, and re-asks when the plan changes', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      clearCredentials();
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-plan-'));
+      cleanupPaths.push(directory);
+      const scans = path.join(directory, 'scans');
+      await mkdir(scans);
+      for (const name of ['a.jpg', 'b.jpg', 'c.jpg']) await writeFile(path.join(scans, name), JPEG_BYTES);
+      await writeFile(path.join(scans, 'broken.jpg'), 'not an image');
+      const { request } = await driveServer(directory);
+      const args = {
+        inputs: [{ type: 'path', path: scans }],
+        outputDirectory: path.join(directory, 'out'),
+        maxCostUsd: 0.5,
+        noConfig: true,
+      };
+      const message = (reply: JsonRpcReply): string => (
+        (reply.result?.inputRequests as Record<string, { params: { message: string } }>).proceed.params.message
+      );
+
+      // One folder argument, four files in it, one of which fails locally.
+      const asked = await request(1, 'tools/call', { name: 'ocr_extract', arguments: args, _meta: modernMeta() });
+      expect(asked.result?.resultType).toBe('input_required');
+      expect(message(asked)).toMatch(/^Run OCR on 3 documents with gemini\/\S+ \(estimated cost capped at \$0\.5\)\?/u);
+      expect(message(asked)).toContain('1 other input(s) failed local validation');
+
+      // The folder grew after the person said yes: that is not what they approved.
+      await writeFile(path.join(scans, 'd.jpg'), JPEG_BYTES);
+      const answer = { proceed: { action: 'accept', content: { proceed: true } } };
+      const reasked = await request(2, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: args,
+        inputResponses: answer,
+        requestState: asked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(reasked.result?.resultType).toBe('input_required');
+      expect(message(reasked)).toMatch(/^Run OCR on 4 documents/u);
+
+      const ran = await request(3, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: args,
+        inputResponses: answer,
+        requestState: reasked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(ran.result?.resultType).toBe('complete');
+      expect(ran.result?.structuredContent).toMatchObject({ error: { code: 'AUTH_MISSING' } });
+    });
+
+    it('does not ask a person to approve a run that would send nothing', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-plan-'));
+      cleanupPaths.push(directory);
+      await writeFile(path.join(directory, 'broken.jpg'), 'not an image');
+      const { request } = await driveServer(directory);
+
+      const reply = await request(1, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: { inputs: [{ type: 'path', path: path.join(directory, 'broken.jpg') }], noConfig: true },
+        _meta: modernMeta(),
+      });
+      expect(reply.result?.resultType).toBe('complete');
+      expect(reply.result).toMatchObject({ isError: true, structuredContent: { status: 'failed' } });
+    });
+
+    it('keeps noConfig hermetic after an earlier call read the project .env', async () => {
+      clearCredentials();
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-env-'));
+      cleanupPaths.push(directory);
+      await writeFile(path.join(directory, '.env'), 'GEMINI_API_KEY=from-project-env\n');
+      await writeFile(path.join(directory, 'invoice.jpg'), JPEG_BYTES);
+      const { request } = await driveServer(directory);
+      const inputs = [{ type: 'path', path: path.join(directory, 'invoice.jpg') }];
+      const outputDirectory = path.join(directory, 'out');
+
+      const hermetic = async (id: number): Promise<JsonRpcReply> => request(id, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: { inputs, outputDirectory, noConfig: true },
+        _meta: modernMeta(),
+      });
+      expect((await hermetic(1)).result?.structuredContent).toMatchObject({ error: { code: 'AUTH_MISSING' } });
+      // A call that does read the project reads its .env...
+      await request(2, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: { inputs, outputDirectory, dryRun: true },
+        _meta: modernMeta(),
+      });
+      // ...and must leave nothing behind for the next hermetic call.
+      expect(process.env.GEMINI_API_KEY).toBeUndefined();
+      expect((await hermetic(3)).result?.structuredContent).toMatchObject({ error: { code: 'AUTH_MISSING' } });
     });
 
     it('refuses a forged confirmation without request state', async () => {

@@ -378,6 +378,23 @@ describe('CLI input discovery', () => {
     expect(found).toHaveLength(1);
   });
 
+  it('fails a missing input whose name only looks like a glob instead of dropping it', async () => {
+    await writeFile(path.join(directory, 'present.jpg'), JPEG_BYTES);
+
+    for (const missing of ['Scan (2).jpg', 'inv[1].pdf', 'nomatch/*.pdf']) {
+      await expect(discoverInputs(['present.jpg', missing], options)).rejects.toMatchObject({
+        code: 'INPUT_NOT_FOUND',
+        message: expect.stringContaining(missing) as unknown,
+      });
+    }
+  });
+
+  it('still reads an existing filename containing glob characters literally', async () => {
+    await writeFile(path.join(directory, 'Scan (2).jpg'), JPEG_BYTES);
+    const found = await discoverInputs(['Scan (2).jpg'], options);
+    expect(found.map((input) => input.name)).toEqual(['Scan (2).jpg']);
+  });
+
   it('sniffs an explicitly named extensionless or temporary document', async () => {
     const extensionless = path.join(directory, 'agent-upload');
     const temporary = path.join(directory, 'agent-upload.tmp');

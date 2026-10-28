@@ -41,6 +41,7 @@ import {
   type OcrJobEvent,
   type OcrJobRequest,
   type OcrMachineResult,
+  type OcrRunResult,
 } from './protocol';
 
 const thinkingLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -212,6 +213,8 @@ const CONFIRM_TTL_MS = 600_000;
 interface ConfirmationState {
   nonce: string;
   requestHash: string;
+  /** Digest of the planned run the person was shown: documents, route, ceiling. */
+  planHash: string;
 }
 
 interface ConfirmationGuard {
@@ -586,21 +589,86 @@ function ocrFailure(message: string, code: 'CONFIG_INVALID' | 'CANCELLED', hint:
   return mcpResult(toOcrRunFailure(randomUUID(), ocrErrorPayload(error)));
 }
 
-function confirmationMessage(request: OcrJobRequest): string {
-  const documents = request.inputs.length;
+/**
+ * What a confirmation is about, taken from a local dry run of the request
+ * rather than from its arguments. The arguments say `inputs: [folder]` and no
+ * ceiling; the plan knows the folder holds forty documents, which provider and
+ * model the configuration resolved to, and the ceiling a config file applies.
+ * Asking a person to approve "1 document with the configured provider" while
+ * forty go to a provider they were never shown is the failure this replaces.
+ */
+interface ConfirmationPlan {
+  /** Documents that passed local validation and will be sent. */
+  sources: string[];
+  /** Inputs that failed local validation and will not be sent. */
+  rejected: number;
+  provider: string;
+  gateway: string;
+  model: string;
+  costLimitUsd?: number;
+}
+
+function confirmationPlan(result: OcrRunResult): ConfirmationPlan {
+  return {
+    sources: result.documents.filter((document) => !document.error).map((document) => document.source),
+    rejected: result.documents.filter((document) => document.error).length,
+    provider: result.provider,
+    gateway: result.gateway,
+    model: result.model,
+    ...(result.costLimitUsd !== undefined ? { costLimitUsd: result.costLimitUsd } : {}),
+  };
+}
+
+function confirmationMessage(plan: ConfirmationPlan): string {
+  const documents = plan.sources.length;
   const noun = documents === 1 ? 'document' : 'documents';
-  const target = request.provider?.model ?? request.provider?.id ?? 'the configured provider';
-  const ceiling = request.execution?.maxCostUsd === undefined
+  const route = plan.gateway === 'cloudflare' ? ' via Cloudflare AI Gateway' : '';
+  const ceiling = plan.costLimitUsd === undefined
     ? 'no cost ceiling'
-    : `a $${request.execution.maxCostUsd} ceiling`;
+    : `estimated cost capped at $${plan.costLimitUsd}`;
+  const rejected = plan.rejected > 0
+    ? ` ${plan.rejected} other input(s) failed local validation and will not be sent.`
+    : '';
   // Deliberately not "this calls a paid API": free tiers, local
   // OpenAI-compatible endpoints and preflight failures all exist, and a prompt
   // that overstates what it knows trains people to click through it.
-  return `Run OCR on ${documents} ${noun} with ${target} (${ceiling})? This sends them to the provider and may incur charges.`;
+  return `Run OCR on ${documents} ${noun} with ${plan.provider}/${plan.model}${route} (${ceiling})? `
+    + `This sends them to the provider and may incur charges.${rejected}`;
 }
 
 function confirmationRequestHash(request: OcrJobRequest): string {
   return createHash('sha256').update(JSON.stringify(request)).digest('base64url');
+}
+
+function confirmationPlanHash(plan: ConfirmationPlan): string {
+  return createHash('sha256').update(JSON.stringify(plan)).digest('base64url');
+}
+
+/** Plan the request locally: no provider call, no artifacts, no credentials. */
+async function planMcpRequest(
+  request: OcrJobRequest,
+  context: McpRequestContext,
+  cwd: string,
+): Promise<OcrMachineResult> {
+  const abortController = new AbortController();
+  const relayAbort = (): void => abortController.abort(context.mcpReq.signal.reason);
+  if (context.mcpReq.signal.aborted) relayAbort();
+  else context.mcpReq.signal.addEventListener('abort', relayAbort, { once: true });
+  try {
+    const execution = await executeOcrJobRequest({ ...request, dryRun: true }, {
+      cwd,
+      runId: randomUUID(),
+      abortController,
+      // The live run that follows reports its own warnings.
+      onWarning: () => undefined,
+      noConfig: request.noConfig,
+    });
+    return execution.result;
+  } catch (error) {
+    return toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error)));
+  } finally {
+    context.mcpReq.signal.removeEventListener('abort', relayAbort);
+  }
 }
 
 /**
@@ -621,6 +689,7 @@ async function confirmationGate(
   request: OcrJobRequest,
   context: McpRequestContext,
   guard: ConfirmationGuard,
+  cwd: string,
 ): Promise<InputRequiredResult | ReturnType<typeof mcpResult> | undefined> {
   // A dry run neither bills nor writes, so there is nothing to confirm.
   if (request.dryRun) return undefined;
@@ -637,31 +706,40 @@ async function confirmationGate(
     );
   }
 
-  const answer = inputResponse(context.mcpReq.inputResponses, CONFIRM_KEY);
-  if (answer.kind === 'missing') {
-    return inputRequired({
-      inputRequests: {
-        [CONFIRM_KEY]: inputRequired.elicit({
-          message: confirmationMessage(request),
-          requestedSchema: {
-            type: 'object',
-            properties: {
-              [CONFIRM_KEY]: {
-                type: 'boolean',
-                title: 'Run the OCR job',
-                description: 'Confirm the paid extraction run.',
-              },
-            },
-            required: [CONFIRM_KEY],
-          },
-        }),
-      },
-      requestState: await guard.codec.mint({
-        nonce: randomUUID(),
-        requestHash: confirmationRequestHash(request),
-      }),
-    });
+  // A request that fails before any document could be sent (bad config, no
+  // inputs) or whose every document fails local validation bills nothing:
+  // return that outcome instead of asking a person to approve it.
+  const planned = await planMcpRequest(request, context, cwd);
+  if (!('documents' in planned) || planned.documents.every((document) => document.error)) {
+    return mcpResult(planned);
   }
+  const plan = confirmationPlan(planned);
+  const ask = async (): Promise<InputRequiredResult> => inputRequired({
+    inputRequests: {
+      [CONFIRM_KEY]: inputRequired.elicit({
+        message: confirmationMessage(plan),
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            [CONFIRM_KEY]: {
+              type: 'boolean',
+              title: 'Run the OCR job',
+              description: 'Confirm the paid extraction run.',
+            },
+          },
+          required: [CONFIRM_KEY],
+        },
+      }),
+    },
+    requestState: await guard.codec.mint({
+      nonce: randomUUID(),
+      requestHash: confirmationRequestHash(request),
+      planHash: confirmationPlanHash(plan),
+    }),
+  });
+
+  const answer = inputResponse(context.mcpReq.inputResponses, CONFIRM_KEY);
+  if (answer.kind === 'missing') return ask();
 
   const state = context.mcpReq.requestState<ConfirmationState>();
   const now = Date.now();
@@ -684,12 +762,18 @@ async function confirmationGate(
   const accepted = answer.kind === 'elicit'
     && answer.action === 'accept'
     && answer.content?.[CONFIRM_KEY] === true;
-  if (accepted) return undefined;
-  return ocrFailure(
-    'The OCR run was not confirmed.',
-    'CANCELLED',
-    'Re-run the tool and accept the confirmation prompt to proceed.',
-  );
+  if (!accepted) {
+    return ocrFailure(
+      'The OCR run was not confirmed.',
+      'CANCELLED',
+      'Re-run the tool and accept the confirmation prompt to proceed.',
+    );
+  }
+  // The approval covered the run as it was planned then. If the folder, the
+  // configuration or the ceiling changed since, the person approved something
+  // else: ask again with the new numbers (the MRTR pattern allows re-asking).
+  if (state.planHash !== confirmationPlanHash(plan)) return ask();
+  return undefined;
 }
 
 /**
@@ -740,32 +824,106 @@ function artifactResourceLinks(result: OcrMachineResult): McpResourceLinkBlock[]
 }
 
 /**
+ * Claude Code keeps only the first and last 5,000 characters of error text
+ * longer than about 11,000, so a long batch lost exactly the middle documents
+ * and their artifact paths. Error text is built to fit whole.
+ */
+const MCP_ERROR_TEXT_MAX_CHARS = 8_000;
+
+function truncateText(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
+}
+
+function runCounts(result: OcrRunResult): string {
+  return `${result.succeeded} succeeded, ${result.partial} partial, ${result.failed} failed, `
+    + `${result.skipped} skipped of ${result.total}`;
+}
+
+/**
+ * The text of a tool error (`ok: false`). Hosts such as Claude Code show the
+ * model only this text for an error, so it carries both halves of what the
+ * model has to act on: what failed and why, and which artifacts the run
+ * already produced and paid for, so they are kept rather than re-run. It is
+ * compact enough to arrive whole; `structuredContent` keeps the full envelope.
+ */
+function errorText(result: OcrMachineResult): string {
+  if (!('documents' in result)) {
+    const { error } = result;
+    const lines = [`Run ${result.runId} failed: [${error.code}] ${error.message}`];
+    if (error.hint) lines.push(`Hint: ${error.hint}`);
+    for (const warning of result.warnings ?? []) lines.push(`Warning: ${warning}`);
+    return truncateText(lines.join('\n'), MCP_ERROR_TEXT_MAX_CHARS);
+  }
+  const lines = [
+    `Run ${result.runId} ${result.status}: ${runCounts(result)}. Full per-document results are in structuredContent.documents.`,
+  ];
+  let length = lines[0].length;
+  // Room is reserved for each section's closing line so it is never cut off.
+  const addSection = (title: string, entries: string[], noun: string): void => {
+    if (entries.length === 0) return;
+    lines.push(title);
+    length += title.length + 1;
+    let shown = 0;
+    for (const entry of entries) {
+      const line = truncateText(entry, 600);
+      if (length + line.length + 1 > MCP_ERROR_TEXT_MAX_CHARS - 240) break;
+      lines.push(line);
+      length += line.length + 1;
+      shown += 1;
+    }
+    if (shown < entries.length) {
+      const more = `… ${entries.length - shown} more ${noun} in structuredContent.documents.`;
+      lines.push(more);
+      length += more.length + 1;
+    }
+  };
+  addSection('Failed:', result.documents.flatMap((document) => (
+    document.error
+      ? [`- ${document.source}: [${document.error.code}] ${document.error.message}${document.error.hint ? ` Hint: ${document.error.hint}` : ''}`]
+      : []
+  )), 'failed document(s)');
+  addSection('Produced (keep these; do not re-run them):', result.documents.flatMap((document) => (
+    document.artifacts.length > 0
+      ? [`- ${document.source} (${document.status}${document.partialReason ? `: ${document.partialReason}` : ''}): ${document.artifacts.map((artifact) => artifact.path).join(', ')}`]
+      : []
+  )), 'document(s) with artifacts');
+  return lines.join('\n');
+}
+
+/**
+ * Claude Code saves a successful text result longer than 50,000 characters to
+ * a file and shows the model only its path. The mirror stays below that, with
+ * room for the resource links that follow it.
+ */
+const MCP_TEXT_MIRROR_MAX_CHARS = 40_000;
+
+/**
  * The text block that mirrors `structuredContent` for hosts that render content
  * only.
  *
- * Normally that is the envelope itself: for reference delivery it is a few
- * hundred bytes of metadata and paths. Inline delivery is the exception — the
- * envelope then carries every extracted document body, and mirroring it verbatim
- * sends the whole corpus twice in one response. Above 64 KiB the mirror
- * collapses to a summary, and bodies travel once in `structuredContent`.
- *
- * This is a deliberate departure from the tools specification, which says a
- * tool returning `structuredContent` SHOULD also return the serialised JSON in
- * a text block. The SHOULD exists for hosts that ignore `structuredContent`;
- * for large inline delivery the summary tells such a host where the bodies are,
- * which is the most it can be told without doubling the payload.
+ * The tools specification says a tool returning `structuredContent` SHOULD
+ * also return the serialized JSON in a text block, and that is what happens up
+ * to {@link MCP_TEXT_MIRROR_MAX_CHARS}. Above it (inline bodies, or a very
+ * large batch) the mirror collapses to a summary: sending the corpus twice in
+ * one response, or having the host replace it with a file path, both cost more
+ * than the summary loses. A tool error too long to arrive whole gets
+ * {@link errorText} instead.
  */
 function resultTextBlock(result: OcrMachineResult): McpTextBlock {
-  const inline = 'documents' in result && result.documents.some((document) => document.content !== undefined);
-  if (!inline) return { type: 'text', text: JSON.stringify(result) };
-  // Most hosts still feed text content to the model. Keep modest inline
-  // responses usable there, while avoiding a second copy of a large corpus.
   const serialized = JSON.stringify(result);
-  if (Buffer.byteLength(serialized, 'utf8') <= MCP_ARTIFACT_CHUNK_BYTES) return { type: 'text', text: serialized };
-  const summary = `${result.status} run ${result.runId}: `
-    + `${result.succeeded} succeeded, ${result.partial} partial, ${result.failed} failed, ${result.skipped} skipped `
-    + `of ${result.total}. Document bodies are in structuredContent.documents[].content.`;
-  return { type: 'text', text: summary };
+  // An error keeps the JSON mirror while it fits the host's error text whole;
+  // past that it would be cut in the middle, so it becomes the compact list.
+  if (!result.ok) {
+    return { type: 'text', text: serialized.length <= MCP_ERROR_TEXT_MAX_CHARS ? serialized : errorText(result) };
+  }
+  if (serialized.length <= MCP_TEXT_MIRROR_MAX_CHARS || !('documents' in result)) {
+    return { type: 'text', text: serialized };
+  }
+  const inline = result.documents.some((document) => document.content !== undefined);
+  const where = inline
+    ? 'Document bodies are in structuredContent.documents[].content.'
+    : 'Per-document status and artifact paths are in structuredContent.documents; artifacts are also linked below.';
+  return { type: 'text', text: `${result.status} run ${result.runId}: ${runCounts(result)}. ${where}` };
 }
 
 export function mcpResult(result: OcrMachineResult): {
@@ -783,7 +941,8 @@ export function mcpResult(result: OcrMachineResult): {
     // and `cost_limited` all hand the caller less than it asked for — a
     // document failed, the run stopped early, or the budget cut it short — so
     // reporting the tool call as successful while `structuredContent.ok` is
-    // false lets a client act on results it never received.
+    // false lets a client act on results it never received. The error text
+    // still lists the artifacts those runs produced (see errorText).
     ...(result.ok ? {} : { isError: true }),
   };
 }
@@ -873,7 +1032,7 @@ async function executeMcpTool(
 ): Promise<ReturnType<typeof mcpResult> | InputRequiredResult> {
   try {
     const request = buildRequest();
-    const gate = await confirmationGate(request, context, confirmationGuard);
+    const gate = await confirmationGate(request, context, confirmationGuard, cwd);
     if (gate) return gate;
     return await executeMcpRequest(request, context, cwd, artifacts);
   } catch (error) {
@@ -1015,6 +1174,11 @@ export function createOcrMcpServer(version: string, cwd = process.cwd()): McpSer
       inputSchema: artifactInputSchema,
       outputSchema: artifactOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // Claude Code saves a text result over 50,000 characters to a file unless
+      // the tool raises its own limit, which would turn every large chunk into
+      // a file path and defeat the pagination. Sized for the worst case: a
+      // maximum chunk whose every byte JSON-escapes to six characters.
+      _meta: { 'anthropic/maxResultSizeChars': MCP_ARTIFACT_CHUNK_BYTES * 6 + 4_096 },
     },
     async (input) => {
       try {

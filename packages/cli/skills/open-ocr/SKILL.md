@@ -172,7 +172,9 @@ modest inline responses also include a text copy.
 
 For OCR result envelopes, use `error.code`, `error.retryable`, and `error.hint`
 rather than matching prose. On MCP, check `isError` as well as the OCR result's
-`ok`, `status`, and per-document errors. Protocol/argument-validation errors and
+`ok`, `status`, and per-document errors. A `partial`, `cancelled`, or
+`cost_limited` run also sets `isError`; keep the artifacts it already produced
+(its error text lists them) instead of repeating paid OCR. Protocol/argument-validation errors and
 `ocr_read_artifact` failures may contain no OCR envelope; inspect their MCP error
 or text feedback and do not treat missing `structuredContent` as success.
 

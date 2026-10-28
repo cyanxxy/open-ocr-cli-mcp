@@ -30,7 +30,6 @@ function outputConflict(message: string, cause?: unknown, hint = OUTPUT_CONFLICT
 }
 
 export interface BatchLockAcquireOptions {
-  forceUnlock?: boolean;
   onWarning?: (message: string) => void;
 }
 
@@ -637,52 +636,54 @@ export class BatchOutputLock {
       let existingOwner: BatchLockOwner | undefined;
       try {
         existingOwner = parseBatchLockOwner(JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown);
-      } catch {
+      } catch (readError) {
+        // The owner released it between our write and this read: try again.
+        if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
+          return BatchOutputLock.acquire(outputDirectory, options);
+        }
         // Invalid owner data is handled below without guessing that it is stale.
       }
-      const ownership = existingOwner
-        ? `PID ${existingOwner.pid} on ${existingOwner.hostname}, started ${existingOwner.startedAt}`
-        : 'owner details unavailable';
-
-      if (options.forceUnlock) {
-        if (!existingOwner) {
-          throw outputConflict(
-            `Cannot force-unlock ${lockPath}: owner metadata is invalid. Remove it manually only after verifying no batch is running.`,
-            error,
-          );
-        }
-        const localHostname = hostname();
-        if (existingOwner.hostname !== localHostname) {
-          throw outputConflict(
-            `Cannot force-unlock ${lockPath}: it belongs to host ${existingOwner.hostname}, not ${localHostname}.`,
-            error,
-          );
-        }
-        if (processIsAlive(existingOwner.pid)) {
-          throw outputConflict(
-            `Cannot force-unlock ${lockPath}: owner PID ${existingOwner.pid} is still running on ${localHostname}.`,
-            error,
-          );
-        }
-
-        const currentOwner = parseBatchLockOwner(
-          JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown,
+      const manualRecovery = `Verify no batch is writing to ${outputDirectory}, then delete ${lockPath}.`;
+      if (!existingOwner) {
+        throw outputConflict(
+          `Batch output directory is locked and its owner metadata is invalid: ${lockPath}`,
+          error,
+          manualRecovery,
         );
-        if (currentOwner?.token !== existingOwner.token) {
-          throw outputConflict(`Cannot force-unlock ${lockPath}: lock ownership changed during recovery.`);
-        }
-        await fs.rm(lockPath);
-        options.onWarning?.(
-          `Removed stale batch lock for dead PID ${existingOwner.pid} on ${localHostname}: ${lockPath}`,
-        );
-        return BatchOutputLock.acquire(outputDirectory, { onWarning: options.onWarning });
       }
-      throw outputConflict(
-        `Batch output directory is already in use (${ownership}): ${outputDirectory}. `
-        + 'If that same-host process is no longer running, retry with --force-unlock. '
-        + `Review ${lockPath} manually for cross-host or invalid lock metadata.`,
-        error,
+      const localHostname = hostname();
+      if (existingOwner.hostname !== localHostname) {
+        throw outputConflict(
+          `Batch output directory is locked by PID ${existingOwner.pid} on host ${existingOwner.hostname} `
+          + `(started ${existingOwner.startedAt}), which cannot be checked from ${localHostname}: ${outputDirectory}`,
+          error,
+          manualRecovery,
+        );
+      }
+      if (processIsAlive(existingOwner.pid)) {
+        throw outputConflict(
+          `Batch output directory is in use by running PID ${existingOwner.pid} `
+          + `(started ${existingOwner.startedAt}): ${outputDirectory}`,
+          error,
+          'Wait for that batch to finish, or write to a different output directory.',
+        );
+      }
+
+      // A same-host owner that is provably dead (killed, crashed, a second
+      // Ctrl-C) cannot release its own lock. Reclaiming it here is exactly the
+      // check an operator would make, so it needs no flag. The token re-read
+      // keeps two recovering processes from deleting each other's fresh lock.
+      const currentOwner = parseBatchLockOwner(
+        JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown,
       );
+      if (currentOwner?.token !== existingOwner.token) {
+        throw outputConflict(`Batch lock ownership changed during stale-lock recovery: ${lockPath}`, error);
+      }
+      await fs.rm(lockPath);
+      options.onWarning?.(
+        `Removed stale batch lock left by dead PID ${existingOwner.pid} on ${localHostname}: ${lockPath}`,
+      );
+      return BatchOutputLock.acquire(outputDirectory, options);
     }
   }
 

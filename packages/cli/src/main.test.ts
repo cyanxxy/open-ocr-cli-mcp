@@ -26,7 +26,7 @@ vi.mock('./config', async (importOriginal) => {
   return {
     ...actual,
     loadCliConfig: vi.fn(() => Promise.resolve({})),
-    loadLocalEnv: vi.fn(),
+    localEnvironment: vi.fn(() => process.env),
   };
 });
 
@@ -42,6 +42,7 @@ vi.mock('./runner', () => ({
   runBatch: mocks.runBatch,
 }));
 
+import { loadCliConfig } from './config';
 import { CliExitError, cliExitCode, ocrErrorPayload } from './errors';
 import { cliVersion, createProgram, machineFailureChannel, main } from './main';
 import { assertOcrJobEvent, type OcrJobEvent } from './protocol';
@@ -116,6 +117,7 @@ describe('CLI command exit contracts', () => {
         'extract',
         input,
         '--quiet',
+        // Still accepted after automatic stale-lock recovery made it redundant.
         '--force-unlock',
       ]);
     } catch (error) {
@@ -125,7 +127,6 @@ describe('CLI command exit contracts', () => {
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toBe('Could not persist batch summary');
     expect(cliExitCode(thrown)).toBe(1);
-    expect(mocks.runBatch.mock.calls[0]?.[1]).toMatchObject({ forceUnlock: true });
   });
 
   it('validates a custom schema before requiring provider credentials', async () => {
@@ -734,6 +735,48 @@ describe('CLI command exit contracts', () => {
         error: expect.stringContaining('GEMINI_API_KEY') as unknown,
       });
       expect(process.exitCode).toBe(1);
+    } finally {
+      stdout.mockRestore();
+    }
+  });
+
+  it('reports a malformed config as a failed JSON check instead of prose on stderr', async () => {
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      // loadCliConfig is mocked in this file; reject the way a malformed file does.
+      vi.mocked(loadCliConfig).mockRejectedValueOnce(new CliExitError('Invalid JSON in .open-ocr-cli.json', 2, {
+        code: 'CONFIG_INVALID', category: 'configuration', retryable: false,
+      }));
+      await createProgram().parseAsync(['node', 'open-ocr-cli', 'doctor', '--json']);
+      const report = JSON.parse(stdout.mock.calls.flat().join('')) as {
+        configuration: { ok: boolean; code?: string; error?: string };
+      };
+      expect(report.configuration).toMatchObject({
+        ok: false,
+        code: 'CONFIG_INVALID',
+        error: expect.stringContaining('Invalid JSON') as unknown,
+      });
+      expect(process.exitCode).toBe(1);
+    } finally {
+      stdout.mockRestore();
+      cwd.mockRestore();
+    }
+  });
+
+  it('answers status --json failures with a typed JSON error', async () => {
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      await createProgram().parseAsync([
+        'node', 'open-ocr-cli', 'status', path.join(directory, 'missing-results'), '--json',
+      ]);
+      const report = JSON.parse(stdout.mock.calls.flat().join('')) as {
+        healthy: boolean;
+        error: { code: string; message: string };
+      };
+      expect(report.healthy).toBe(false);
+      expect(report.error.message).toContain('missing-results');
+      expect(process.exitCode).toBe(2);
     } finally {
       stdout.mockRestore();
     }

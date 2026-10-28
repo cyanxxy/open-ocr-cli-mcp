@@ -43,7 +43,6 @@ function options(): ResolvedCliOptions {
     defaultExcludes: true,
     resume: true,
     overwrite: false,
-    forceUnlock: false,
     failFast: false,
     jsonl: false,
     dryRun: false,

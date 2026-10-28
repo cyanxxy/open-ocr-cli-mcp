@@ -8,7 +8,7 @@ import {
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
   loadCliConfig,
-  loadLocalEnv,
+  localEnvironment,
   resolveCliOptions,
   type ModeScopedOptionKey,
 } from './config';
@@ -302,7 +302,7 @@ export async function executeOcrJobRequest(
   const hermetic = execution.noConfig === true || request.noConfig === true;
   // Ambient OPEN_OCR_NO_CONFIG still blocks .env; explicit configPath may load
   // only that file (no user/project merge) via loadCliConfig hermetic rules.
-  loadLocalEnv(execution.cwd, hermetic);
+  const env = localEnvironment(execution.cwd, hermetic);
   const fileConfig = await loadCliConfig(
     execution.cwd,
     request.configPath,
@@ -361,7 +361,7 @@ export async function executeOcrJobRequest(
   const stdinInput = stdinInputs[0]?.type === 'stdin' ? stdinInputs[0] : undefined;
   const options = {
     // Errors name request fields, not `extract` flags: this caller sent JSON.
-    ...resolveCliOptions(requestFlags(request, outputDirectory), effectiveFileConfig, execution.cwd, 'field'),
+    ...resolveCliOptions(requestFlags(request, outputDirectory), effectiveFileConfig, execution.cwd, 'field', env),
     customSchema,
     ...(stdinInput?.name ? { stdinName: stdinInput.name } : {}),
     ...(stdinInput?.mimeType ? { stdinType: stdinInput.mimeType } : {}),

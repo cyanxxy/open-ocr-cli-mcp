@@ -2,16 +2,11 @@
 
 import process from 'node:process';
 
-import { cliExitCode, isBrokenPipeError, renderCliError } from './errors';
+import { cliExitCode, renderCliError } from './errors';
 import { main, PRIMARY_CLI_NAME } from './main';
+import { installStdoutPipeGuard, STDOUT_CLOSED_EXIT_CODE, stdoutClosedByReader } from './stdout';
 
-// Writable streams emit EPIPE asynchronously; it does not reject `main()`.
-// Scope the clean exit to stdout itself so an unrelated provider or filesystem
-// EPIPE still reaches the ordinary typed-error path.
-process.stdout.on('error', (error: Error) => {
-  if (isBrokenPipeError(error)) process.exit(0);
-  throw error;
-});
+installStdoutPipeGuard();
 
 main().catch((error: unknown) => {
   process.stderr.write(renderCliError(error, PRIMARY_CLI_NAME));
@@ -19,4 +14,8 @@ main().catch((error: unknown) => {
     process.stderr.write(`${error.stack}\n`);
   }
   process.exitCode = cliExitCode(error);
+}).finally(() => {
+  // The run was cancelled internally so it could clean up, but the caller
+  // chose to stop reading: report that the way the CLI always has.
+  if (stdoutClosedByReader()) process.exitCode = STDOUT_CLOSED_EXIT_CODE;
 });

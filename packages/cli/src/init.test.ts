@@ -31,8 +31,9 @@ describe('CLI init', () => {
   it('writes safe interactive configuration and validates an environment credential', async () => {
     const validateCredentials = vi.fn(() => Promise.resolve());
     const output: string[] = [];
-    const result = await runInit({}, {
+    const result = await runInit({ global: true }, {
       cwd: directory,
+      homeDirectory: directory,
       env: { OCR_KEY: 'secret-value' },
       prompter: answers(['gemini', 'direct', 'gemini-3.1-flash-lite', 'LOW', '4', '30', '2.50', 'OCR_KEY']),
       validateCredentials,
@@ -40,12 +41,47 @@ describe('CLI init', () => {
     });
 
     expect(result).toMatchObject({ written: true, credentialStatus: 'valid' });
+    expect(result.configPath).toBe(path.join(directory, '.config', 'open-ocr-cli', 'config.json'));
     expect(validateCredentials).toHaveBeenCalledWith('secret-value', 'gemini-3.1-flash-lite');
-    const config = JSON.parse(await readFile(path.join(directory, '.open-ocr-cli.json'), 'utf8')) as Record<string, unknown>;
+    const config = JSON.parse(await readFile(result.configPath, 'utf8')) as Record<string, unknown>;
     expect(config).toMatchObject({ provider: 'gemini', gateway: 'direct', concurrency: 4, requestsPerMinute: 30, maxCostUsd: 2.5, apiKeyEnv: 'OCR_KEY' });
     expect(config).not.toHaveProperty('apiKey');
-    expect(await readFile(path.join(directory, '.open-ocr-cli.json'), 'utf8')).not.toContain('secret-value');
+    expect(await readFile(result.configPath, 'utf8')).not.toContain('secret-value');
     expect(output.join('')).toContain('credential validated');
+  });
+
+  it('keeps project setup on the default endpoint and key variable without asking', async () => {
+    const questions: string[] = [];
+    const output: string[] = [];
+    const result = await runInit({ skipValidation: true }, {
+      cwd: directory,
+      env: {},
+      prompter: {
+        ask: (question, defaultValue) => {
+          questions.push(question);
+          return Promise.resolve(defaultValue);
+        },
+        confirm: () => Promise.resolve(false),
+        close: () => undefined,
+      },
+      writeOutput: (text) => output.push(text),
+    });
+
+    expect(result).toMatchObject({ written: true, gateway: 'direct', apiKeyEnvironmentVariable: 'GEMINI_API_KEY' });
+    expect(questions).not.toContain('Choose gateway by number or value');
+    expect(questions).not.toContain('API key environment variable');
+    expect(questions).not.toContain('Provider API base URL');
+    const config = JSON.parse(await readFile(path.join(directory, '.open-ocr-cli.json'), 'utf8')) as Record<string, unknown>;
+    expect(config).not.toHaveProperty('apiKeyEnv');
+    expect(config).not.toHaveProperty('baseUrl');
+    expect(output.join('')).toContain('init --global');
+
+    await expect(runInit({ yes: true, force: true, gateway: 'cloudflare' }, {
+      cwd: directory,
+      env: {},
+      prompter: answers([]),
+      writeOutput: () => undefined,
+    })).rejects.toMatchObject({ code: 'CONFIG_INVALID', hint: expect.stringContaining('init --global') as unknown });
   });
 
   it('shows fixed-choice options and re-prompts after an invalid provider', async () => {
@@ -61,8 +97,9 @@ describe('CLI init', () => {
       confirm: () => Promise.resolve(true),
       close: () => undefined,
     };
-    const result = await runInit({ skipValidation: true }, {
+    const result = await runInit({ skipValidation: true, global: true }, {
       cwd: directory,
+      homeDirectory: directory,
       env: {},
       prompter,
       writeOutput: (text) => output.push(text),
@@ -89,7 +126,7 @@ describe('CLI init', () => {
     const result = await runInit({ skipValidation: true }, {
       cwd: directory,
       env: {},
-      prompter: answers(['2', '1', '5', 'kimi-custom-vision', '3']),
+      prompter: answers(['2', '5', 'kimi-custom-vision', '3']),
       writeOutput: (text) => output.push(text),
     });
 

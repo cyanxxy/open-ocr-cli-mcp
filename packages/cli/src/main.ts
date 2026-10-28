@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { once } from 'node:events';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -22,7 +21,7 @@ import {
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
   loadCliConfig,
-  loadLocalEnv,
+  localEnvironment,
   resolveCliOptions,
   suppliedModeScopedFlags,
 } from './config';
@@ -35,6 +34,7 @@ import {
   cliSignalExitCode,
   ocrErrorPayload,
   type CliExitCode,
+  type CliInterruptSignal,
   type OcrErrorPayload,
 } from './errors';
 import { describeDiscoverySkips, discoverInputSet } from './inputs';
@@ -58,7 +58,8 @@ import {
 import { runBatch } from './runner';
 import { providerRuntimeConfig } from './providerRuntime';
 import { inspectBatchStatus, renderBatchStatus } from './status';
-import type { ExtractCommandFlags } from './types';
+import { onStdoutClosed, writeStdout } from './stdout';
+import type { CliConfigFile, ExtractCommandFlags } from './types';
 import {
   assertWebOutputAvailable,
   resolveWebUrls,
@@ -101,10 +102,6 @@ async function configFileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function writeMachineStdout(value: string): Promise<void> {
-  if (process.stdout.write(value)) return;
-  await once(process.stdout, 'drain');
-}
 
 /**
  * The terminal `run.failed` event a machine stream owes its consumer when the
@@ -139,19 +136,26 @@ async function withInterruptHandling<T>(
 ): Promise<T> {
   const abortController = new AbortController();
   let exitCode: CliExitCode | undefined;
-  const interrupt = (signal: 'SIGINT' | 'SIGTERM'): void => {
+  const interrupt = (signal: CliInterruptSignal): void => {
+    if (exitCode !== undefined) return;
     exitCode = cliSignalExitCode(signal);
-    abortController.abort(new Error(`Interrupted by ${signal}`));
+    abortController.abort(new Error(
+      signal === 'SIGPIPE' ? 'Interrupted: stdout was closed by its reader' : `Interrupted by ${signal}`,
+    ));
   };
   const onSigint = (): void => interrupt('SIGINT');
   const onSigterm = (): void => interrupt('SIGTERM');
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
+  // A reader that stops listening is cancelled like any interrupt, so the
+  // batch still releases its lock and writes its summary before it exits.
+  const stopWatchingStdout = onStdoutClosed(() => interrupt('SIGPIPE'));
   try {
     return await operation({ abortController, interruptedExitCode: () => exitCode });
   } finally {
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
+    stopWatchingStdout();
   }
 }
 
@@ -231,11 +235,11 @@ function addExtractOptions(command: Command): Command {
     .option('--resume', 'skip unchanged documents recorded in the batch manifest')
     .option('--no-resume', 'process documents even when the manifest marks them complete')
     .option('--overwrite', 'replace existing output artifacts')
-    .option('--force-unlock', 'recover a same-host batch lock only when its owner process is dead')
+    .option('--force-unlock', 'no longer needed: a same-host lock left by a dead process is reclaimed automatically')
     .option('--fail-fast', 'stop scheduling new documents after the first failure')
     .option('--jsonl', 'emit protocol v2 lifecycle events on stdout, one JSON object per line, ending in exactly one run.completed or run.failed event — the same stream as `run --response-format jsonl`')
     .option('--dry-run', 'resolve and validate the job without calling a provider or writing files')
-    .option('--quiet', 'suppress progress output on stderr')
+    .option('--quiet', 'suppress progress output on stderr; failed and partial documents are still reported unless --jsonl carries them')
     .option('--verbose', 'show agent steps and detailed progress on stderr')
     .option('--stdin-name <name>', 'filename used for stdin input (type is sniffed when omitted)')
     .option('--stdin-type <mime>', 'MIME type for stdin when it cannot be inferred from --stdin-name')
@@ -316,7 +320,7 @@ then CLI flags. Later sources win.
         ? async (event: OcrJobEvent): Promise<void> => {
             lastSequence = event.sequence;
             if (event.type === 'run.completed' || event.type === 'run.failed') emittedTerminalRecord = true;
-            await writeMachineStdout(`${JSON.stringify(event)}\n`);
+            await writeStdout(`${JSON.stringify(event)}\n`);
           }
         : undefined;
       /**
@@ -327,7 +331,7 @@ then CLI flags. Later sources win.
       const emitRunFailure = async (error: unknown, fallbackExitCode: CliExitCode): Promise<void> => {
         if (!jsonlRequested || emittedTerminalRecord) return;
         emittedTerminalRecord = true;
-        await writeMachineStdout(`${JSON.stringify(
+        await writeStdout(`${JSON.stringify(
           runFailedEvent(runId, lastSequence + 1, ocrErrorPayload(error, fallbackExitCode), priorWarnings),
         )}\n`);
       };
@@ -351,7 +355,7 @@ then CLI flags. Later sources win.
           assertConfigFlagsDoNotConflict(command);
           const cwd = process.cwd();
           const noConfig = cliConfigDisabled(flags.config);
-          loadLocalEnv(cwd, noConfig);
+          const env = localEnvironment(cwd, noConfig);
           const fileConfig = await loadCliConfig(
             cwd,
             typeof flags.config === 'string' ? flags.config : undefined,
@@ -369,7 +373,7 @@ then CLI flags. Later sources win.
             const schemaWarning = customSchemaCompatibilityWarning(customSchema);
             if (schemaWarning) process.stderr.write(`${schemaWarning}\n`);
           }
-          const resolvedOptions = resolveCliOptions(flags, fileConfig, cwd);
+          const resolvedOptions = resolveCliOptions(flags, fileConfig, cwd, 'flag', env);
           const options = customSchema
             ? { ...resolvedOptions, customSchema }
             : resolvedOptions;
@@ -473,7 +477,7 @@ then CLI flags. Later sources win.
         ? async (event: OcrJobEvent): Promise<void> => {
             lastSequence = event.sequence;
             if (event.type === 'run.failed') emittedFailure = true;
-            await writeMachineStdout(`${JSON.stringify(event)}\n`);
+            await writeStdout(`${JSON.stringify(event)}\n`);
           }
         : undefined;
       await withInterruptHandling(async ({ abortController, interruptedExitCode }) => {
@@ -507,7 +511,7 @@ then CLI flags. Later sources win.
             noConfig: flags.config === false,
           });
           if (flags.responseFormat === 'json') {
-            await writeMachineStdout(`${JSON.stringify(execution.result)}\n`);
+            await writeStdout(`${JSON.stringify(execution.result)}\n`);
           }
           if (abortController.signal.aborted) process.exitCode = interruptedExitCode() ?? 1;
           else {
@@ -518,9 +522,9 @@ then CLI flags. Later sources win.
           const signalExitCode = interruptedExitCode();
           const payload = ocrErrorPayload(error, signalExitCode ?? 2);
           if (flags.responseFormat === 'json') {
-            await writeMachineStdout(`${JSON.stringify(toOcrRunFailure(runId, payload, warnings))}\n`);
+            await writeStdout(`${JSON.stringify(toOcrRunFailure(runId, payload, warnings))}\n`);
           } else if (!emittedFailure) {
-            await writeMachineStdout(`${JSON.stringify(
+            await writeStdout(`${JSON.stringify(
               runFailedEvent(runId, lastSequence + 1, payload, warnings),
             )}\n`);
           }
@@ -593,7 +597,7 @@ then CLI flags. Later sources win.
       assertConfigFlagsDoNotConflict(command);
       const cwd = process.cwd();
       const noConfig = cliConfigDisabled(flags.config);
-      loadLocalEnv(cwd, noConfig);
+      const env = localEnvironment(cwd, noConfig);
       const fileConfig = await loadCliConfig(
         cwd,
         typeof flags.config === 'string' ? flags.config : undefined,
@@ -613,6 +617,8 @@ then CLI flags. Later sources win.
           format: fileConfig.format === 'json' ? 'json' : 'markdown',
         },
         cwd,
+        'flag',
+        env,
       );
       // Narrowing only. Both inputs to `format` are already constrained to
       // markdown/json — Commander rejects any other `--format` value, and the
@@ -663,7 +669,7 @@ then CLI flags. Later sources win.
           }
           if (!options.output) {
             if (!result.artifacts) throw new Error('Web OCR returned no inline artifacts');
-            await writeMachineStdout(primaryArtifact(result.artifacts, webFormat));
+            await writeStdout(primaryArtifact(result.artifacts, webFormat));
           }
           const usage = execution.summary.usage;
           if (!options.quiet) process.stderr.write(
@@ -736,18 +742,22 @@ then CLI flags. Later sources win.
       assertConfigFlagsDoNotConflict(command);
       const cwd = process.cwd();
       const noConfig = cliConfigDisabled(flags.config);
-      loadLocalEnv(cwd, noConfig);
-      const config = await loadCliConfig(
-        cwd,
-        typeof flags.config === 'string' ? flags.config : undefined,
-        noConfig,
-      );
+      let config: CliConfigFile = {};
+      let env: NodeJS.ProcessEnv = process.env;
       let resolvedConfig: ReturnType<typeof resolveCliOptions> | undefined;
-      let configurationError: string | undefined;
+      let configurationError: OcrErrorPayload | undefined;
+      // A malformed or refused config file is the case doctor exists for, so
+      // it is reported as a failed check (in JSON under --json), not thrown.
       try {
-        resolvedConfig = resolveCliOptions({ dryRun: true }, config, cwd);
+        env = localEnvironment(cwd, noConfig);
+        config = await loadCliConfig(
+          cwd,
+          typeof flags.config === 'string' ? flags.config : undefined,
+          noConfig,
+        );
+        resolvedConfig = resolveCliOptions({ dryRun: true }, config, cwd, 'flag', env);
       } catch (error) {
-        configurationError = error instanceof Error ? error.message : String(error);
+        configurationError = ocrErrorPayload(error);
       }
       const configuredProvider = config.provider && PROVIDER_IDS.includes(config.provider)
         ? config.provider
@@ -761,7 +771,7 @@ then CLI flags. Later sources win.
         ));
       const gatewayTokenRequired = resolvedConfig?.gateway === 'cloudflare'
         && resolvedConfig.cloudflareByok;
-      const gatewayTokenConfigured = Boolean(process.env[gatewayTokenEnv]);
+      const gatewayTokenConfigured = Boolean(env[gatewayTokenEnv]);
       let credentialProbe: {
         status: 'not_requested' | 'passed' | 'failed' | 'skipped';
         error?: string;
@@ -769,7 +779,7 @@ then CLI flags. Later sources win.
       if (flags.checkCredentials) {
         if (!resolvedConfig || configurationError) {
           credentialProbe = { status: 'skipped', error: 'Configuration is invalid.' };
-        } else if (!providerKeyOptional && !process.env[apiKeyEnv]) {
+        } else if (!providerKeyOptional && !env[apiKeyEnv]) {
           credentialProbe = { status: 'skipped', error: `${apiKeyEnv} is not configured.` };
         } else if (gatewayTokenRequired && !gatewayTokenConfigured) {
           credentialProbe = { status: 'skipped', error: `${gatewayTokenEnv} is not configured.` };
@@ -789,10 +799,15 @@ then CLI flags. Later sources win.
       const projectConfigExists = await configFileExists(projectConfigPath);
       const checks = {
         node: { ok: isSupportedNode(process.versions.node), version: process.versions.node },
-        configuration: { ok: !configurationError, error: configurationError },
+        configuration: {
+          ok: !configurationError,
+          error: configurationError?.message,
+          code: configurationError?.code,
+          hint: configurationError?.hint,
+        },
         provider,
         gateway: resolvedConfig?.gateway ?? config.gateway ?? 'direct',
-        apiKey: { ok: providerKeyOptional || Boolean(process.env[apiKeyEnv]), environmentVariable: apiKeyEnv },
+        apiKey: { ok: providerKeyOptional || Boolean(env[apiKeyEnv]), environmentVariable: apiKeyEnv },
         gatewayToken: {
           ok: !gatewayTokenRequired || gatewayTokenConfigured,
           required: gatewayTokenRequired,
@@ -808,6 +823,7 @@ then CLI flags. Later sources win.
       else {
         process.stdout.write(`Node.js ${checks.node.version}: ${checks.node.ok ? 'ok' : 'use Node 20.19+, 22.13+, or 24+'}\n`);
         process.stdout.write(`Configuration: ${checks.configuration.ok ? 'ok' : checks.configuration.error}\n`);
+        if (checks.configuration.hint) process.stdout.write(`  hint: ${checks.configuration.hint}\n`);
         process.stdout.write(`${apiKeyEnv}: ${checks.apiKey.ok ? 'configured' : 'missing'}\n`);
         if (checks.gatewayToken.required) {
           process.stdout.write(`${gatewayTokenEnv}: ${checks.gatewayToken.ok ? 'configured' : 'missing'}\n`);
@@ -840,7 +856,17 @@ then CLI flags. Later sources win.
     .argument('[output]', 'batch output directory', 'open-ocr-output')
     .option('--json', 'emit machine-readable JSON')
     .action(async (output: string, flags: { json?: boolean }) => {
-      const report = await inspectBatchStatus(output, process.cwd());
+      let report: Awaited<ReturnType<typeof inspectBatchStatus>>;
+      try {
+        report = await inspectBatchStatus(output, process.cwd());
+      } catch (error) {
+        if (!flags.json) throw error;
+        // An agent parsing stdout gets the typed error instead of nothing.
+        const typed = asCliExitError(error, 2);
+        await writeStdout(`${JSON.stringify({ healthy: false, error: ocrErrorPayload(typed) }, null, 2)}\n`);
+        process.exitCode = typed.exitCode;
+        return;
+      }
       process.stdout.write(flags.json ? `${JSON.stringify(report, null, 2)}\n` : renderBatchStatus(report));
       if (!report.healthy) process.exitCode = 1;
     });
@@ -849,7 +875,7 @@ then CLI flags. Later sources win.
   // thing a coding agent reads — leads with the machine surface.
   program.command('init')
     .description('create a safe CLI configuration and validate credentials; --yes runs without prompting')
-    .option('--global', 'write the user configuration instead of ./.open-ocr-cli.json')
+    .option('--global', 'write the user configuration instead of ./.open-ocr-cli.json (required for custom endpoints, key variables, and gateways)')
     .addOption(new Option('--provider <provider>', 'model provider').choices([...PROVIDER_IDS]))
     .addOption(new Option('--gateway <gateway>', 'API route').choices(['direct', 'cloudflare']))
     .option('--model <model>', 'provider model identifier (required for openai-compatible with --yes)')
@@ -857,8 +883,7 @@ then CLI flags. Later sources win.
     .option('--yes', 'accept recommended defaults without prompting')
     .option('--skip-validation', 'do not make the credential validation request')
     .action(async (flags: InitFlags) => {
-      loadLocalEnv(process.cwd());
-      await runInit(flags);
+      await runInit(flags, { env: localEnvironment(process.cwd()) });
     });
 
   program.command('interactive')
@@ -943,9 +968,9 @@ export async function main(argv: string[] = process.argv): Promise<void> {
           2,
         );
         if (channel === 'json') {
-          await writeMachineStdout(`${JSON.stringify(toOcrRunFailure(randomUUID(), payload))}\n`);
+          await writeStdout(`${JSON.stringify(toOcrRunFailure(randomUUID(), payload))}\n`);
         } else {
-          await writeMachineStdout(`${JSON.stringify(runFailedEvent(randomUUID(), 0, payload))}\n`);
+          await writeStdout(`${JSON.stringify(runFailedEvent(randomUUID(), 0, payload))}\n`);
         }
       }
       return;

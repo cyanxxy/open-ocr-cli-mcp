@@ -15,8 +15,9 @@ import {
  */
 export { redactSensitiveErrorText };
 
-export type CliExitCode = 1 | 2 | 130 | 143;
-export type CliInterruptSignal = 'SIGINT' | 'SIGTERM';
+export type CliExitCode = 1 | 2 | 130 | 141 | 143;
+/** `SIGPIPE` stands for stdout's reader closing the pipe (EPIPE). */
+export type CliInterruptSignal = 'SIGINT' | 'SIGPIPE' | 'SIGTERM';
 
 export const OCR_ERROR_CODES = [
   'INPUT_NOT_FOUND',
@@ -96,8 +97,12 @@ const DEFAULT_ERROR_HINTS: Record<OcrErrorCode, string> = {
   INTERNAL: 'Report the failure with non-secret diagnostics; rerunning the identical command is unlikely to help.',
 };
 
+function isSignalExitCode(exitCode: CliExitCode): boolean {
+  return exitCode === 130 || exitCode === 141 || exitCode === 143;
+}
+
 function defaultErrorDetails(exitCode: CliExitCode): OcrErrorDetails {
-  if (exitCode === 130 || exitCode === 143) {
+  if (isSignalExitCode(exitCode)) {
     return { code: 'CANCELLED', category: 'cancelled', retryable: true, hint: DEFAULT_ERROR_HINTS.CANCELLED };
   }
   if (exitCode === 1) {
@@ -176,7 +181,7 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
   if (normalized.includes('rate limit') || normalized.includes('429')) {
     return { code: 'RATE_LIMITED', category: 'provider', retryable: true, hint: 'Retry later or lower request concurrency/rate.' };
   }
-  if (normalized.includes('interrupted') || normalized.includes('cancelled') || exitCode === 130 || exitCode === 143) {
+  if (normalized.includes('interrupted') || normalized.includes('cancelled') || isSignalExitCode(exitCode)) {
     return { code: 'CANCELLED', category: 'cancelled', retryable: true, hint: 'Resume or rerun the interrupted job when ready.' };
   }
   return undefined;
@@ -422,7 +427,7 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     }
     current = recordValue(current, 'cause');
   }
-  if (exitCode === 130 || exitCode === 143) return defaultErrorDetails(exitCode);
+  if (isSignalExitCode(exitCode)) return defaultErrorDetails(exitCode);
   return undefined;
 }
 
@@ -546,6 +551,7 @@ export function renderCliError(error: unknown, binaryName: string): string {
 }
 
 /** Return the conventional shell exit status for a supported interrupt signal. */
-export function cliSignalExitCode(signal: CliInterruptSignal): 130 | 143 {
-  return signal === 'SIGINT' ? 130 : 143;
+export function cliSignalExitCode(signal: CliInterruptSignal): 130 | 141 | 143 {
+  if (signal === 'SIGINT') return 130;
+  return signal === 'SIGPIPE' ? 141 : 143;
 }

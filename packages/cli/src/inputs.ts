@@ -126,14 +126,14 @@ function noExpansionSkips(): Omit<ExpandedInput, 'files'> {
   };
 }
 
-function inputError(message: string, code: OcrErrorCode = 'INPUT_INVALID'): CliExitError {
+function inputError(message: string, code: OcrErrorCode = 'INPUT_INVALID', hint?: string): CliExitError {
   return new CliExitError(message, 2, {
     code,
     category: 'input',
     retryable: false,
-    hint: code === 'INPUT_NOT_FOUND'
+    hint: hint ?? (code === 'INPUT_NOT_FOUND'
       ? 'Check the input path and working directory.'
-      : 'Use a supported, non-empty image or PDF within the documented limits.',
+      : 'Use a supported, non-empty image or PDF within the documented limits.'),
   });
 }
 
@@ -306,6 +306,16 @@ async function expandInput(
   })) {
     signal?.throwIfAborted();
     if (match.isFile()) appendDiscoveredFile(files, match.fullpath(), options.maxFiles);
+  }
+  // A missing file named like `Scan (2).pdf` or `inv[1].pdf` arrives here as a
+  // "pattern". Matching nothing must fail like any other missing input; an
+  // empty expansion would silently drop the document from a successful run.
+  if (files.length === 0) {
+    throw inputError(
+      `Input does not exist and matches no files as a glob pattern: ${value}`,
+      'INPUT_NOT_FOUND',
+      'Check the path and working directory. Glob characters such as ( ) [ ] { } * ? ! in a filename are read as a pattern only when no file has that exact name.',
+    );
   }
   return { files, ...noExpansionSkips() };
 }
