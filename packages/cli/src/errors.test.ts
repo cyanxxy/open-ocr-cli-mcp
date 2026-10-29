@@ -280,7 +280,7 @@ describe('CLI exit errors', () => {
 
   describe('provider JSON error bodies', () => {
     /**
-     * Recorded from the live Gemini API (gemini-3.1-flash-lite, 2026-07-26).
+     * Recorded from the live Gemini API (gemini-3.5-flash-lite, 2026-07-26).
      * The SDK throws `ApiError` with a numeric `status` own-property and the
      * whole response body as `message`, so these fixtures reproduce the exact
      * error object the classifier receives in production.

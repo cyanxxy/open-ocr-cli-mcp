@@ -346,7 +346,7 @@ export interface OcrCapabilities {
      *
      * Published because the accepted set is narrower than the protocol's own
      * `thinking` enum and varies per model — Kimi K3 takes LOW/HIGH/MAX, Gemini
-     * 3.1 Pro refuses MINIMAL — and an agent that guessed got a configuration
+     * 3.8 Flash refuses MINIMAL — and an agent that guessed got a configuration
      * error it could only have avoided by reading prose. `fallbackLevels`
      * applies to any model ID not in `byModel`, which is how the profiles that
      * accept arbitrary upstream IDs are described.

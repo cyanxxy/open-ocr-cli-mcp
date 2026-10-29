@@ -52,7 +52,7 @@ function summaryFor(result: OcrJobResult): BatchSummary {
     mode: 'simple',
     provider: 'gemini',
     gateway: 'direct',
-    model: 'gemini-3.5-flash',
+    model: 'gemini-3.8-flash',
     usage,
     costLimitReached: false,
     results: [result],
@@ -342,7 +342,7 @@ describe('agent protocols', () => {
       provider: 'gemini',
       gateway: 'direct',
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       startedAt: timestamp,
       completedAt: timestamp,
       durationMs: 1,
@@ -380,7 +380,7 @@ describe('agent protocols', () => {
         provider: 'gemini',
         gateway: 'direct',
         mode: 'agentic',
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
         startedAt: timestamp,
         completedAt: timestamp,
         durationMs: 1,
@@ -420,7 +420,7 @@ describe('agent protocols', () => {
       provider: 'gemini',
       gateway: 'direct',
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       startedAt: timestamp,
       completedAt: timestamp,
       durationMs: 5,
@@ -499,7 +499,7 @@ describe('agent protocols', () => {
       provider: 'gemini',
       gateway: 'direct',
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       startedAt: timestamp,
       completedAt: timestamp,
       durationMs: 1,
@@ -600,7 +600,7 @@ describe('agent protocols', () => {
       .toEqual(['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif']);
     expect(geminiProvider?.reasoning?.fallbackLevels)
       .toEqual(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH']);
-    expect(geminiProvider?.reasoning?.byModel).toHaveProperty('gemini-3.5-flash');
+    expect(geminiProvider?.reasoning?.byModel).toHaveProperty('gemini-3.8-flash');
     expect(kimiProvider?.inputImageMimeTypes)
       .toEqual(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
     expect(museProvider?.inputImageMimeTypes)
@@ -636,7 +636,7 @@ describe('agent protocols', () => {
       provider: 'gemini',
       gateway: 'direct',
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       startedAt: timestamp,
       completedAt: timestamp,
       durationMs: 1,
@@ -675,7 +675,7 @@ describe('agent protocols', () => {
       provider: 'gemini',
       gateway: 'direct',
       mode: 'simple',
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       startedAt: timestamp,
       completedAt: timestamp,
       durationMs: 5,

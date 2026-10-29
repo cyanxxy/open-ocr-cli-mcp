@@ -266,7 +266,7 @@ describe('agentTools', () => {
       createMemory(),
       {
         apiKey: 'test-key',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.5-flash-lite',
         regionCropper: mockRegionCropper,
         regionStructuredExtractor: () => Promise.reject(failure),
       },
@@ -368,7 +368,7 @@ describe('agentTools', () => {
       createMemory('invoice'),
       {
         apiKey: 'test-key',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.5-flash-lite',
         thinkingConfig: {
           level: 'MINIMAL',
           includeThoughts: false,
@@ -419,7 +419,7 @@ describe('agentTools', () => {
       createMemory('invoice'),
       {
         apiKey: 'test-key',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.5-flash-lite',
         regionCropper: mockRegionCropper,
       },
     );
@@ -439,7 +439,7 @@ describe('agentTools', () => {
       createMemory('invoice'),
       {
         apiKey: 'test-key',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.5-flash-lite',
         regionCropper: mockRegionCropper,
       },
     );
@@ -455,7 +455,7 @@ describe('agentTools', () => {
       'data:application/pdf;base64,ZmFrZQ==',
       'application/pdf',
       createMemory('invoice'),
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
     );
 
     expect(result.success).toBe(false);

@@ -134,22 +134,21 @@ describe('Gemini error classification', () => {
 });
 
 describe('applyThinkingConfig', () => {
-  it('uses current Flash defaults and rejects minimal for 3.8 and 3.7 before sending', () => {
-    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash'] as const) {
+  it('uses current defaults and rejects minimal for 3.8 Flash and 4 Argon before sending', () => {
+    for (const model of ['gemini-3.8-flash', 'gemini-4-argon'] as const) {
       expect(applyThinkingConfig({}, model).thinkingConfig.thinkingLevel).toBe('MEDIUM');
       expect(() => applyThinkingConfig({}, model, { level: 'MINIMAL' })).toThrow('minimal is not supported');
     }
     expect(applyThinkingConfig({}, 'gemini-3.5-flash-lite').thinkingConfig.thinkingLevel).toBe('MINIMAL');
-    expect(applyThinkingConfig({}, 'gemini-3.6-flash', { level: 'MINIMAL' }).thinkingConfig.thinkingLevel).toBe('MINIMAL');
   });
   it('defaults thinking by model family when no config is provided', () => {
-    expect(applyThinkingConfig({}, 'gemini-3.1-pro-preview').thinkingConfig).toEqual({
-      thinkingLevel: 'HIGH',
-    });
-    expect(applyThinkingConfig({}, 'gemini-3.5-flash').thinkingConfig).toEqual({
+    expect(applyThinkingConfig({}, 'gemini-4-argon').thinkingConfig).toEqual({
       thinkingLevel: 'MEDIUM',
     });
-    expect(applyThinkingConfig({}, 'gemini-3.1-flash-lite').thinkingConfig).toEqual({
+    expect(applyThinkingConfig({}, 'gemini-3.8-flash').thinkingConfig).toEqual({
+      thinkingLevel: 'MEDIUM',
+    });
+    expect(applyThinkingConfig({}, 'gemini-3.5-flash-lite').thinkingConfig).toEqual({
       thinkingLevel: 'MINIMAL',
     });
   });
@@ -157,7 +156,7 @@ describe('applyThinkingConfig', () => {
   it('uses the SDK thinking enum and preserves the base config', () => {
     const result = applyThinkingConfig(
       { temperature: 0.2 },
-      'gemini-3-flash-preview',
+      'gemini-3.5-flash-lite',
       { level: 'MEDIUM', includeThoughts: true },
     );
     expect(result).toEqual({
@@ -166,17 +165,14 @@ describe('applyThinkingConfig', () => {
     });
   });
 
-  it('allows minimal on Flash models but rejects it on Pro instead of silently upgrading it', () => {
-    const flash = applyThinkingConfig({}, 'gemini-3.5-flash', { level: 'MINIMAL' });
-    expect(flash.thinkingConfig.thinkingLevel).toBe('MINIMAL');
-
-    const lite = applyThinkingConfig({}, 'gemini-3.1-flash-lite', { level: 'MINIMAL' });
+  it('allows minimal on Flash-Lite but rejects it on Argon instead of silently upgrading it', () => {
+    const lite = applyThinkingConfig({}, 'gemini-3.5-flash-lite', { level: 'MINIMAL' });
     expect(lite.thinkingConfig.thinkingLevel).toBe('MINIMAL');
 
     expect(() => applyThinkingConfig(
       {},
-      'gemini-3.1-pro-preview',
+      'gemini-4-argon',
       { level: 'MINIMAL' },
-    )).toThrow('gemini-3.1-pro-preview supports thinking levels low, medium, high');
+    )).toThrow('gemini-4-argon supports thinking levels low, medium, high');
   });
 });

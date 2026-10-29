@@ -12,7 +12,7 @@ import { OcrError, OcrErrorType } from './types';
 import { getGeminiUsage, resetGeminiUsage } from './usage';
 
 const FILE_DATA = 'data:image/png;base64,ZmFrZQ==';
-const CLIENT = { apiKey: 'k', model: 'gemini-3.5-flash' as const };
+const CLIENT = { apiKey: 'k', model: 'gemini-3.8-flash' as const };
 
 function mockGenerate(response: unknown) {
   const generateContent = vi.fn<(request: {
@@ -40,7 +40,7 @@ describe('extractTextFromFile — output contract', () => {
     await extractTextFromFile(FILE_DATA, 'image/png', CLIENT, undefined, { outputFormat: 'json' });
 
     const call = generateContent.mock.calls[0][0];
-    expect(call.model).toBe('gemini-3.5-flash');
+    expect(call.model).toBe('gemini-3.8-flash');
     const promptText = call.contents[0].parts[0].text as string;
     expect(promptText).toMatch(/structured JSON/i);
     expect(promptText).not.toMatch(/clean markdown/i);

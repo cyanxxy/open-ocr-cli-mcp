@@ -57,7 +57,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -78,7 +78,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -98,7 +98,7 @@ describe('agentLoop', () => {
     });
     const { memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(), FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
     expect(mockExecuteAgentTurn).toHaveBeenCalledTimes(3);
@@ -116,7 +116,7 @@ describe('agentLoop', () => {
     });
     const { memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(), FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
     expect(mockExecuteAgentTurn).toHaveBeenCalledTimes(2);
@@ -129,7 +129,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -146,7 +146,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -161,7 +161,7 @@ describe('agentLoop', () => {
     await expect(drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG, throwOnFailure: true },
     ))).rejects.toThrow('API key invalid');
   });
@@ -172,7 +172,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -188,7 +188,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -206,7 +206,7 @@ describe('agentLoop', () => {
     const { steps, memory } = await drainLoop(agentLoop(
       FIXTURE_FILE(),
       FIXTURE_DATA,
-      { apiKey: 'test-key', model: 'gemini-3-flash-preview', abortSignal: controller.signal },
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite', abortSignal: controller.signal },
       { maxIterations: 3, ...BASE_CONFIG },
     ));
 
@@ -228,7 +228,7 @@ describe('agentLoop', () => {
       });
       const pending = drainLoop(agentLoop(
         FIXTURE_FILE(), FIXTURE_DATA,
-        { apiKey: 'test-key', model: 'gemini-3-flash-preview' },
+        { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
         { maxIterations: 3, ...BASE_CONFIG, maxDurationMs: 25, throwOnFailure: true },
       ));
       await vi.advanceTimersByTimeAsync(25);

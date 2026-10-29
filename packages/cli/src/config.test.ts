@@ -67,13 +67,13 @@ describe('CLI configuration', () => {
 
   it('lets CLI flags override environment and file configuration', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    process.env.OPEN_OCR_MODEL = 'gemini-3-flash-preview';
+    process.env.OPEN_OCR_MODEL = 'gemini-3.5-flash-lite';
     const options = resolveCliOptions(
-      { model: 'gemini-3.1-pro-preview', thinking: 'high', concurrency: '6' },
-      { model: 'gemini-3.1-flash-lite', thinking: 'LOW', concurrency: 3 },
+      { model: 'gemini-4-argon', thinking: 'high', concurrency: '6' },
+      { model: 'gemini-3.5-flash-lite', thinking: 'LOW', concurrency: 3 },
       '/workspace',
     );
-    expect(options.model).toBe('gemini-3.1-pro-preview');
+    expect(options.model).toBe('gemini-4-argon');
     expect(options.thinking).toBe('HIGH');
     expect(options.concurrency).toBe(6);
   });
@@ -253,7 +253,7 @@ describe('CLI configuration', () => {
   it('does not carry provider-coupled settings across a provider switch', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     const options = resolveCliOptions({ provider: 'kimi' }, {
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-3.5-flash-lite',
       apiKeyEnv: 'GEMINI_API_KEY',
       baseUrl: 'https://gemini.example/v1',
       thinking: 'MINIMAL',
@@ -273,19 +273,16 @@ describe('CLI configuration', () => {
     });
   });
 
-  it('does not invent effort tiers for direct Kimi models with boolean or mandatory thinking', () => {
+  it('applies the K3-series effort contract to Kimi K3.1 Pro', () => {
     expect(resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.7-code', dryRun: true,
-    }, {}, '/workspace')).toMatchObject({ thinking: 'HIGH' });
-    expect(() => resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.7-code', thinking: 'low', dryRun: true,
-    }, {}, '/workspace')).toThrow('does not expose configurable reasoning effort');
+      provider: 'kimi', model: 'kimi-k3.1-pro', dryRun: true,
+    }, {}, '/workspace')).toMatchObject({ thinking: 'MAX' });
     expect(resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.6', thinking: 'minimal', dryRun: true,
-    }, {}, '/workspace')).toMatchObject({ thinking: 'MINIMAL' });
+      provider: 'kimi', model: 'kimi-k3.1-pro', thinking: 'minimal', dryRun: true,
+    }, {}, '/workspace')).toMatchObject({ thinking: 'LOW' });
     expect(() => resolveCliOptions({
-      provider: 'kimi', model: 'kimi-k2.6', thinking: 'medium', dryRun: true,
-    }, {}, '/workspace')).toThrow('instant mode');
+      provider: 'kimi', model: 'kimi-k3.1-pro', thinking: 'medium', dryRun: true,
+    }, {}, '/workspace')).toThrow('low, high, or max');
   });
 
   it('does not carry a direct base URL across a gateway switch', () => {
@@ -543,16 +540,15 @@ describe('CLI configuration', () => {
 
   it('preserves an explicit minimal effort for agentic Flash models that support it', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    expect(resolveCliOptions({ model: 'gemini-3.6-flash', mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
+    expect(resolveCliOptions({ model: 'gemini-3.5-flash-lite', mode: 'agentic', thinking: 'minimal' }, {}, '/workspace').thinking).toBe('MINIMAL');
   });
 
-  it('uses model-aware Gemini defaults and rejects unsupported Pro minimal effort', () => {
+  it('uses model-aware Gemini defaults and rejects unsupported Argon minimal effort', () => {
     process.env.GEMINI_API_KEY = 'test-key';
-    expect(resolveCliOptions({ model: 'gemini-3.1-flash-lite' }, {}, '/workspace').thinking).toBe('MINIMAL');
-    expect(resolveCliOptions({ model: 'gemini-3-flash-preview' }, {}, '/workspace').thinking).toBe('HIGH');
-    expect(resolveCliOptions({ model: 'gemini-3.1-pro-preview' }, {}, '/workspace').thinking).toBe('HIGH');
+    expect(resolveCliOptions({ model: 'gemini-3.5-flash-lite' }, {}, '/workspace').thinking).toBe('MINIMAL');
+    expect(resolveCliOptions({ model: 'gemini-4-argon' }, {}, '/workspace').thinking).toBe('MEDIUM');
     expect(() => resolveCliOptions(
-      { model: 'gemini-3.1-pro-preview', thinking: 'minimal' },
+      { model: 'gemini-4-argon', thinking: 'minimal' },
       {},
       '/workspace',
     )).toThrow('minimal is not supported');

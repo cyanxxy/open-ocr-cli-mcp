@@ -16,7 +16,7 @@ function config(overrides: Partial<ProviderRuntimeConfig> = {}): ProviderRuntime
     gateway: 'direct',
     apiKey: 'secret',
     apiKeyEnv: 'OPENROUTER_API_KEY',
-    model: 'google/gemini-3.5-flash',
+    model: 'google/gemini-3.8-flash',
     baseUrl: 'https://openrouter.ai/api/v1',
     thinkingConfig: { level: 'MEDIUM', includeThoughts: false },
     ...overrides,

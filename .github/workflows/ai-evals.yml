@@ -80,7 +80,7 @@ jobs:
         env:
           EVAL_PROVIDER: openrouter
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPEN_OCR_MODEL: moonshotai/kimi-k3
+          OPEN_OCR_MODEL: anthropic/claude-sonnet-5.5
 
       - name: Run Muse live canary
         if: ${{ steps.credentials.outputs.muse == 'true' }}

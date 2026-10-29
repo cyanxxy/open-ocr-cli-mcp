@@ -42,7 +42,7 @@ function batchSummary(results: SummaryResult[], overrides: Record<string, unknow
     // status no longer guesses gemini/direct when it is absent.
     provider: 'gemini',
     gateway: 'direct',
-    model: 'gemini-3.5-flash',
+    model: 'gemini-3.8-flash',
     usage,
     costLimitReached: false,
     results,
@@ -96,7 +96,7 @@ describe('CLI batch status', () => {
     const report = await inspectBatchStatus('.', directory);
     expect(report).toMatchObject({ healthy: true, summaryPresent: true, manifestPresent: false });
     expect(renderBatchStatus(report)).toContain('120 tokens');
-    expect(renderBatchStatus(report)).toContain('gemini/gemini-3.5-flash via direct');
+    expect(renderBatchStatus(report)).toContain('gemini/gemini-3.8-flash via direct');
   });
 
   it('reports a directory at an artifact path as missing output', async () => {

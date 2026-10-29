@@ -1,5 +1,66 @@
 # Changelog
 
+## 4.3.0 - 2026-10-29
+
+The 4.2.0 tag was created, but its release run failed before publishing, so
+4.2.0 never reached npm, GHCR, or GitHub Releases. 4.3.0 is the first published
+release with the 4.2.0 changes listed below it.
+
+### Changed
+
+- Gemini now offers three models: `gemini-3.8-flash` (default),
+  `gemini-4-argon`, and `gemini-3.5-flash-lite`. A config or `--model` naming
+  any other Gemini model fails with `CONFIG_INVALID`.
+  - `gemini-3.7-flash` and `gemini-3.5-flash` were removed because Google now
+    routes them to 3.8 Flash and 3.6 Flash.
+  - `gemini-3.6-flash` and `gemini-3-flash-preview` were removed (Google
+    recommends 3.6 Flash in place of the preview).
+  - `gemini-3.1-flash-lite` (shuts down 2027-05-07) and
+    `gemini-3.1-pro-preview` were also removed.
+- `gemini-4-argon` accepts thinking `low`, `medium` (default), or `high`.
+  Cost is estimated at $2 / $0.10 cached / $10 per million tokens through
+  2026-11-30, and $4 / $0.20 / $20 from 2026-12-01 (UTC).
+- Kimi offers `kimi-k3` (default), `kimi-k3.1-pro`, and
+  `kimi-k3.1-pro-highspeed`. The K3.1 models use K3's `low`/`high`/`max`
+  effort (default `max`). K2 models (`kimi-k2.7-code`, `-highspeed`,
+  `kimi-k2.6`) were removed: Kimi closes them to new accounts on 2026-10-31
+  and retires them by the end of December 2026.
+- Muse offers `muse-spark-1.3` (default) and `muse-wonder-1.0` (preview,
+  `minimal` to `max`). Spark 1.1 and 1.2 were removed; only the 1.3
+  contributor variant keeps a built-in price.
+- OpenRouter's suggested routes are now only the current models that read
+  images and PDFs natively: the three Gemini models, Muse
+  Spark 1.3 and Wonder, GPT-6.1 Sol and Terra, GPT-6 Luna and Astra, Claude
+  Opus/Sonnet/Haiku 5.5 and Fable 5.1, Grok 4.7, and Mistral Medium 3.5. Each
+  route validates thinking against OpenRouter's published efforts and default.
+  `moonshotai/kimi-*` routes are no longer suggested (Kimi has no native PDF
+  input there); an explicit model ID still works. The OpenRouter eval canary
+  and examples use `anthropic/claude-sonnet-5.5`.
+
+### Added
+
+- Evals: an olmOCR-bench subset (ODC-BY 1.0, pinned revision and checksums)
+  installed by `npm run evals:setup`. It adds 20 single-page PDFs from old
+  scans, multi-column, tiny-text, and table categories, the first public cases
+  that exercise native PDF input. Their verified pass/fail checks are scored as
+  the new `unit_test_pass_rate` metric through `reference.unitTestsPath`.
+
+### Fixed
+
+- OpenRouter requests send `max_tokens` instead of `max_completion_tokens`.
+  Gemini, Muse, and Kimi endpoints list only `max_tokens`, so structured and
+  tool requests (which set `require_parameters`) could find no endpoint.
+- `kimi-k3.1-pro` used to receive the K2 `thinking` toggle instead of
+  `reasoning_effort`.
+- Fallback cost estimates: Claude Sonnet 5.5 cached input ($0.10, was $0.20)
+  and OpenRouter Kimi K3 (Moonshot's $3 / $0.30 / $15). OpenRouter's reported
+  `usage.cost` still takes precedence.
+- CI now builds the release notes for the current version on every pull
+  request, so a changelog section that the release workflow would reject fails
+  before merge instead of after tagging.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.1.0...v4.3.0)
+
 ## 4.2.0 - 2026-10-28
 
 ### Security
@@ -49,6 +110,8 @@ those settings to your user config, a `--config` file, or flags.
   first and last 5,000 characters) becomes a compact list of failures and of
   the artifacts already produced, so they are not re-run; the JSON text mirror
   of a successful result collapses to a summary above 40,000 characters.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.1.0...v4.2.0)
 
 ## 4.1.0 - 2026-10-03
 

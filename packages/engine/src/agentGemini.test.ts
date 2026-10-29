@@ -123,7 +123,7 @@ describe('executeAgentTurn', () => {
       memory,
       {
         apiKey: 'test-key',
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
       },
       {
         maxIterations: 4,
@@ -136,7 +136,7 @@ describe('executeAgentTurn', () => {
     expect(result.finished).toBe(true);
     expect(mockRunModelInteraction).toHaveBeenCalledTimes(1);
     expect(mockRunModelInteraction).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       store: true,
       input: [transcript[0]],
       systemInstruction: 'system prompt',
@@ -175,7 +175,7 @@ describe('executeAgentTurn', () => {
       createMemory(),
       {
         apiKey: 'test-key',
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
       },
       {
         maxIterations: 4,
@@ -192,7 +192,7 @@ describe('executeAgentTurn', () => {
       store: true,
     }));
     expect(mockRunModelInteraction).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       systemInstruction: 'system prompt',
       tools: expect.any(Array) as unknown,
       generationConfig: expect.objectContaining({ thinking_level: 'medium' }) as unknown,
@@ -296,7 +296,7 @@ describe('executeAgentTurn', () => {
       memory,
       {
         apiKey: 'test-key',
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
       },
       {
         maxIterations: 4,
@@ -357,7 +357,7 @@ describe('executeAgentTurn', () => {
     }));
     for (const [request] of mockRunModelInteraction.mock.calls) {
       expect(request).toEqual(expect.objectContaining({
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
         systemInstruction: 'system prompt',
         tools: expect.any(Array) as unknown,
         generationConfig: expect.objectContaining({ thinking_level: 'medium' }) as unknown,
@@ -410,7 +410,7 @@ describe('executeAgentTurn', () => {
       'data:image/png;base64,ZmFrZQ==',
       'image/png',
       memory,
-      { apiKey: 'test-key', model: 'gemini-3.5-flash' },
+      { apiKey: 'test-key', model: 'gemini-3.8-flash' },
       agentConfig,
       (step) => emittedSteps.push(step),
     )).rejects.toThrow('429 rate limit');
@@ -440,7 +440,7 @@ describe('executeAgentTurn', () => {
       'data:image/png;base64,ZmFrZQ==',
       'image/png',
       memory,
-      { apiKey: 'test-key', model: 'gemini-3.5-flash' },
+      { apiKey: 'test-key', model: 'gemini-3.8-flash' },
       agentConfig,
       vi.fn(),
     );
@@ -466,7 +466,7 @@ describe('executeAgentTurn', () => {
         '[PDF attachment removed — 0 KB]',
         'application/pdf',
         createMemory(),
-        { apiKey: 'test-key', model: 'gemini-3.5-flash' },
+        { apiKey: 'test-key', model: 'gemini-3.8-flash' },
         { maxIterations: 4, confidenceThreshold: 0.8, maxTokens: 1024 },
         vi.fn(),
       )).rejects.toThrow(`unsuccessful status "${status}"`);
@@ -489,7 +489,7 @@ describe('executeAgentTurn', () => {
       '[PDF attachment removed — 0 KB]',
       'application/pdf',
       createMemory(),
-      { apiKey: 'test-key', model: 'gemini-3.5-flash' },
+      { apiKey: 'test-key', model: 'gemini-3.8-flash' },
       { maxIterations: 4, confidenceThreshold: 0.8, maxTokens: 1024 },
       vi.fn(),
     )).rejects.toThrow(/requires action but returned no function call/i);

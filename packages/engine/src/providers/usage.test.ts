@@ -9,7 +9,7 @@ const openRouterConfig: ProviderRuntimeConfig = {
   gateway: 'direct',
   apiKey: 'secret',
   apiKeyEnv: 'OPENROUTER_API_KEY',
-  model: 'google/gemini-3.5-flash',
+  model: 'google/gemini-3.8-flash',
   baseUrl: 'https://openrouter.ai/api/v1',
 };
 
@@ -77,12 +77,12 @@ describe('provider usage accounting', () => {
     }, {
       ...openRouterConfig,
       provider: 'kimi',
-      model: 'kimi-k2.6',
+      model: 'kimi-k3.1-pro',
     });
 
     expect(getProviderUsage()).toMatchObject({
       cachedTokens: 250_000,
-      estimatedCostUsd: 1.1525,
+      estimatedCostUsd: 2.55,
     });
   });
 

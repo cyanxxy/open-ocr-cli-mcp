@@ -26,9 +26,10 @@ Rebuilding fixtures requires Poppler (`pdftoppm`) plus the Python packages in
 evaluation runs do not require Python or Poppler.
 
 - `canary`: 17 local cases, including three raster cases, plus the first five
-  selected cases from each installed public dataset.
+  selected CORD and OmniDocBench cases and two olmOCR-bench PDFs per category.
 - `full` (`npm run evals`): all 24 local cases and all installed public cases.
-- `benchmark`: only installed CORD and OmniDocBench cases; run setup first.
+- `benchmark`: only installed CORD, OmniDocBench, and olmOCR-bench cases; run
+  setup first.
 
 Set `EVAL_REPEATS` or pass `--repeat` to the canary, full, or benchmark command
 to collect 1–10 samples per case. `evals:stability` fixes the benchmark repeat
@@ -63,7 +64,7 @@ contains images and is suitable for comparing compatible vision endpoints.
 
 ```bash
 EVAL_PROVIDER=kimi npm run evals:canary
-EVAL_PROVIDER=openrouter OPEN_OCR_MODEL=moonshotai/kimi-k3 npm run evals:canary
+EVAL_PROVIDER=openrouter OPEN_OCR_MODEL=anthropic/claude-sonnet-5.5 npm run evals:canary
 ```
 
 `EVAL_GATEWAY=cloudflare` uses `CLOUDFLARE_ACCOUNT_ID` and
@@ -107,6 +108,16 @@ Text references produce:
 - Normalized edit similarity
 - Token coverage and unsupported-text rate
 
+Unit-test references (`reference.unitTestsPath`) produce `unit_test_pass_rate`:
+the share of olmOCR-style pass/fail checks the Markdown output satisfies. Text
+presence and absence use the smallest edit distance from the query to any
+substring of the output (`maxDiffs` allowed), reading order uses the same
+approximate matching for both spans, and table checks parse Markdown and HTML
+tables (including `rowspan`/`colspan`) to verify a cell's neighbors and headings.
+Normalization and table rules are ported from olmOCR (Apache-2.0); presence
+matching differs from its `partial_ratio`, so rates approximate, but do not
+reproduce, the official olmOCR-bench leaderboard.
+
 Structured references produce exact normalized field precision, recall, and
 F1, critical-field exact match, and table-cell F1. Table cells are compared as
 a multiset of `column:value` pairs so harmless row serialization differences do
@@ -133,11 +144,19 @@ stable unless intentionally publishing a new, documented benchmark corpus.
   selection). The manifest records that no machine-readable dataset license
   was declared when selected. The installer prints that notice and keeps
   downloaded files in the ignored local cache.
+- olmOCR-bench is used under ODC-BY 1.0. The installer checks each category's
+  test file against a pinned SHA-256 and selects five single-page PDFs (with at
+  least three verified tests) from each of `old_scans`, `multi_column`,
+  `long_tiny_text`, and `table_tests`, 20 PDFs in all. These are the only
+  public cases sent as PDFs rather than images. Math categories are skipped
+  because grading them needs a LaTeX renderer. `headers_footers` and all
+  `absent` tests are skipped because they reward dropping page headers,
+  footers, and page numbers, which this tool deliberately transcribes.
 
 Review upstream terms before sharing cached files. Attribution and source URLs
 are in `datasets.json`; `evals/cache/installed.json` records installed revisions,
-case counts, and installation time. Public cases currently score text only;
-saved parse annotations are not additional structured-quality benchmarks.
+case counts, and installation time. CORD and OmniDocBench cases score text
+only; saved parse annotations are not additional structured-quality benchmarks.
 
 ## Run artifacts
 

@@ -9,7 +9,8 @@ export type EvalMetricName =
   | 'field_recall'
   | 'field_f1'
   | 'critical_field_exact_match'
-  | 'table_cell_f1';
+  | 'table_cell_f1'
+  | 'unit_test_pass_rate';
 
 export type EvalMetricScores = Partial<Record<EvalMetricName, number>>;
 

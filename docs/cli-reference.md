@@ -32,7 +32,7 @@ Start with [invoice.schema.json](../examples/invoice.schema.json).
 ```bash
 open-ocr-cli extract scan.png --provider kimi
 open-ocr-cli extract scan.png --provider muse
-open-ocr-cli extract scan.png --provider openrouter --model moonshotai/kimi-k3
+open-ocr-cli extract scan.png --provider openrouter --model anthropic/claude-sonnet-5.5
 open-ocr-cli extract scan.png --provider openai-compatible \
   --base-url http://localhost:11434/v1 --model your-vision-model
 ```

@@ -15,6 +15,7 @@ import {
   type EvalSuiteConfig,
   type EvalSuiteName,
 } from '@open-ocr/engine/evals';
+import { isOcrUnitTest } from '@open-ocr/engine/evalUnitTests';
 
 const evalsDir = path.dirname(fileURLToPath(import.meta.url));
 export const repoRoot = path.resolve(evalsDir, '..');
@@ -66,6 +67,7 @@ export async function assertEvalInputsExist(evalCases: EvalCase[]): Promise<void
     await fs.access(absoluteInputPath);
     if (evalCase.reference?.textPath) await fs.access(path.resolve(repoRoot, evalCase.reference.textPath));
     if (evalCase.reference?.jsonPath) await fs.access(path.resolve(repoRoot, evalCase.reference.jsonPath));
+    if (evalCase.reference?.unitTestsPath) await fs.access(path.resolve(repoRoot, evalCase.reference.unitTestsPath));
   }
 }
 
@@ -82,6 +84,14 @@ export async function loadEvalGroundTruth(evalCase: EvalCase): Promise<EvalGroun
       throw new Error(`Eval reference JSON must be an object: ${evalCase.reference.jsonPath}`);
     }
     groundTruth.json = parsed as Record<string, unknown>;
+  }
+  if (evalCase.reference.unitTestsPath) {
+    const raw = await fs.readFile(path.resolve(repoRoot, evalCase.reference.unitTestsPath), 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(isOcrUnitTest)) {
+      throw new Error(`Eval unit tests must be a non-empty array of valid tests: ${evalCase.reference.unitTestsPath}`);
+    }
+    groundTruth.unitTests = parsed;
   }
   return groundTruth;
 }

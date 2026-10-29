@@ -52,6 +52,16 @@ jobs:
       - name: Test release automation
         run: node --test scripts/release-automation.test.mjs
 
+      # The release workflow rejects a version whose changelog section lacks
+      # headings or a comparison link; check it before merge, not after tagging.
+      - name: Check release notes for the current version
+        run: |
+          VERSION=$(node -p "require('./packages/cli/package.json').version")
+          # The script prefers GITHUB_REF_NAME (a tag in release runs); on a PR
+          # that is "<n>/merge", so point it at the version being released.
+          GITHUB_REF_NAME="v$VERSION" node scripts/assert-release-version.mjs
+          node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
+
       - name: Type check
         if: ${{ matrix.node-version == '24.x' }}
         run: npm run typecheck
