@@ -259,21 +259,30 @@ function parseMarkdownTables(content: string): TableData[] {
 
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
-/** Text outside markup: drops each `<...>` span, and an unterminated `<...` to the end. */
+/**
+ * Text outside markup: drops each `<...>` span (a `<br>` becomes a newline) and an
+ * unterminated `<...` to the end, so no tag fragment can survive.
+ */
 function stripTags(html: string): string {
   let text = '';
-  let inTag = false;
+  let tag: string | undefined;
   for (const character of html) {
-    if (inTag) inTag = character !== '>';
-    else if (character === '<') inTag = true;
-    else text += character;
+    if (tag === undefined) {
+      if (character === '<') tag = '';
+      else text += character;
+    } else if (character === '>') {
+      if (/^br\s*\/?$/i.test(tag)) text += '\n';
+      tag = undefined;
+    } else {
+      tag += character;
+    }
   }
   return text;
 }
 
 function htmlText(html: string): string {
   // Entities decode after tags are gone, so an escaped `&lt;` stays literal text.
-  return stripTags(html.replace(/<br\s*\/?>/gi, '\n'))
+  return stripTags(html)
     .replace(/&(#\d+|#x[\da-f]+|\w+);/gi, (entity, code: string) => {
       if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(Number.parseInt(code.slice(2), 16));
       if (code.startsWith('#')) return String.fromCodePoint(Number.parseInt(code.slice(1), 10));

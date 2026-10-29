@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.3.0 - 2026-10-28
+## 4.3.0 - 2026-10-29
 
 The 4.2.0 tag was created, but its release run failed before publishing, so
 4.2.0 never reached npm, GHCR, or GitHub Releases. 4.3.0 is the first published
