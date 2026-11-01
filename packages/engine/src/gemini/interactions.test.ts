@@ -250,7 +250,7 @@ describe('runModelInteraction', () => {
     expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
   });
 
-  it('reports a unary interaction the SDK could not continue as truncated output', async () => {
+  it('disables automatic continuation for unary calls and reports requires_continuation as truncated output', async () => {
     mockInteractionCreate.mockResolvedValueOnce({
       id: 'unary-hop',
       status: 'requires_continuation',
@@ -262,7 +262,7 @@ describe('runModelInteraction', () => {
       model: 'gemini-3.8-flash',
       input: 'Extract text',
     })).rejects.toThrow('reached the output token limit');
-    expect(mockInteractionCreate.mock.calls[0]?.[0]).not.toHaveProperty('automatic_continuation');
+    expect(mockInteractionCreate.mock.calls[0]?.[0]).toMatchObject({ stream: false, automatic_continuation: false });
   });
 
   it('preserves output_text supplied only by the terminal streaming event', async () => {

@@ -463,9 +463,15 @@ export async function runModelInteraction({
 
   await waitForGeminiRequestSlot(abortSignal, runtime);
   if (!onProgress) {
-    const params: Interactions.CreateModelInteractionParamsNonStreaming = {
+    // Automatic continuation is disabled here as well. Each continuation hop
+    // re-prefills the conversation and generated prefix, so input tokens are
+    // billed again on every hop, and the hops run inside one SDK call where
+    // --max-cost cannot stop them. A `requires_continuation` stop is reported as
+    // truncated output instead, the same as before the SDK added the feature.
+    const params: Interactions.CreateModelInteractionParamsNonStreaming & AutomaticContinuationOption = {
       ...common,
       stream: false,
+      automatic_continuation: false,
     };
     const interaction = await withReadableProviderErrors(() => genAI.interactions.create(
       params,
@@ -476,9 +482,6 @@ export async function runModelInteraction({
       model,
       runtime,
     );
-    // Unary calls keep the SDK's default automatic continuation: it merges the
-    // hops into one Interaction (steps concatenated, usage summed), so only a
-    // continuation it could not finish reaches this check.
     assertInteractionNotTruncated(interaction.status);
     return {
       id: interaction.id,
