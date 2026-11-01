@@ -216,6 +216,17 @@ interface ParsedLocaleNumber {
 const GROUPING_SPACE = /[\s\u00a0\u202f'\u2019]/u;
 
 /**
+ * Currency abbreviations that are written with a trailing period, lower-cased
+ * ("Rs.", "Re.", "Fr.", "SFr.", "Bs.", "S/.", "B/.", "Kr.", "Dhs.", "Ksh.").
+ * The period ends the abbreviation; it is never a decimal point.
+ */
+const CURRENCY_ABBREVIATIONS = new Set([
+  'rs', 're', 'rp', 'fr', 'sfr', 'chf', 'bs', 'bss', 'bsf', 's/', 'b/', 'kr', 'dkr', 'skr', 'nkr', 'ikr',
+  'dh', 'dhs', 'ksh', 'kshs', 'sh', 'shs', 'ush', 'tsh', 'tk', 'ft', 'gs', 'br', 'esc', 'pts', 'ptas',
+  'lm', 'ls', 'lt', 'lei', 'z\u0142', 'k\u010d', 'din', 'rm',
+]);
+
+/**
  * Parse a human-formatted number that may use US ("1,234.56"), European
  * ("1.234,56"), space/apostrophe ("1 234,56", "1'234.56"), or plain ("1234")
  * grouping/decimal conventions, with currency symbols or codes around it.
@@ -229,12 +240,16 @@ const GROUPING_SPACE = /[\s\u00a0\u202f'\u2019]/u;
  * ("3 @ 5.00"), irregular grouping ("1,23,4"), and the like. The one guess that
  * is made, a single separator followed by exactly three digits ("1.234"), is
  * reported through `ambiguity` so the caller can warn about it.
+ *
+ * A "." right after a known currency abbreviation ("Rs.500", "S/.100") ends
+ * the abbreviation. Any other separator right after letters ("No.5", "USD.50")
+ * returns 'separator-after-letters' instead of being read as a decimal point.
  */
 function parseLocaleNumber(
   raw: string,
   mode: 'number' | 'currency',
   threeDecimalCurrency: boolean,
-): ParsedLocaleNumber | null {
+): ParsedLocaleNumber | 'separator-after-letters' | null {
   const text = raw.normalize('NFKC').replace(/[\u2212\ufe63\uff0d]/gu, '-').trim();
   const cores = text.match(/\d(?:[\d.,\s\u00a0\u202f'\u2019]*\d)?/gu);
   if (!cores || cores.length !== 1) return null;
@@ -243,11 +258,23 @@ function parseLocaleNumber(
   let prefix = text.slice(0, coreStart);
   const suffix = text.slice(coreStart + core.length);
 
-  // ".5" / ",5": the separator sits outside the digit run.
+  // ".5" / ",5": the separator sits outside the digit run. A separator right
+  // after letters (or "S/.") is never a decimal point: it ends a currency
+  // abbreviation ("Rs.500", "Fr.25", "S/.100"), which is dropped, or it is
+  // something else ("No.5"), which is not guessed at.
   const leadingSeparator = /[.,]$/u.exec(prefix);
   if (leadingSeparator) {
-    prefix = prefix.slice(0, -1);
-    core = `0${leadingSeparator[0]}${core}`;
+    const beforeSeparator = prefix.slice(0, -1);
+    const word = /[\p{L}/]+$/u.exec(beforeSeparator)?.[0];
+    if (word !== undefined) {
+      if (leadingSeparator[0] !== '.' || !CURRENCY_ABBREVIATIONS.has(word.toLocaleLowerCase('en'))) {
+        return 'separator-after-letters';
+      }
+      prefix = beforeSeparator;
+    } else {
+      prefix = beforeSeparator;
+      core = `0${leadingSeparator[0]}${core}`;
+    }
   }
 
   const negative = prefix.includes('-')
@@ -380,6 +407,10 @@ export function normalizeFieldValue(
       return type === 'number' ? value : formatAmount(value, Math.min(6, decimalsOf(value)), threeDecimal);
     }
     const parsed = parseLocaleNumber(text, type, threeDecimal);
+    if (parsed === 'separator-after-letters') {
+      warn(`${label}: "${text}" has a separator directly after letters, which is not read as a decimal point; kept as text.`);
+      return text;
+    }
     if (!parsed) {
       if (type === 'currency' && /\d/u.test(text)) {
         warn(`${label}: "${text}" could not be read as a single amount; kept as text.`);
@@ -596,7 +627,85 @@ export function normalizePresetPayload(
 
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/u;
 const EMAIL = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/u;
-const URL_SCHEME = /^([a-z][a-z0-9+.-]*):(.*)$/isu;
+/** A scheme-like prefix: everything before the first ":" that holds no "/", "?", or "#". */
+const URL_SCHEME_PREFIX = /^([^:/?#]*):(.*)$/su;
+const DNS_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/iu;
+const DOTTED_QUAD = /^\d{1,3}(?:\.\d{1,3}){3}$/u;
+
+/**
+ * Whether a parsed hostname names a real host for a value written without a
+ * scheme: `localhost`, a dotted-quad or bracketed IPv6 literal, or a DNS name
+ * with at least two labels and an alphabetic (or punycode) top-level label.
+ * `written` is the lower-cased text as written, so the URL parser's
+ * numeric-host rewriting ("12345" -> 0.0.48.57) never turns a number into an
+ * address.
+ */
+function isRealHostname(hostname: string, written: string): boolean {
+  if (hostname === 'localhost') return true;
+  if (/^\[[0-9a-f:.]+\]$/iu.test(hostname)) return true;
+  if (DOTTED_QUAD.test(hostname)) return written.startsWith(hostname);
+  const labels = hostname.split('.');
+  if (labels.length < 2 || !labels.every((label) => DNS_LABEL.test(label))) return false;
+  const tld = labels[labels.length - 1];
+  return /^[a-z]{2,63}$/iu.test(tld) || /^xn--[a-z0-9-]+$/iu.test(tld);
+}
+
+type UrlVerdict = { ok: true } | { ok: false; scheme?: string };
+
+/** The scheme a prefix names, for the warning; a dotted prefix is a host, not a scheme. */
+function schemeOf(prefix: RegExpExecArray | null): { scheme?: string } {
+  if (!prefix || !/^[a-z][a-z0-9+-]*$/iu.test(prefix[1])) return {};
+  return { scheme: prefix[1].toLowerCase() };
+}
+
+/**
+ * Decide whether a url-typed value is safe to keep. Only two shapes are kept:
+ * an absolute http(s) URL whose scheme is written plainly at the start, and a
+ * scheme-less `host[:port][/path]` whose host parses as a real host name.
+ * Everything else — `javascript:`, `data:`, `vbscript:`, `file:` in any case
+ * mix, whitespace or control characters hidden in the scheme ("java\tscript:"),
+ * a remainder that merely starts with a digit ("javascript:1;alert(1)"), or
+ * text that is not a URL at all — is rejected, because a consumer that renders
+ * the value as a link would execute or open it.
+ */
+function judgeUrl(value: string): UrlVerdict {
+  const trimmed = value.trim();
+  // Browsers ignore ASCII whitespace and control characters inside a scheme
+  // ("java\tscript:"), so the scheme is identified with them removed.
+  // eslint-disable-next-line no-control-regex
+  const compact = trimmed.replace(/[\u0000- \u007f]/gu, '');
+  // eslint-disable-next-line no-control-regex
+  const hasControl = /[\u0000-\u001f\u007f-\u009f]/u.test(trimmed);
+  const prefix = URL_SCHEME_PREFIX.exec(compact);
+
+  if (prefix && /^https?$/iu.test(prefix[1])) {
+    // The scheme must be written plainly: "ht\ttp://" is not kept.
+    if (hasControl || !/^https?:\/\//iu.test(trimmed)) return { ok: false };
+    try {
+      const url = new URL(trimmed);
+      return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname !== '' ? { ok: true } : { ok: false };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  // Without an http(s) scheme the value must be a plain host[:port][/path]:
+  // no whitespace or control characters, starting with a host character, and,
+  // when a colon comes before any "/", a numeric port right after it
+  // ("localhost:3000", "example.com:8080/x").
+  if (hasControl || /\s/u.test(trimmed) || !/^[\p{L}\p{N}[]/u.test(trimmed)) return { ok: false, ...schemeOf(prefix) };
+  if (prefix && !/^\d{1,5}(?:[/?#]|$)/u.test(prefix[2])) return { ok: false, ...schemeOf(prefix) };
+  let url: URL;
+  try {
+    url = new URL(`http://${trimmed}`);
+  } catch {
+    return { ok: false, ...schemeOf(prefix) };
+  }
+  if (url.username !== '' || url.password !== '' || !isRealHostname(url.hostname, trimmed.toLowerCase())) {
+    return { ok: false, ...schemeOf(prefix) };
+  }
+  return { ok: true };
+}
 
 function isCalendarDate(year: number, month: number, day: number): boolean {
   if (month < 1 || month > 12 || day < 1) return false;
@@ -607,9 +716,10 @@ function isCalendarDate(year: number, month: number, day: number): boolean {
 /**
  * Check a normalized value against its declared type. Values that merely look
  * wrong (an ambiguous `12/01/26` date, a malformed email) are kept with a
- * warning: the document may genuinely print them that way. A URL with a scheme
- * other than http(s) — `javascript:`, `data:`, `file:` — is dropped to null,
- * because a consumer that renders it as a link would execute or open it.
+ * warning: the document may genuinely print them that way. A URL is stricter:
+ * anything but an http(s) URL or a plain host name (see judgeUrl) is dropped
+ * to null, because a consumer that renders it as a link would execute or open
+ * it.
  */
 function checkTypedValue(rule: ExtractionRule, value: PrimitiveFieldValue, warnings: string[]): PrimitiveFieldValue {
   if (typeof value !== 'string' || value.trim() === '') return value;
@@ -627,30 +737,12 @@ function checkTypedValue(rule: ExtractionRule, value: PrimitiveFieldValue, warni
     return value;
   }
   if (rule.type === 'url') {
-    // Browsers ignore ASCII whitespace and control characters inside a scheme
-    // ("java\tscript:"), so the scheme is judged with them removed.
-    // eslint-disable-next-line no-control-regex
-    const compact = value.replace(/[\u0000- \u007f]/gu, '');
-    const scheme = URL_SCHEME.exec(compact);
-    // "example.com:8080/x" and "localhost:3000" are a host and port, not a scheme.
-    const isHostAndPort = scheme !== null && (scheme[1].includes('.') || /^\d/u.test(scheme[2]));
-    if (scheme && !isHostAndPort) {
-      const protocol = scheme[1].toLowerCase();
-      if (protocol !== 'http' && protocol !== 'https') {
-        warnings.push(`${label}: "${value}" uses the "${protocol}:" scheme; only http and https URLs are kept, so the value was set to null.`);
-        return null;
-      }
-      try {
-        new URL(compact);
-      } catch {
-        warnings.push(`${label}: "${value}" is not a valid URL.`);
-      }
-      return value;
-    }
-    if (!/^[^\s/?#]+\.[^\s/?#]{2,}(?:[/?#:]|$)/u.test(compact)) {
-      warnings.push(`${label}: "${value}" does not look like a URL.`);
-    }
-    return value;
+    const verdict = judgeUrl(value);
+    if (verdict.ok) return value;
+    warnings.push(verdict.scheme
+      ? `${label}: "${value}" uses the "${verdict.scheme}:" scheme; only http and https URLs are kept, so the value was set to null.`
+      : `${label}: "${value}" is not a valid http(s) URL or host name, so the value was set to null.`);
+    return null;
   }
   return value;
 }
