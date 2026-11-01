@@ -4,7 +4,8 @@ import path from 'node:path';
 import { GATEWAY_IDS, GEMINI_MODELS, PROVIDER_IDS } from '@open-ocr/engine/providers';
 import { batchMetadataError, CliExitError } from './errors';
 import { asRecord, isIsoTimestamp, isOneOf, parseBatchLockOwner } from './jsonValidation';
-import { artifactFileExists, parseCliManifest } from './manifest';
+import { artifactFileExists, parseCliManifest, parseUsageSnapshot } from './manifest';
+import { artifactPathKey, batchLockOwnerState, isTransactionFileName, type BatchLockState } from './output';
 import {
   CLI_MODES,
   type BatchSummary,
@@ -32,6 +33,12 @@ export interface BatchStatusEntry {
 export interface BatchStatusLock {
   path: string;
   ownerValid: boolean;
+  /**
+   * `live`: the owning process is running; `stale`: it is gone (or its PID was
+   * reused), and the next extract reclaims the lock automatically;
+   * `unverifiable`: another host owns it, or the owner record is invalid.
+   */
+  state: BatchLockState;
   pid?: number;
   hostname?: string;
   startedAt?: string;
@@ -45,6 +52,18 @@ export interface BatchStatusReport {
   manifestPresent: boolean;
   summaryPresent: boolean;
   activeLock?: BatchStatusLock;
+  /**
+   * Usage recorded across every run in this directory (the total `--max-cost`
+   * is enforced against on resume). Absent for manifests from older releases.
+   */
+  cumulativeUsage?: BatchSummary['usage'];
+  /**
+   * Artifact-shaped files (`.md`, `.json`, `.csv`) in the output directory
+   * that no manifest entry owns. A resume refuses to replace them.
+   */
+  untrackedArtifacts: string[];
+  /** Staging/backup leftovers (`*.<pid>-<uuid>.tmp|.bak`) of an interrupted write. */
+  strayTempFiles: string[];
   lastRun?: Pick<
     BatchSummary,
     | 'startedAt'
@@ -67,6 +86,10 @@ export interface BatchStatusReport {
     skipped: number;
     missingArtifacts: number;
     missingSources: number;
+    /** Manifest entries claimed by a run that never finished them. */
+    interrupted: number;
+    untrackedArtifacts: number;
+    strayTempFiles: number;
   };
   sourceDrift: boolean;
   healthy: boolean;
@@ -118,14 +141,15 @@ async function readBatchLockIfPresent(lockPath: string): Promise<BatchStatusLock
     value = JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    if (error instanceof SyntaxError) return { path: lockPath, ownerValid: false };
+    if (error instanceof SyntaxError) return { path: lockPath, ownerValid: false, state: 'unverifiable' };
     throw error;
   }
   const owner = parseBatchLockOwner(value);
-  if (!owner) return { path: lockPath, ownerValid: false };
+  if (!owner) return { path: lockPath, ownerValid: false, state: 'unverifiable' };
   return {
     path: lockPath,
     ownerValid: true,
+    state: batchLockOwnerState(owner),
     pid: owner.pid,
     hostname: owner.hostname,
     startedAt: owner.startedAt,
@@ -265,19 +289,45 @@ function parseSummary(value: unknown, summaryPath: string): ParsedSummary | unde
     provider,
     gateway,
     model,
-    usage: {
-      requests: usage.requests as number,
-      inputTokens: usage.inputTokens as number,
-      outputTokens: usage.outputTokens as number,
-      thoughtTokens: usage.thoughtTokens as number,
-      toolTokens: usage.toolTokens as number,
-      cachedTokens: usage.cachedTokens as number,
-      totalTokens: usage.totalTokens as number,
-      estimatedCostUsd: usage.estimatedCostUsd,
-    },
+    usage: parseUsageSnapshot(usage, `${summaryPath}: usage`)!,
     costLimitReached: record.costLimitReached,
     results,
   };
+}
+
+const METADATA_FILES = new Set(['.open-ocr-manifest.json', 'batch-summary.json', '.open-ocr.lock']);
+const ARTIFACT_EXTENSION = /\.(?:md|json|csv)$/iu;
+
+/** Walk the output directory for files the manifest does not account for. */
+async function scanOutputDirectory(
+  outputDirectory: string,
+  owned: ReadonlySet<string>,
+): Promise<{ untrackedArtifacts: string[]; strayTempFiles: string[] }> {
+  const untrackedArtifacts: string[] = [];
+  const strayTempFiles: string[] = [];
+  let entries: Array<{ name: string; parentPath?: string; path?: string; isFile(): boolean }>;
+  try {
+    entries = await fs.readdir(outputDirectory, { recursive: true, withFileTypes: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { untrackedArtifacts, strayTempFiles };
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const directory = entry.parentPath ?? entry.path ?? outputDirectory;
+    const filePath = path.join(directory, entry.name);
+    if (isTransactionFileName(entry.name)) {
+      strayTempFiles.push(filePath);
+      continue;
+    }
+    if (directory === outputDirectory && METADATA_FILES.has(entry.name)) continue;
+    if (!ARTIFACT_EXTENSION.test(entry.name)) continue;
+    if (!owned.has(artifactPathKey(filePath))) untrackedArtifacts.push(filePath);
+  }
+  untrackedArtifacts.sort((left, right) => left.localeCompare(right));
+  strayTempFiles.sort((left, right) => left.localeCompare(right));
+  return { untrackedArtifacts, strayTempFiles };
 }
 
 export async function inspectBatchStatus(
@@ -308,6 +358,11 @@ export async function inspectBatchStatus(
     ? undefined
     : parseCliManifest(manifestValue, manifestPath);
   const summary = parseSummary(summaryValue, summaryPath);
+  const owned = new Set<string>();
+  for (const entry of Object.values(manifest?.entries ?? {})) {
+    for (const file of [...entry.outputFiles, ...(entry.ownedFiles ?? [])]) owned.add(artifactPathKey(file));
+  }
+  const { untrackedArtifacts, strayTempFiles } = await scanOutputDirectory(outputDirectory, owned);
   const entries = await Promise.all(Object.entries(manifest?.entries ?? {}).map(async ([source, entry]) => {
     const missingOutputFiles = (await Promise.all(entry.outputFiles.map(async (file) => ({
       file,
@@ -344,6 +399,9 @@ export async function inspectBatchStatus(
     skipped: summaryCounts?.skipped ?? 0,
     missingArtifacts: entries.reduce((sum, entry) => sum + entry.missingOutputFiles.length, 0),
     missingSources: entries.filter((entry) => !entry.sourceExists).length,
+    interrupted: entries.filter((entry) => entry.status === 'pending').length,
+    untrackedArtifacts: untrackedArtifacts.length,
+    strayTempFiles: strayTempFiles.length,
   };
   const lastRunIncomplete = summary?.results.some((result) => (
     result.status === 'skipped'
@@ -368,6 +426,9 @@ export async function inspectBatchStatus(
     manifestPresent: manifest !== undefined,
     summaryPresent: summary !== undefined,
     ...(activeLock ? { activeLock } : {}),
+    ...(manifest?.usage ? { cumulativeUsage: manifest.usage } : {}),
+    untrackedArtifacts,
+    strayTempFiles,
     ...(summary ? {
       lastRun: {
         startedAt: summary.startedAt,
@@ -384,7 +445,11 @@ export async function inspectBatchStatus(
     } : {}),
     counts,
     sourceDrift: counts.missingSources > 0,
-    healthy: activeLock === undefined && !manifestHasProblems && !lastRunHasProblems,
+    healthy: activeLock === undefined
+      && !manifestHasProblems
+      && !lastRunHasProblems
+      && untrackedArtifacts.length === 0
+      && strayTempFiles.length === 0,
     entries,
   };
 }
@@ -400,16 +465,35 @@ export function renderBatchStatus(report: BatchStatusReport): string {
     const owner = report.activeLock.ownerValid
       ? `PID ${report.activeLock.pid} on ${report.activeLock.hostname}, started ${report.activeLock.startedAt}`
       : 'owner details are invalid or unavailable';
-    lines.push(`Batch lock: present (${owner})`);
+    const state = report.activeLock.state === 'live'
+      ? 'held by a running process'
+      : report.activeLock.state === 'stale'
+        ? 'stale; its owner is gone and the next extract reclaims it'
+        : 'cannot be verified from this host';
+    lines.push(`Batch lock: ${state} (${owner})`);
   }
+  if (report.counts.interrupted > 0) {
+    lines.push(`Interrupted: ${report.counts.interrupted} document(s) were being written when a run stopped; resume re-extracts them`);
+  }
+  if (report.untrackedArtifacts.length > 0) {
+    lines.push(`Untracked files: ${report.untrackedArtifacts.length} artifact-like file(s) no manifest entry owns; resume will not replace them`);
+  }
+  if (report.strayTempFiles.length > 0) {
+    lines.push(`Leftover temp files: ${report.strayTempFiles.length} (from an interrupted write; the next extract cleans them up)`);
+  }
+  const usageLine = (label: string, usage: BatchSummary['usage']): string => (
+    `${label}: ${usage.totalTokens} tokens, ${usage.requests} requests, estimated $${usage.estimatedCostUsd.toFixed(6)}`
+    + (usage.unreportedUsageRequests ? ` (${usage.unreportedUsageRequests} response(s) reported no usage)` : '')
+  );
   if (report.lastRun) {
     lines.push(
       `Last run: ${report.lastRun.completedAt} with ${report.lastRun.provider}/${report.lastRun.model} via ${report.lastRun.gateway} in ${report.lastRun.mode} mode`,
-      `Usage: ${report.lastRun.usage.totalTokens} tokens, ${report.lastRun.usage.requests} requests, estimated $${report.lastRun.usage.estimatedCostUsd.toFixed(6)}`,
+      usageLine('Usage (last run)', report.lastRun.usage),
     );
     if (report.lastRun.costLimitReached) lines.push('Last run stopped at its estimated cost limit.');
     else if (report.lastRun.incomplete) lines.push('Last run did not schedule or complete every document.');
   }
+  if (report.cumulativeUsage) lines.push(usageLine('Usage (all runs)', report.cumulativeUsage));
   const issues = report.entries.filter((entry) => (
     entry.status !== 'succeeded' || entry.missingOutputFiles.length > 0
   ));
@@ -425,6 +509,15 @@ export function renderBatchStatus(report: BatchStatusReport): string {
     }
     if (issues.length > 20) lines.push(`  - …and ${issues.length - 20} more`);
   }
+  for (const [heading, files] of [
+    ['Untracked artifact files:', report.untrackedArtifacts],
+    ['Leftover temp files:', report.strayTempFiles],
+  ] as const) {
+    if (files.length === 0) continue;
+    lines.push('', heading);
+    for (const file of files.slice(0, 20)) lines.push(`  - ${file}`);
+    if (files.length > 20) lines.push(`  - …and ${files.length - 20} more`);
+  }
   const sourceWarnings = report.entries.filter((entry) => (
     entry.sourceKind === 'path' && !entry.sourceExists
   ));
@@ -433,9 +526,13 @@ export function renderBatchStatus(report: BatchStatusReport): string {
     for (const entry of sourceWarnings.slice(0, 20)) lines.push(`  - ${entry.source}: missing or moved`);
     if (sourceWarnings.length > 20) lines.push(`  - …and ${sourceWarnings.length - 20} more`);
   }
-  const status = report.activeLock
-    ? 'Status: batch in progress or stale lock'
-    : report.healthy ? 'Status: healthy' : 'Status: attention required';
+  const status = report.activeLock?.state === 'live'
+    ? 'Status: batch in progress'
+    : report.activeLock?.state === 'stale'
+      ? 'Status: interrupted (stale lock)'
+      : report.activeLock
+        ? 'Status: batch in progress or stale lock'
+        : report.healthy ? 'Status: healthy' : 'Status: attention required';
   lines.push('', status);
   return `${lines.join('\n')}\n`;
 }

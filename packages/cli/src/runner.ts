@@ -287,9 +287,9 @@ async function extractWithRetries(
   const result = await runWithProviderRetries(
     options,
     signal,
-    async () => {
+    async (attemptSignal) => {
       try {
-        return await extractOnce(input, options, signal, onStep, runtime, budgetDeadline);
+        return await extractOnce(input, options, attemptSignal, onStep, runtime, budgetDeadline);
       } catch (error) {
         // A malformed model answer (not JSON, wrong shape, no text) is typed
         // OUTPUT_INVALID by the engine. Typing it here as well lets --retries
@@ -301,6 +301,7 @@ async function extractWithRetries(
         throw error;
       }
     },
+    { deadlineMs: budgetDeadline },
   );
   return { artifacts: result.value, attempts: result.attempts };
 }

@@ -7,6 +7,7 @@ import {
   type ProviderErrorPayload,
   type ProviderErrorSubject,
 } from '@open-ocr/engine/gemini/errorPayload';
+import { isQuotaExhaustedError } from '@open-ocr/engine/providers/retry';
 
 /**
  * Redaction is defined beside the provider-body reader so the engine renders
@@ -365,6 +366,17 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     }
     if (structuredCode === 'PERMISSION_DENIED' || structuredCode === 'PERMISSION_DENIED_ERROR') {
       return { code: 'PERMISSION_DENIED', category: 'authorization', retryable: false, hint: 'Verify that the credential and project are allowed to use this model or operation.' };
+    }
+    // Account-level quota/credit exhaustion (OpenAI `insufficient_quota`, HTTP
+    // 402, a Gemini per-day quota) arrives as a 429 or RESOURCE_EXHAUSTED, but
+    // no retry can clear it: say so instead of "retry later".
+    if (isQuotaExhaustedError(current)) {
+      return {
+        code: 'RATE_LIMITED',
+        category: 'provider',
+        retryable: false,
+        hint: 'Check the provider account balance and quota before retrying.',
+      };
     }
     if (
       structuredCode === 'RESOURCE_EXHAUSTED'

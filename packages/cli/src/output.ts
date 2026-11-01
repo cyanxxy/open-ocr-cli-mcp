@@ -1,8 +1,10 @@
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 
+import type { ProviderUsageSnapshot } from '@open-ocr/engine/providers';
 import { parseBatchLockOwner, type BatchLockOwner } from './jsonValidation';
 import { batchMetadataError, CliExitError } from './errors';
 import { artifactFileExists, parseCliManifest } from './manifest';
@@ -17,7 +19,13 @@ import type {
 
 const EMPTY_MANIFEST: CliManifest = { version: 1, entries: {} };
 
-const OUTPUT_CONFLICT_HINT = 'Choose a new output path or resume a matching job.';
+const OUTPUT_CONFLICT_HINT = 'Choose a new output path, pass --overwrite to replace the existing file(s), '
+  + 'or rerun the job that wrote them to resume it.';
+
+/** `--no-resume` turns ownership off, so "resume a matching job" cannot be the remedy. */
+const RESUME_DISABLED_CONFLICT_HINT = 'This run has resume disabled, so existing artifacts are never reused or replaced. '
+  + 'Drop --no-resume to resume the job that wrote them, pass --overwrite to re-extract and replace them, '
+  + 'or choose a new --output directory.';
 
 function outputConflict(message: string, cause?: unknown, hint = OUTPUT_CONFLICT_HINT): CliExitError {
   return new CliExitError(message, 2, {
@@ -31,6 +39,64 @@ function outputConflict(message: string, cause?: unknown, hint = OUTPUT_CONFLICT
 
 export interface BatchLockAcquireOptions {
   onWarning?: (message: string) => void;
+}
+
+/**
+ * A stable identity for one process lifetime, so a lock whose PID has since
+ * been reused by an unrelated process is recognised as stale instead of
+ * looking in use forever. Undefined where the platform gives no way to read it.
+ */
+export function processStartIdentity(pid: number): string | undefined {
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // Field 22 (starttime) counted after the parenthesised command name,
+      // which may itself contain spaces or parentheses.
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const startTicks = fields[19];
+      if (!startTicks || !/^\d+$/u.test(startTicks)) return undefined;
+      let bootId = '';
+      try {
+        bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      } catch {
+        // Containers may hide boot_id; start ticks alone still separate PIDs.
+      }
+      return `linux:${bootId}:${startTicks}`;
+    }
+    if (process.platform === 'win32') return undefined;
+    const started = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim();
+    return started ? `ps:${started}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let ownProcessStart: string | undefined | null = null;
+function currentProcessStartIdentity(): string | undefined {
+  if (ownProcessStart === null) ownProcessStart = processStartIdentity(process.pid);
+  return ownProcessStart;
+}
+
+/**
+ * What a lock owner record means from this host:
+ * - `live`: the owning process is running (or cannot be told apart from it).
+ * - `stale`: the owner is provably gone, or its PID now belongs to another process.
+ * - `unverifiable`: a different host owns it; only an operator can check.
+ */
+export type BatchLockState = 'live' | 'stale' | 'unverifiable';
+
+export function batchLockOwnerState(owner: BatchLockOwner): BatchLockState {
+  if (owner.hostname !== hostname()) return 'unverifiable';
+  if (!processIsAlive(owner.pid)) return 'stale';
+  if (owner.processStart !== undefined) {
+    const current = processStartIdentity(owner.pid);
+    if (current !== undefined && current !== owner.processStart) return 'stale';
+  }
+  return 'live';
 }
 
 function processIsAlive(pid: number): boolean {
@@ -238,6 +304,8 @@ export interface ArtifactAvailabilityOptions {
   reclaimable?: ReadonlySet<string>;
   /** A manifest-backed resume is active, which changes the conflict guidance. */
   resumeActive?: boolean;
+  /** The caller turned resume off (`--no-resume`), which changes the guidance again. */
+  resumeDisabled?: boolean;
 }
 
 /** Reject every destination this extraction could write before paid work starts. */
@@ -283,9 +351,100 @@ export async function assertArtifactTargetsAvailable(
       + 'resume only replaces artifacts its own manifest recorded for this input.',
     );
   }
+  const hint = availability.resumeDisabled ? RESUME_DISABLED_CONFLICT_HINT : OUTPUT_CONFLICT_HINT;
   throw outputConflict(
-    `Output already exists before extraction: ${existing.join(', ')}. ${OUTPUT_CONFLICT_HINT}`,
+    `Output already exists before extraction: ${existing.join(', ')}. ${hint}`,
+    undefined,
+    hint,
   );
+}
+
+/** Every destination this input could write, including optional artifacts. */
+export async function possibleArtifactTargets(
+  input: ResolvedInput,
+  options: ResolvedCliOptions,
+  totalInputs: number,
+): Promise<ArtifactTarget[]> {
+  const writesFiles = totalInputs > 1 || Boolean(options.output) || options.format === 'all';
+  if (!writesFiles) return [];
+  return resolveArtifactTargets(input, possibleArtifactExtensions(options), options, totalInputs);
+}
+
+/** Staging and backup names written by {@link commitArtifacts} and {@link writeTextFileAtomically}. */
+const TRANSACTION_SUFFIX = /\.(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(tmp|bak)$/u;
+
+export interface StaleTransactionFile {
+  path: string;
+  /** The artifact or metadata file the staged/backup copy belongs to. */
+  target: string;
+  kind: 'tmp' | 'bak';
+  pid: number;
+}
+
+/** Find staging/backup leftovers of the given targets (no changes made). */
+export async function findStaleTransactionFiles(
+  targets: Iterable<string>,
+): Promise<StaleTransactionFile[]> {
+  const byDirectory = new Map<string, Set<string>>();
+  for (const target of targets) {
+    const resolved = path.resolve(target);
+    const directory = path.dirname(resolved);
+    byDirectory.set(directory, (byDirectory.get(directory) ?? new Set()).add(path.basename(resolved)));
+  }
+  const found: StaleTransactionFile[] = [];
+  await Promise.all([...byDirectory].map(async ([directory, names]) => {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(directory);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const match = TRANSACTION_SUFFIX.exec(entry);
+      if (!match) continue;
+      const base = entry.slice(0, match.index);
+      if (!names.has(base)) continue;
+      found.push({
+        path: path.join(directory, entry),
+        target: path.join(directory, base),
+        kind: match[2] as 'tmp' | 'bak',
+        pid: Number(match[1]),
+      });
+    }
+  }));
+  return found.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+/** Any staging/backup file name, for a directory-wide status scan. */
+export function isTransactionFileName(name: string): boolean {
+  return TRANSACTION_SUFFIX.test(name);
+}
+
+/**
+ * Remove leftovers of a killed artifact or manifest transaction. Must run only
+ * while holding the batch lock, so no live writer of this directory can own
+ * them. A `.bak` is the previous artifact moved aside mid-commit: it is put
+ * back when its target is missing, otherwise discarded. Files whose embedded
+ * PID belongs to another live process are left alone.
+ */
+export async function recoverStaleTransactionFiles(
+  targets: Iterable<string>,
+): Promise<{ removed: string[]; restored: string[] }> {
+  const removed: string[] = [];
+  const restored: string[] = [];
+  for (const file of await findStaleTransactionFiles(targets)) {
+    if (file.pid !== process.pid && processIsAlive(file.pid)) continue;
+    if (file.kind === 'bak' && !(await pathExists(file.target))) {
+      await fs.rename(file.path, file.target);
+      restored.push(file.target);
+      continue;
+    }
+    await fs.rm(file.path, { force: true });
+    removed.push(file.path);
+  }
+  return { removed, restored };
 }
 
 export async function assertNoOutputCollisions(
@@ -553,13 +712,25 @@ export async function writeArtifacts(
  */
 export const STDIN_MANIFEST_KEY = '<stdin>';
 
+export interface ManifestFingerprints {
+  /** Content-hash (v2) fingerprint of the input as it is now. */
+  current: string;
+  /** Legacy path/size/mtime fingerprint, accepted only for entries without a version. */
+  legacy?: string;
+}
+
 export class ManifestStore {
   private readonly manifestPath: string;
   private manifest: CliManifest = { ...EMPTY_MANIFEST, entries: {} };
   private pendingWrite: Promise<void> = Promise.resolve();
+  private usageSource: (() => ProviderUsageSnapshot | undefined) | undefined;
 
   constructor(outputDirectory: string) {
     this.manifestPath = path.join(outputDirectory, '.open-ocr-manifest.json');
+  }
+
+  get path(): string {
+    return this.manifestPath;
   }
 
   async load(): Promise<void> {
@@ -575,6 +746,24 @@ export class ManifestStore {
     }
   }
 
+  /** Cumulative usage recorded by earlier runs, as loaded. */
+  recordedUsage(): ProviderUsageSnapshot | undefined {
+    return this.manifest.usage ? { ...this.manifest.usage } : undefined;
+  }
+
+  /**
+   * Supply the cumulative usage persisted with every manifest write, so a
+   * killed run still leaves its spend on record for the next `--max-cost` check.
+   */
+  setUsageSource(source: () => ProviderUsageSnapshot | undefined): void {
+    this.usageSource = source;
+  }
+
+  entry(key: string): ManifestEntry | undefined {
+    const entry = this.manifest.entries[key];
+    return entry ? { ...entry, outputFiles: [...entry.outputFiles] } : undefined;
+  }
+
   /**
    * The entry a resume may skip: same input, same output-affecting options, and
    * a run that actually finished.
@@ -584,31 +773,81 @@ export class ManifestStore {
    * ceiling, say — so skipping it strands the shortfall permanently, and the
    * rerun then reports the batch as fully succeeded because the skip is counted
    * as `resumed`. Re-extracting is the only outcome that can improve it.
+   *
+   * `pending` is an interrupted attempt and is never skipped either.
    */
-  async completedEntry(key: string, fingerprint: string): Promise<ManifestEntry | undefined> {
+  async completedEntry(
+    key: string,
+    fingerprints: string | ManifestFingerprints,
+  ): Promise<(ManifestEntry & { legacyFingerprint?: true }) | undefined> {
+    const { current, legacy } = typeof fingerprints === 'string'
+      ? { current: fingerprints, legacy: undefined }
+      : fingerprints;
     const entry = this.manifest.entries[key];
-    if (
-      !entry
-      || entry.status !== 'succeeded'
-      || entry.fingerprint !== fingerprint
-    ) return undefined;
+    if (!entry || entry.status !== 'succeeded') return undefined;
+    const matchesCurrent = entry.fingerprint === current;
+    const matchesLegacy = !matchesCurrent
+      && legacy !== undefined
+      && entry.fingerprintVersion === undefined
+      && entry.fingerprint === legacy;
+    if (!matchesCurrent && !matchesLegacy) return undefined;
     if (!(await Promise.all(entry.outputFiles.map(artifactFileExists))).every(Boolean)) return undefined;
-    return { ...entry, outputFiles: [...entry.outputFiles] };
+    return {
+      ...entry,
+      outputFiles: [...entry.outputFiles],
+      ...(matchesLegacy ? { legacyFingerprint: true as const } : {}),
+    };
   }
 
   /**
    * Artifact paths this manifest already attributes to `key`, whatever the
-   * recorded fingerprint or status. A resume owns these destinations: they are
-   * this input's own output from an earlier attempt, so re-extracting the input
-   * may replace them.
+   * recorded fingerprint or status: the current outputs plus every path the
+   * entry ever wrote or claimed (earlier formats, interrupted attempts). A
+   * resume owns these destinations, so re-extracting the input may replace them.
    */
   recordedArtifactPaths(key: string): ReadonlySet<string> {
-    return new Set((this.manifest.entries[key]?.outputFiles ?? []).map(artifactPathKey));
+    const entry = this.manifest.entries[key];
+    return new Set([...(entry?.outputFiles ?? []), ...(entry?.ownedFiles ?? [])].map(artifactPathKey));
   }
 
+  /** Every artifact path any entry owns, for leftover cleanup and `status`. */
+  allOwnedArtifactPaths(): Set<string> {
+    const owned = new Set<string>();
+    for (const key of Object.keys(this.manifest.entries)) {
+      for (const file of this.recordedArtifactPaths(key)) owned.add(file);
+    }
+    return owned;
+  }
+
+  /**
+   * Replace one entry and persist the whole manifest atomically (staged file,
+   * then rename). Ownership only grows: paths the entry recorded before stay
+   * in `ownedFiles`, so a later format switch still recognises them.
+   */
   update(key: string, entry: ManifestEntry): Promise<void> {
-    this.manifest.entries[key] = entry;
+    const previous = this.manifest.entries[key];
+    const owned = [...new Set([
+      ...(previous?.ownedFiles ?? []),
+      ...(previous?.outputFiles ?? []),
+      ...(entry.ownedFiles ?? []),
+      ...entry.outputFiles,
+    ].map(artifactPathKey))];
+    this.manifest.entries[key] = {
+      ...entry,
+      ...(owned.length > 0 ? { ownedFiles: owned } : {}),
+    };
+    return this.write();
+  }
+
+  /** Persist the manifest (and the current cumulative usage) without changing entries. */
+  flush(): Promise<void> {
+    return this.write();
+  }
+
+  private write(): Promise<void> {
     this.pendingWrite = this.pendingWrite.then(async () => {
+      const usage = this.usageSource?.();
+      if (usage) this.manifest.usage = usage;
       await writeTextFileAtomically(
         this.manifestPath,
         `${JSON.stringify(this.manifest, null, 2)}\n`,
@@ -624,6 +863,8 @@ export class ManifestStore {
  * CLI processes from racing manifest read-modify-write cycles and losing resume
  * entries after provider work has already been paid for.
  */
+const MAX_LOCK_ACQUIRE_ATTEMPTS = 8;
+
 export class BatchOutputLock {
   private constructor(
     readonly lockPath: string,
@@ -636,70 +877,104 @@ export class BatchOutputLock {
   ): Promise<BatchOutputLock> {
     await fs.mkdir(outputDirectory, { recursive: true });
     const lockPath = path.join(outputDirectory, '.open-ocr.lock');
+    const processStart = currentProcessStartIdentity();
     const owner: BatchLockOwner = {
       version: 1,
       token: randomUUID(),
       pid: process.pid,
       hostname: hostname(),
       startedAt: new Date().toISOString(),
+      ...(processStart ? { processStart } : {}),
     };
-    try {
-      await writeTextFileAtomically(lockPath, `${JSON.stringify(owner, null, 2)}\n`, false);
-      return new BatchOutputLock(lockPath, owner);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const manualRecovery = `Verify no batch is writing to ${outputDirectory}, then delete ${lockPath}.`;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < MAX_LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
+      try {
+        await writeTextFileAtomically(lockPath, `${JSON.stringify(owner, null, 2)}\n`, false);
+        return new BatchOutputLock(lockPath, owner);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        lastError = error;
+      }
       let existingOwner: BatchLockOwner | undefined;
       try {
         existingOwner = parseBatchLockOwner(JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown);
       } catch (readError) {
         // The owner released it between our write and this read: try again.
-        if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
-          return BatchOutputLock.acquire(outputDirectory, options);
-        }
+        if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
         // Invalid owner data is handled below without guessing that it is stale.
       }
-      const manualRecovery = `Verify no batch is writing to ${outputDirectory}, then delete ${lockPath}.`;
       if (!existingOwner) {
         throw outputConflict(
           `Batch output directory is locked and its owner metadata is invalid: ${lockPath}`,
-          error,
+          lastError,
           manualRecovery,
         );
       }
-      const localHostname = hostname();
-      if (existingOwner.hostname !== localHostname) {
+      const state = batchLockOwnerState(existingOwner);
+      if (state === 'unverifiable') {
         throw outputConflict(
           `Batch output directory is locked by PID ${existingOwner.pid} on host ${existingOwner.hostname} `
-          + `(started ${existingOwner.startedAt}), which cannot be checked from ${localHostname}: ${outputDirectory}`,
-          error,
+          + `(started ${existingOwner.startedAt}), which cannot be checked from ${hostname()}: ${outputDirectory}`,
+          lastError,
           manualRecovery,
         );
       }
-      if (processIsAlive(existingOwner.pid)) {
+      if (state === 'live') {
         throw outputConflict(
           `Batch output directory is in use by running PID ${existingOwner.pid} `
           + `(started ${existingOwner.startedAt}): ${outputDirectory}`,
-          error,
+          lastError,
           'Wait for that batch to finish, or write to a different output directory.',
         );
       }
 
       // A same-host owner that is provably dead (killed, crashed, a second
-      // Ctrl-C) cannot release its own lock. Reclaiming it here is exactly the
-      // check an operator would make, so it needs no flag. The token re-read
-      // keeps two recovering processes from deleting each other's fresh lock.
-      const currentOwner = parseBatchLockOwner(
-        JSON.parse(await fs.readFile(lockPath, 'utf8')) as unknown,
-      );
-      if (currentOwner?.token !== existingOwner.token) {
-        throw outputConflict(`Batch lock ownership changed during stale-lock recovery: ${lockPath}`, error);
+      // Ctrl-C, or its PID now belongs to another process) cannot release its
+      // own lock. Reclaiming it is exactly the check an operator would make.
+      //
+      // Check-then-delete is not atomic: a second recovering process could
+      // delete the fresh lock the first one just created. Instead move the lock
+      // aside under a unique name (atomic), then confirm the moved file is the
+      // stale owner's. If it is not, someone else already reclaimed it, so put
+      // their lock back and report the conflict.
+      const aside = `${lockPath}.${process.pid}-${randomUUID()}.tmp`;
+      try {
+        await fs.rename(lockPath, aside);
+      } catch (renameError) {
+        if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw renameError;
       }
-      await fs.rm(lockPath);
+      let movedOwner: BatchLockOwner | undefined;
+      try {
+        movedOwner = parseBatchLockOwner(JSON.parse(await fs.readFile(aside, 'utf8')) as unknown);
+      } catch {
+        movedOwner = undefined;
+      }
+      if (movedOwner?.token !== existingOwner.token) {
+        try {
+          await fs.link(aside, lockPath);
+        } catch {
+          // A third process took the path meanwhile; their lock stands.
+        }
+        await fs.rm(aside, { force: true });
+        throw outputConflict(
+          `Batch lock ownership changed during stale-lock recovery: ${lockPath}`,
+          lastError,
+          'Another process reclaimed the stale lock first; wait for it to finish, or write to a different output directory.',
+        );
+      }
+      await fs.rm(aside, { force: true });
       options.onWarning?.(
-        `Removed stale batch lock left by dead PID ${existingOwner.pid} on ${localHostname}: ${lockPath}`,
+        `Removed stale batch lock left by ${processIsAlive(existingOwner.pid) ? 'reused' : 'dead'} PID `
+        + `${existingOwner.pid} on ${hostname()}: ${lockPath}`,
       );
-      return BatchOutputLock.acquire(outputDirectory, options);
     }
+    throw outputConflict(
+      `Could not acquire the batch lock after ${MAX_LOCK_ACQUIRE_ATTEMPTS} attempts; another process keeps taking it: ${lockPath}`,
+      lastError,
+      'Wait for the other batch to finish, or write to a different output directory.',
+    );
   }
 
   async release(): Promise<void> {

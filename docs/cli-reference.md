@@ -106,10 +106,15 @@ Directories are recursive. Hidden paths and `node_modules`, `dist`, `build`,
 `vendor`, and `target` subtrees are skipped by default. Warnings count skipped
 unsupported files and default-excluded directories, not hidden or custom-excluded
 paths. `--hidden` includes hidden paths; `--exclude <glob>` adds exclusions.
+An exclude pattern is matched relative to the working directory for every
+input, and additionally relative to a scanned folder (so `--exclude 'drafts/**'`
+with input `docs` keeps working); an exclude that matched nothing is reported
+as a `Discovery:` warning. Explicitly named files are never excluded.
 Use `--no-default-excludes`, explicitly name a default-excluded directory, or
 use a quoted glob to include those trees. Hidden/custom exclusions still apply
 to directory and glob discovery. Discovery does not follow symlinks encountered
-while walking. Quote globs to let the CLI expand them.
+while walking; inputs that resolve to the same file (a named symlink and its
+target) are extracted once, with a warning. Quote globs to let the CLI expand them.
 
 Images: **70 MB raw**. PDFs: **50 MB, 1,000 pages**. Default batch limits:
 **1,000 files / 5,120 MB**, concurrency **2** (range **1–16**). Formats accepted
@@ -117,11 +122,31 @@ by a provider may be narrower than discovery. Video is not an OCR input.
 
 `--requests-per-minute` spaces request starts evenly, including agent
 continuations. `--max-cost` stops future requests once recorded estimates reach
-the budget; in-flight requests can exceed it. Known models use paid-tier token
+the budget; in-flight requests can exceed it. In an output directory with a
+resume manifest the budget is **cumulative**: it covers the spend recorded by
+every resumed run of that directory, so rerunning a cost-limited batch with the
+same `--max-cost` resumes finished documents and starts no new paid work (raise
+the cap to continue). `--overwrite` and `--no-resume` start a fresh total.
+Known models use paid-tier token
 estimates; OpenRouter reports cost when available. For other providers, unknown
 prices require both `--input-price` and `--output-price` when enforcing a cost
 limit. Cached-input rates and provider-reported cache usage are included where
-available.
+available. `usage.requests` counts every HTTP attempt, including failed and
+retried ones. A response that carries no token usage is counted in
+`usage.unreportedUsageRequests` with a warning; under `--max-cost` with non-zero
+prices the run fails closed: no further paid documents start, the rest are
+skipped as `COST_LIMIT`, and the exit code is 1.
+
+Retries (`--retries`, simple and template modes) wait for the provider's
+`Retry-After` (seconds or HTTP-date, also Gemini `RetryInfo`) on 429/503, capped
+at 60 s, instead of the jittered backoff; a requested wait that does not fit in
+the remaining `--timeout` fails the document at once with the provider error.
+Out-of-quota and out-of-credit responses (OpenAI `insufficient_quota`, billing
+limits, HTTP 402, Gemini per-day or zero-limit quotas) are never retried. Every
+attempt but the last is limited to two thirds of the remaining document budget
+(at least 30 s), so a hung connection is retried instead of consuming the whole
+`--timeout`; the last attempt keeps whatever time remains. Raise `--timeout` for
+documents that legitimately take longer than that.
 
 ## Output and resume
 
@@ -131,9 +156,26 @@ Machine/MCP reference jobs default to `.open-ocr-results/<runId>`.
 
 Directories with resume metadata contain `.open-ocr-manifest.json` and
 `batch-summary.json`; `.open-ocr.lock` marks the directory's owning process. A
-lock left by a dead process on the same host is reclaimed automatically with a
-warning, so `--force-unlock` is accepted but no longer needed; a live,
-cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
+lock left by a dead process on the same host — or one whose PID now belongs to
+a different process (checked against the recorded process start time) — is
+reclaimed automatically with a warning, so `--force-unlock` is accepted but no
+longer needed; a live, cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
+Concurrent reclaimers of one stale lock get exactly one winner; the others
+report `OUTPUT_CONFLICT`.
+
+Resume is crash-safe. Before a document's artifacts are committed, its manifest
+entry is written as a `pending` claim naming every path it may write, and the
+manifest itself is replaced atomically. A run killed at any point (including
+`SIGKILL`) therefore leaves only files the next run recognises as its own: it
+re-extracts the interrupted document, removes leftover
+`<artifact>.<pid>-<uuid>.tmp` staging files, and puts back any `.bak` an
+interrupted replacement had moved aside. Each entry also keeps every artifact
+path it has ever written, so switching `--format` back and forth reuses the
+directory without conflicts. Resume compares a streamed SHA-256 of each input
+(plus path, size, and output-affecting settings), not its mtime: a content
+change that preserves size and mtime is re-extracted, and a touch that changes
+nothing is not. Entries written by 4.3.0 and earlier (size/mtime fingerprints)
+are trusted once and upgraded.
 A single artifact file has no resume metadata. Relative input paths are preserved.
 Existing files are protected unless `--overwrite` is explicit or a matching resume owns a stale
 artifact. Destinations are preflighted before paid work. Resume checks input
@@ -148,6 +190,15 @@ output preflight failures instead fail the run. Read `partialReason` and
 `nextAction` for partial results. Truncated, blocked, empty, malformed, and
 schema-invalid responses never count as success.
 Dry runs validate even resumed inputs and write no files.
+
+`status <dir>` reports the last run's usage and the cumulative usage of every
+run in the directory, documents left `pending` by an interrupted run,
+artifact-shaped files (`.md`, `.json`, `.csv`) no manifest entry owns, leftover
+staging/backup files, and whether a lock is held by a running process, is stale
+(the next extract reclaims it), or cannot be verified from this host. Any of
+these makes the directory unhealthy. A `--no-resume` run into a directory that
+already holds this job's artifacts fails with `OUTPUT_CONFLICT`; drop
+`--no-resume`, pass `--overwrite`, or choose a new `--output`.
 
 ## Machine requests and events
 

@@ -16,7 +16,8 @@
         "toolTokens": { "type": "integer", "minimum": 0 },
         "cachedTokens": { "type": "integer", "minimum": 0 },
         "totalTokens": { "type": "integer", "minimum": 0 },
-        "estimatedCostUsd": { "type": "number", "minimum": 0 }
+        "estimatedCostUsd": { "type": "number", "minimum": 0 },
+        "unreportedUsageRequests": { "type": "integer", "minimum": 1 }
       }
     },
     "artifact": {
