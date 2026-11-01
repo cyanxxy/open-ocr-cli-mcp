@@ -1,18 +1,27 @@
 import { Buffer } from 'node:buffer';
-import { open } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 
 import {
+  applyOperatorCeilings,
   assertCredentialsAvailable,
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
   loadCliConfig,
+  loadMcpCallerConfig,
   localEnvironment,
   resolveCliOptions,
   type ModeScopedOptionKey,
+  type OperatorCeilings,
 } from './config';
 import { CliExitError } from './errors';
+import {
+  assertCallerPatternBounded,
+  callerBoundaryError,
+  confineCallerPath,
+  escapesRoot,
+} from './fileBoundary';
 import { describeDiscoverySkips, discoverInputSet } from './inputs';
 import { createOcrJobService } from './runner';
 import type { OcrJobServiceResult } from './ocrJobService';
@@ -26,7 +35,7 @@ import {
   type OcrJobEventSink,
   type OcrJobRequest,
 } from './protocol';
-import type { CliConfigFile, ExtractCommandFlags } from './types';
+import type { CliConfigFile, ExtractCommandFlags, ResolvedCliOptions } from './types';
 import { resolveWebUrls, runWebJob } from './web';
 
 export interface ExecuteOcrJobOptions {
@@ -36,6 +45,16 @@ export interface ExecuteOcrJobOptions {
   eventSink?: OcrJobEventSink;
   onWarning?: (message: string) => void;
   noConfig?: boolean;
+  /**
+   * Who sent the request. `mcp` marks a caller that is untrusted relative to
+   * the operator who started the server: its paths are confined to `cwd`, its
+   * `configPath` may not route requests or credentials, and the operator's
+   * limits are ceilings it can only lower (see `loadMcpCallerConfig`). Omitted
+   * for `run`, whose caller is the person at the terminal.
+   */
+  boundary?: 'mcp';
+  /** Observe the fully resolved options, e.g. to describe a run for confirmation. */
+  onResolvedOptions?: (options: ResolvedCliOptions) => void;
 }
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -258,6 +277,48 @@ function machineConfigurationError(request: OcrJobRequest, fileConfig: CliConfig
   return undefined;
 }
 
+/** Glob syntax, as discovery reads it (see `isGlobPattern` in inputs.ts). */
+const GLOB_SYNTAX = /[*?{}[\]()!]/u;
+
+/**
+ * Keep an MCP caller's inputs inside the server working directory: paths and
+ * the static prefix of a glob are realpath-checked, and a glob may not be
+ * absolute or climb with `..`. Matches are checked again after discovery,
+ * because a glob can still walk through a symbolic link part-way down.
+ */
+async function assertMcpInputsInside(
+  request: OcrJobRequest,
+  fileConfig: CliConfigFile,
+  cwd: string,
+): Promise<void> {
+  for (const pattern of [...(request.discovery?.exclude ?? []), ...(fileConfig.exclude ?? [])]) {
+    assertCallerPatternBounded(cwd, pattern, 'exclude');
+  }
+  for (const input of request.inputs) {
+    if (input.type !== 'path') continue;
+    if (GLOB_SYNTAX.test(input.path)) assertCallerPatternBounded(cwd, input.path, 'input');
+    await confineCallerPath(cwd, input.path, 'input');
+  }
+}
+
+async function assertMcpMatchesInside(
+  inputs: readonly { absolutePath?: string; displayPath: string }[],
+  cwd: string,
+): Promise<void> {
+  const root = await realpath(cwd);
+  for (const input of inputs) {
+    if (!input.absolutePath) continue;
+    const resolved = await realpath(input.absolutePath);
+    if (escapesRoot(path.relative(root, resolved))) {
+      throw callerBoundaryError(
+        'input',
+        `A matched input resolves outside the MCP server working directory: ${input.displayPath}`,
+        cwd,
+      );
+    }
+  }
+}
+
 function configurationError(message: string): CliExitError {
   return new CliExitError(message, 2, {
     code: 'CONFIG_INVALID',
@@ -300,27 +361,40 @@ export async function executeOcrJobRequest(
     throw configurationError('OCR URL inputs cannot be mixed with path or stdin inputs.');
   }
   const hermetic = execution.noConfig === true || request.noConfig === true;
+  const mcp = execution.boundary === 'mcp';
   // Ambient OPEN_OCR_NO_CONFIG still blocks .env; explicit configPath may load
   // only that file (no user/project merge) via loadCliConfig hermetic rules.
   const env = localEnvironment(execution.cwd, hermetic);
-  const fileConfig = await loadCliConfig(
-    execution.cwd,
-    request.configPath,
-    hermetic,
-  );
+  let fileConfig: CliConfigFile;
+  let ceilings: OperatorCeilings = {};
+  let operatorSchema = false;
+  if (mcp) {
+    ({ fileConfig, ceilings, operatorSchema } = await loadMcpCallerConfig(
+      execution.cwd,
+      request.configPath,
+      hermetic,
+    ));
+    await assertMcpInputsInside(request, fileConfig, execution.cwd);
+  } else {
+    fileConfig = await loadCliConfig(execution.cwd, request.configPath, hermetic);
+  }
   const invalidConfiguration = machineConfigurationError(request, fileConfig);
   if (invalidConfiguration) throw configurationError(invalidConfiguration);
 
+  // A schema file named by the MCP caller (directly or through its
+  // configuration) is read only from inside the working directory.
+  const schemaFile = request.extraction?.schema ? undefined : request.extraction?.schemaPath ?? fileConfig.schema;
+  if (mcp && schemaFile !== undefined && !(request.extraction?.schemaPath === undefined && operatorSchema)) {
+    await confineCallerPath(execution.cwd, schemaFile, 'schemaPath');
+  }
   // Validate schema content before option resolution can require credentials.
   let customSchema: Record<string, unknown> | undefined;
   try {
     customSchema = request.extraction?.schema
       ? validateCustomSchema(request.extraction.schema)
-      : request.extraction?.schemaPath
-        ? await loadCustomSchema(request.extraction.schemaPath, execution.cwd)
-        : fileConfig.schema
-          ? await loadCustomSchema(fileConfig.schema, execution.cwd)
-          : undefined;
+      : schemaFile !== undefined
+        ? await loadCustomSchema(schemaFile, execution.cwd)
+        : undefined;
   } catch (error) {
     throw schemaError(error);
   }
@@ -335,9 +409,14 @@ export async function executeOcrJobRequest(
     if (schemaWarning) warn(schemaWarning);
   }
   const deliveryMode = request.delivery?.mode ?? 'reference';
+  const requestedOutput = deliveryMode === 'reference' ? request.delivery?.outputDirectory : undefined;
+  // Over MCP the caller's directory must resolve inside the working directory
+  // and outside hidden directories (.git, .claude, ...) other than the default.
   const outputDirectory = deliveryMode === 'reference'
-    ? request.delivery?.outputDirectory
-      ? path.resolve(execution.cwd, request.delivery.outputDirectory)
+    ? requestedOutput
+      ? mcp
+        ? await confineCallerPath(execution.cwd, requestedOutput, 'outputDirectory', 'write')
+        : path.resolve(execution.cwd, requestedOutput)
       : defaultAgentOutputDirectory(execution.cwd, execution.runId)
     : undefined;
   // The default output directory is per-run, so a resume there can never match
@@ -359,9 +438,15 @@ export async function executeOcrJobRequest(
     ? { ...fileConfig, schema: undefined }
     : fileConfig;
   const stdinInput = stdinInputs[0]?.type === 'stdin' ? stdinInputs[0] : undefined;
+  let flags = requestFlags(request, outputDirectory);
+  if (mcp) {
+    const capped = applyOperatorCeilings(flags, effectiveFileConfig, ceilings);
+    flags = capped.flags;
+    for (const message of capped.warnings) warn(message);
+  }
   const options = {
     // Errors name request fields, not `extract` flags: this caller sent JSON.
-    ...resolveCliOptions(requestFlags(request, outputDirectory), effectiveFileConfig, execution.cwd, 'field', env),
+    ...resolveCliOptions(flags, effectiveFileConfig, execution.cwd, 'field', env),
     customSchema,
     ...(stdinInput?.name ? { stdinName: stdinInput.name } : {}),
     ...(stdinInput?.mimeType ? { stdinType: stdinInput.mimeType } : {}),
@@ -372,6 +457,7 @@ export async function executeOcrJobRequest(
     'field',
   );
   if (ignoredWarning) warn(ignoredWarning);
+  execution.onResolvedOptions?.(options);
   if (urlInputs.length > 0) {
     const urls = await resolveWebUrls(urlInputs.map((input) => input.url), undefined, execution.cwd);
     assertCredentialsAvailable(options);
@@ -392,6 +478,7 @@ export async function executeOcrJobRequest(
   // A directory scan that drops files hands back fewer documents than were
   // requested, which the caller has to hear about. It reuses the CLI's wording
   // so both surfaces say one thing.
+  if (mcp) await assertMcpMatchesInside(discovery.inputs, execution.cwd);
   const skipSummary = describeDiscoverySkips(discovery.skipped);
   if (skipSummary) warn(`Discovery: ${skipSummary}`);
   assertCredentialsAvailable(options);

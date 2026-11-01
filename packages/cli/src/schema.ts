@@ -1,5 +1,4 @@
 import { Buffer } from 'node:buffer';
-import { open } from 'node:fs/promises';
 import path from 'node:path';
 
 import Ajv2020, { type ValidateFunction } from 'ajv/dist/2020.js';
@@ -8,6 +7,7 @@ import addFormats from 'ajv-formats';
 import { findSchemaCompatibilityIssues } from '@open-ocr/engine/gemini/schemaCompat';
 import type { JsonValue } from '@open-ocr/engine/gemini/types';
 import { CliExitError } from './errors';
+import { jsonSyntaxLocation, openRegularFile } from './fileBoundary';
 
 const MAX_SCHEMA_BYTES = 1024 * 1024;
 const MAX_LISTED_SCHEMA_ISSUES = 3;
@@ -133,7 +133,7 @@ function schemaFileError(message: string, cause: unknown): CliExitError {
 function unreadableSchemaError(error: unknown, schemaPath: string): CliExitError | undefined {
   const code = (error as NodeJS.ErrnoException).code;
   if (code === 'ENOENT') return schemaFileError(`Schema file not found: ${schemaPath}`, error);
-  if (code === 'EISDIR') return schemaFileError(`Schema path is not a file: ${schemaPath}`, error);
+  if (code === 'EISDIR' || code === 'ENOTREG') return schemaFileError(`Schema path is not a file: ${schemaPath}`, error);
   if (code === 'EACCES' || code === 'EPERM') {
     return schemaFileError(`Schema file is not readable: ${schemaPath}`, error);
   }
@@ -172,7 +172,8 @@ export async function loadCustomSchema(schemaPath: string, cwd: string): Promise
   // check here applies to the exact bytes we go on to parse.
   let handle;
   try {
-    handle = await open(absolutePath, 'r');
+    // Non-blocking, regular files only: a FIFO or device would hang the read.
+    handle = await openRegularFile(absolutePath, schemaPath);
   } catch (error) {
     throw unreadableSchemaError(error, schemaPath) ?? error;
   }
@@ -185,7 +186,8 @@ export async function loadCustomSchema(schemaPath: string, cwd: string): Promise
       parsed = JSON.parse(await handle.readFile('utf8')) as unknown;
     } catch (error) {
       if (error instanceof SyntaxError) {
-        throw new Error(`Invalid JSON in schema ${schemaPath}: ${error.message}`, { cause: error });
+        // The parser message quotes the file's opening bytes; report the position only.
+        throw new Error(`Invalid JSON in schema ${schemaPath}${jsonSyntaxLocation(error)}`, { cause: error });
       }
       throw unreadableSchemaError(error, schemaPath) ?? error;
     }

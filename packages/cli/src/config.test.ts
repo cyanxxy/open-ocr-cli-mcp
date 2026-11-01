@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearRegisteredSecretsForRedaction } from '@open-ocr/engine/gemini/errorPayload';
 import { listExtractionPresets } from '@open-ocr/engine/templates';
 import {
+  applyOperatorCeilings,
   assertCredentialsAvailable,
   credentialSetupGuidance,
   ignoredModeScopedOptionWarning,
@@ -39,6 +40,44 @@ afterEach(() => {
 });
 
 describe('CLI configuration', () => {
+  it('reports malformed configuration JSON without quoting the file, and still reads an explicit file anywhere', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-config-json-'));
+    const elsewhere = await mkdtemp(path.join(tmpdir(), 'open-ocr-config-elsewhere-'));
+    try {
+      await writeFile(path.join(elsewhere, 'passwd'), 'root:x:0:0:root:/root:/bin/bash\n');
+      let thrown = new Error('expected a rejection');
+      await loadCliConfig(directory, path.join(elsewhere, 'passwd')).catch((error: unknown) => { thrown = error as Error; });
+      expect(thrown.message).toBe(`Invalid JSON in ${path.join(elsewhere, 'passwd')}`);
+      expect(thrown.message).not.toContain('root:x');
+      // The CLI user is trusted: an explicit --config outside the project still loads.
+      await writeFile(path.join(elsewhere, 'ok.json'), JSON.stringify({ baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'X' }));
+      await expect(loadCliConfig(directory, path.join(elsewhere, 'ok.json'), true))
+        .resolves.toMatchObject({ baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'X' });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+      await rm(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it('applies operator ceilings: a caller may lower, never raise or unset, a limit', () => {
+    const ceilings = { maxFiles: 5, maxCostUsd: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 };
+    const lowered = applyOperatorCeilings({ maxFiles: 3, maxCost: 0.5, requestsPerMinute: 4, concurrency: 1, maxTotalMb: 10 }, {}, ceilings);
+    expect(lowered.flags).toMatchObject({ maxFiles: 3, maxCost: 0.5, requestsPerMinute: 4, concurrency: 1, maxTotalMb: 10 });
+    expect(lowered.warnings).toEqual([]);
+
+    const raised = applyOperatorCeilings({ maxFiles: 100_000, maxCost: 1_000_000, requestsPerMinute: 0 }, { concurrency: 16 }, ceilings);
+    expect(raised.flags).toMatchObject({ maxFiles: 5, maxCost: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 });
+    expect(raised.warnings).toHaveLength(4);
+
+    // Nothing supplied: the ceiling is the value, silently.
+    expect(applyOperatorCeilings({}, {}, ceilings)).toEqual({
+      flags: { maxFiles: 5, maxCost: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 },
+      warnings: [],
+    });
+    // No ceilings: flags pass through untouched.
+    expect(applyOperatorCeilings({ maxFiles: 9 }, {}, {})).toEqual({ flags: { maxFiles: 9 }, warnings: [] });
+  });
+
   it('registers the credential values a run resolves so errors echoing them are scrubbed', () => {
     const secret = 'customOpaqueKey-5f3a9c';
     const gatewaySecret = 'gatewayOpaqueToken-77aa';

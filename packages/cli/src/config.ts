@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { readFile, realpath } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -24,6 +24,12 @@ import {
 } from '@open-ocr/engine/providers';
 import { getExtractionPreset, listExtractionPresets } from '@open-ocr/engine/templates';
 import { CliExitError } from './errors';
+import {
+  confineCallerPath,
+  jsonSyntaxLocation,
+  openRegularFile,
+  realpathOfNearestAncestor,
+} from './fileBoundary';
 import { asRecord } from './jsonValidation';
 import { OCR_REQUEST_LIMITS, PRICE_PER_MILLION_LIMIT } from './limits';
 import {
@@ -133,6 +139,7 @@ function configFileError(error: unknown, displayPath: string): CliExitError | un
   const code = (error as NodeJS.ErrnoException).code;
   if (code === 'ENOENT') return configurationError(`Configuration file not found: ${displayPath}`);
   if (code === 'EISDIR') return configurationError(`Configuration path is not a file: ${displayPath}`);
+  if (code === 'ENOTREG') return configurationError(`Configuration path is not a regular file: ${displayPath}`);
   if (code === 'EACCES' || code === 'EPERM') {
     return configurationError(`Configuration file is not readable: ${displayPath}`);
   }
@@ -198,19 +205,41 @@ function pickConfig(value: Record<string, unknown>, label: string): CliConfigFil
   return allowlisted;
 }
 
+/** Far above any real configuration file; bounds what a misdirected path can make the process read. */
+const MAX_CONFIG_BYTES = 1024 * 1024;
+
 async function readConfigFile(
   filePath: string,
   required: boolean,
   displayPath = filePath,
+  regularFileOnly = false,
 ): Promise<CliConfigFile> {
   try {
-    const raw = await readFile(filePath, 'utf8');
+    // The MCP server reads regular files only, non-blocking: a FIFO or device
+    // named as the configuration would otherwise hang the long-lived server or
+    // never reach EOF. The CLI keeps accepting a pipe (`--config <(...)`).
+    const handle = regularFileOnly
+      ? await openRegularFile(filePath, displayPath)
+      : await open(filePath, 'r');
+    let raw: string;
+    try {
+      if ((await handle.stat()).size > MAX_CONFIG_BYTES) {
+        throw configurationError(`Configuration file exceeds the 1 MB limit: ${displayPath}`);
+      }
+      raw = await handle.readFile('utf8');
+    } finally {
+      await handle.close();
+    }
     return pickConfig(asRecord(JSON.parse(raw) as unknown, displayPath), displayPath);
   } catch (error) {
     if (error instanceof CliExitError) throw error;
     const code = (error as NodeJS.ErrnoException).code;
     if (!required && code === 'ENOENT') return {};
-    if (error instanceof SyntaxError) throw configurationError(`Invalid JSON in ${displayPath}: ${error.message}`);
+    // The parser's own message quotes the start of the file; a misdirected
+    // path (`/etc/passwd`, a key file) must not be echoed back that way.
+    if (error instanceof SyntaxError) {
+      throw configurationError(`Invalid JSON in ${displayPath}${jsonSyntaxLocation(error)}`);
+    }
     // An explicitly requested config file that cannot be read is a request
     // error; reporting the raw errno would leak the resolved absolute path.
     const typed = configFileError(error, displayPath);
@@ -271,20 +300,136 @@ export async function loadCliConfig(
   return { ...user, ...project, ...explicit };
 }
 
-/** Resolve symbolic links in the longest existing prefix of a path that may not exist yet. */
-async function realpathOfNearestAncestor(target: string): Promise<string> {
-  const missing: string[] = [];
-  let current = target;
-  for (;;) {
-    try {
-      return path.join(await realpath(current), ...missing.reverse());
-    } catch (error) {
-      const parent = path.dirname(current);
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === current) throw error;
-      missing.push(path.basename(current));
-      current = parent;
+/**
+ * Execution limits an operator can set in the user configuration that an MCP
+ * caller may lower but never raise. `requestsPerMinute` 0 and an absent
+ * `maxCostUsd` both mean "unlimited", so either from the caller is a raise.
+ */
+export const OPERATOR_CEILING_KEYS = [
+  'maxFiles', 'maxTotalMb', 'maxCostUsd', 'requestsPerMinute', 'concurrency',
+] as const;
+
+export type OperatorCeilingKey = (typeof OPERATOR_CEILING_KEYS)[number];
+export type OperatorCeilings = Partial<Record<OperatorCeilingKey, number>>;
+
+/** The request flag each ceiling clamps, and the request field it is reported as. */
+const CEILING_FLAGS: Record<OperatorCeilingKey, { flag: keyof ExtractCommandFlags; field: string }> = {
+  maxFiles: { flag: 'maxFiles', field: 'execution.maxFiles' },
+  maxTotalMb: { flag: 'maxTotalMb', field: 'execution.maxTotalMb' },
+  maxCostUsd: { flag: 'maxCost', field: 'execution.maxCostUsd' },
+  requestsPerMinute: { flag: 'requestsPerMinute', field: 'execution.requestsPerMinute' },
+  concurrency: { flag: 'concurrency', field: 'execution.concurrency' },
+};
+
+function pickCeilings(config: CliConfigFile): OperatorCeilings {
+  const ceilings: OperatorCeilings = {};
+  for (const key of OPERATOR_CEILING_KEYS) {
+    const value = config[key];
+    // A requests-per-minute of 0 disables the limit; it caps nothing.
+    if (typeof value === 'number' && !(key === 'requestsPerMinute' && value === 0)) ceilings[key] = value;
+  }
+  return ceilings;
+}
+
+/**
+ * Apply operator ceilings to an MCP request's flags before option resolution.
+ *
+ * The caller's effective value is whatever would otherwise win (its argument,
+ * else its `configPath` or the project file); a missing or unlimited value
+ * becomes the ceiling and a larger one is lowered to it. Returns the clamped
+ * flags and a warning per lowered field, so the caller learns why its number
+ * was not used.
+ */
+export function applyOperatorCeilings(
+  flags: ExtractCommandFlags,
+  fileConfig: CliConfigFile,
+  ceilings: OperatorCeilings,
+): { flags: ExtractCommandFlags; warnings: string[] } {
+  const clamped: ExtractCommandFlags = { ...flags };
+  const warnings: string[] = [];
+  for (const key of OPERATOR_CEILING_KEYS) {
+    const ceiling = ceilings[key];
+    if (ceiling === undefined) continue;
+    const { flag, field } = CEILING_FLAGS[key];
+    const raw = (flags[flag] as string | number | undefined) ?? fileConfig[key];
+    const requested = raw === undefined ? undefined : Number(raw);
+    const unlimited = requested === undefined || (key === 'requestsPerMinute' && requested === 0);
+    if (!unlimited && Number.isFinite(requested) && requested <= ceiling) {
+      (clamped as Record<string, unknown>)[flag] = requested;
+      continue;
+    }
+    (clamped as Record<string, unknown>)[flag] = ceiling;
+    if (raw !== undefined) {
+      warnings.push(
+        `${field} ${String(raw)} exceeds the operator's limit of ${ceiling} (~/.config/open-ocr-cli/config.json); using ${ceiling}`,
+      );
     }
   }
+  return { flags: clamped, warnings };
+}
+
+export interface McpCallerConfig {
+  /** Merged configuration for option resolution. */
+  fileConfig: CliConfigFile;
+  /** Limits from the operator's user configuration; see {@link applyOperatorCeilings}. */
+  ceilings: OperatorCeilings;
+  /**
+   * True when `fileConfig.schema` came from the operator's user configuration,
+   * whose paths are the operator's own and are not confined to the working
+   * directory.
+   */
+  operatorSchema: boolean;
+}
+
+/**
+ * Configuration for one MCP tool call.
+ *
+ * The caller (an agent, possibly steered by document content) is untrusted
+ * relative to the operator who started the server, so the layers are kept
+ * apart rather than merged blindly:
+ *
+ * - The operator's user configuration and the server environment may route
+ *   requests (provider, baseUrl, apiKeyEnv, gateway) and set limits.
+ * - The caller's `configPath` must be a regular file inside the working
+ *   directory and, like `.open-ocr-cli.json`, may not route; its `output` must
+ *   stay inside the working directory and out of hidden directories.
+ * - The operator's `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`
+ *   and `concurrency` are ceilings, and `noConfig` does not remove them: it
+ *   drops the configuration's settings, never the operator's limits.
+ *
+ * Ambient `OPEN_OCR_NO_CONFIG` is the operator's own choice and still disables
+ * the user configuration, exactly as for the CLI.
+ */
+export async function loadMcpCallerConfig(
+  cwd: string,
+  configPath?: string,
+  callerNoConfig = false,
+): Promise<McpCallerConfig> {
+  const operatorDisabled = environmentDisablesConfig();
+  const userPath = path.join(homedir(), '.config', 'open-ocr-cli', 'config.json');
+  const user = operatorDisabled ? {} : await readConfigFile(userPath, false, userPath, true);
+  const ceilings = pickCeilings(user);
+  if (callerNoConfig) return { fileConfig: {}, ceilings, operatorSchema: false };
+
+  let explicit: CliConfigFile = {};
+  if (configPath) {
+    const absolute = await confineCallerPath(cwd, configPath, 'configPath');
+    explicit = await readConfigFile(absolute, true, configPath, true);
+    assertConfigDoesNotRoute(explicit, 'mcp');
+    if (explicit.output !== undefined) await confineCallerPath(cwd, explicit.output, 'output', 'write');
+  }
+  if (operatorDisabled) return { fileConfig: explicit, ceilings, operatorSchema: false };
+
+  const projectPath = path.join(cwd, '.open-ocr-cli.json');
+  const project = await readConfigFile(projectPath, false, projectPath, true);
+  assertProjectConfigDoesNotRoute(project);
+  await assertProjectOutputStaysInProject(project, cwd);
+  const fileConfig = { ...user, ...project, ...explicit };
+  return {
+    fileConfig,
+    ceilings,
+    operatorSchema: user.schema !== undefined && project.schema === undefined && explicit.schema === undefined,
+  };
 }
 
 /**
@@ -335,17 +480,45 @@ const ROUTING_CONFIG_KEYS = [
  * on it from silently sending documents somewhere else.
  */
 function assertProjectConfigDoesNotRoute(project: CliConfigFile): void {
-  const routing: string[] = ROUTING_CONFIG_KEYS.filter((key) => project[key] !== undefined);
-  if (project.gateway !== undefined && project.gateway !== 'direct') routing.unshift('gateway');
+  assertConfigDoesNotRoute(project, 'project');
+}
+
+function routingKeysIn(config: CliConfigFile): string[] {
+  const routing: string[] = ROUTING_CONFIG_KEYS.filter((key) => config[key] !== undefined);
+  if (config.gateway !== undefined && config.gateway !== 'direct') routing.unshift('gateway');
+  return routing;
+}
+
+/**
+ * The same rule for a configuration the MCP caller chose (`configPath`). The
+ * caller is an agent that may be acting on instructions planted in a document;
+ * if its file could set `baseUrl` and `apiKeyEnv`, one tool call would send any
+ * environment variable of the server, as a bearer token, to any host.
+ */
+function assertConfigDoesNotRoute(config: CliConfigFile, source: 'project' | 'mcp'): void {
+  const routing = routingKeysIn(config);
   if (routing.length === 0) return;
+  if (source === 'project') {
+    throw new CliExitError(
+      `.open-ocr-cli.json cannot set ${routing.join(', ')}: a project configuration may not choose where requests or credentials are sent`,
+      2,
+      {
+        code: 'CONFIG_INVALID',
+        category: 'configuration',
+        retryable: false,
+        hint: 'Move these keys to ~/.config/open-ocr-cli/config.json or a file passed with --config, pass them as flags, or run with --no-config.',
+      },
+    );
+  }
   throw new CliExitError(
-    `.open-ocr-cli.json cannot set ${routing.join(', ')}: a project configuration may not choose where requests or credentials are sent`,
+    `configPath cannot set ${routing.join(', ')}: a configuration supplied by the MCP caller may not choose where requests or credentials are sent`,
     2,
     {
       code: 'CONFIG_INVALID',
       category: 'configuration',
       retryable: false,
-      hint: 'Move these keys to ~/.config/open-ocr-cli/config.json or a file passed with --config, pass them as flags, or run with --no-config.',
+      hint: 'Routing belongs to the operator who starts the MCP server: set it in ~/.config/open-ocr-cli/config.json '
+        + 'or the server environment (OPEN_OCR_PROVIDER, OPEN_OCR_GATEWAY, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_AI_GATEWAY_ID).',
     },
   );
 }

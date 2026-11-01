@@ -49,6 +49,7 @@ import {
   type OcrMachineResult,
   type OcrRunResult,
 } from './protocol';
+import type { ResolvedCliOptions } from './types';
 
 const thinkingLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const contentFormats = ['markdown', 'json', 'csv', 'all'] as const;
@@ -240,7 +241,8 @@ const documentPath = z.string().min(1)
   .regex(/^(?!-$).+$/u, 'stdin ("-") is unavailable over MCP; pass a file path');
 
 const PATH_RESOLUTION_NOTE = 'Relative paths resolve against the server working directory, which ocr_capabilities '
-  + 'and the server instructions report; prefer absolute paths.';
+  + 'and the server instructions report; prefer absolute paths. Every path must resolve, with symbolic links '
+  + 'followed, inside that directory.';
 
 const pathInput = z.strictObject({
   type: z.literal('path'),
@@ -254,9 +256,9 @@ const limits = OCR_REQUEST_LIMITS;
 
 const sharedFields = {
   configPath: z.string().min(1).optional()
-    .describe(`Explicit CLI configuration file. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys; routing and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
   noConfig: z.boolean().optional()
-    .describe('Ignore all configuration files and the project .env. Cannot be combined with configPath. Environment overrides still apply; pass explicit provider/model/options for reproducibility.'),
+    .describe('Ignore configuration files and the project .env. Cannot be combined with configPath. The operator\'s limits still apply, as do environment overrides; pass explicit provider/model/options for reproducibility.'),
   provider: z.enum(PROVIDER_IDS).optional()
     .describe('Model provider. Defaults to the configured provider, otherwise gemini.'),
   gateway: z.enum(GATEWAY_IDS).optional()
@@ -266,7 +268,7 @@ const sharedFields = {
   thinking: z.enum(thinkingLevels).optional()
     .describe('Reasoning effort. Supported levels are provider- and model-specific; read them from ocr_capabilities.'),
   outputDirectory: z.string().min(1).optional()
-    .describe(`Where reference artifacts are written. Defaults to .open-ocr-results/<runId>. Reference delivery only. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Where reference artifacts are written. Defaults to .open-ocr-results/<runId>. Reference delivery only. May not be inside a hidden directory other than .open-ocr-results. ${PATH_RESOLUTION_NOTE}`),
   delivery: z.enum(['inline', 'reference']).optional()
     .describe('reference (default) writes artifact files and returns their paths; inline returns content in the response and writes nothing.'),
   resume: z.boolean().optional()
@@ -274,11 +276,11 @@ const sharedFields = {
   timeoutSeconds: z.number().int().min(limits.timeoutSeconds.min).max(limits.timeoutSeconds.max).optional()
     .describe('Per-document time limit.'),
   maxFiles: z.number().int().min(limits.maxFiles.min).max(limits.maxFiles.max).optional()
-    .describe('Refuse the run before any provider call if discovery matches more than this many documents.'),
+    .describe('Refuse the run before any provider call if discovery matches more than this many documents. An operator-configured value is a ceiling; a larger one is lowered to it.'),
   maxTotalMb: z.number().min(limits.maxTotalMb.min).max(limits.maxTotalMb.max).optional()
     .describe('Refuse the run before any provider call if the matched documents exceed this combined size in MB.'),
   maxCostUsd: z.number().min(limits.maxCostUsd.min).max(limits.maxCostUsd.max).optional()
-    .describe('Stop scheduling new requests once estimated paid-tier cost reaches this value.'),
+    .describe('Stop scheduling new requests once estimated paid-tier cost reaches this value. An operator-configured value is a ceiling; a larger one is lowered to it.'),
   requestsPerMinute: z.number().int().min(limits.requestsPerMinute.min).max(limits.requestsPerMinute.max).optional()
     .describe('Cap provider request starts per minute; 0 disables the limit.'),
   dryRun: z.boolean().optional()
@@ -612,9 +614,51 @@ interface ConfirmationPlan {
   gateway: string;
   model: string;
   costLimitUsd?: number;
+  /** Where the documents and credentials go: the endpoint host, scheme-qualified unless https. */
+  destination: string;
+  /** Environment variables whose values travel with the requests. */
+  credentialEnvs: string[];
+  /**
+   * Digest of every resolved option (credential values excluded), so a change
+   * to anything that shapes the run between approval and execution — a config
+   * file edited, an environment variable changed — is detected, not only the
+   * fields the message names.
+   */
+  optionsDigest: string;
 }
 
-function confirmationPlan(result: OcrRunResult): ConfirmationPlan {
+/** The endpoint host a person can recognise; a non-TLS scheme is spelled out. */
+function destinationOf(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' ? url.host : `${url.protocol}//${url.host}`;
+  } catch {
+    return baseUrl;
+  }
+}
+
+function credentialEnvsOf(options: ResolvedCliOptions): string[] {
+  const names: string[] = [];
+  if (!options.cloudflareByok) names.push(options.apiKeyEnv);
+  if (options.gateway === 'cloudflare' && options.gatewayTokenEnv) names.push(options.gatewayTokenEnv);
+  return [...new Set(names)];
+}
+
+function optionsDigest(options: ResolvedCliOptions): string {
+  // Credential values are never hashed into state the client holds; `output`
+  // carries the planning run's own id when the default directory is used, and
+  // the request hash already binds the caller's outputDirectory.
+  const {
+    apiKey: _apiKey,
+    gatewayToken: _gatewayToken,
+    output: _output,
+    dryRun: _dryRun,
+    ...stable
+  } = options;
+  return createHash('sha256').update(JSON.stringify(stable)).digest('base64url');
+}
+
+function confirmationPlan(result: OcrRunResult, options: ResolvedCliOptions): ConfirmationPlan {
   return {
     sources: result.documents.filter((document) => !document.error).map((document) => document.source),
     rejected: result.documents.filter((document) => document.error).length,
@@ -622,6 +666,9 @@ function confirmationPlan(result: OcrRunResult): ConfirmationPlan {
     gateway: result.gateway,
     model: result.model,
     ...(result.costLimitUsd !== undefined ? { costLimitUsd: result.costLimitUsd } : {}),
+    destination: destinationOf(options.baseUrl),
+    credentialEnvs: credentialEnvsOf(options),
+    optionsDigest: optionsDigest(options),
   };
 }
 
@@ -638,8 +685,14 @@ function confirmationMessage(plan: ConfirmationPlan): string {
   // Deliberately not "this calls a paid API": free tiers, local
   // OpenAI-compatible endpoints and preflight failures all exist, and a prompt
   // that overstates what it knows trains people to click through it.
+  const credentials = plan.credentialEnvs.length > 0
+    ? ` with the credential in ${plan.credentialEnvs.join(' and ')}`
+    : '';
+  // Names a person can check against what they expect: the host the documents
+  // and the credential go to, and which environment variable is sent. A
+  // redirected endpoint or a borrowed secret is visible here before approval.
   return `Run OCR on ${documents} ${noun} with ${plan.provider}/${plan.model}${route} (${ceiling})? `
-    + `This sends them to the provider and may incur charges.${rejected}`;
+    + `This sends them to ${oneLine(plan.destination)}${credentials} and may incur charges.${rejected}`;
 }
 
 function confirmationRequestHash(request: OcrJobRequest): string {
@@ -655,11 +708,12 @@ async function planMcpRequest(
   request: OcrJobRequest,
   context: McpRequestContext,
   cwd: string,
-): Promise<OcrMachineResult> {
+): Promise<{ result: OcrMachineResult; options?: ResolvedCliOptions }> {
   const abortController = new AbortController();
   const relayAbort = (): void => abortController.abort(context.mcpReq.signal.reason);
   if (context.mcpReq.signal.aborted) relayAbort();
   else context.mcpReq.signal.addEventListener('abort', relayAbort, { once: true });
+  let options: ResolvedCliOptions | undefined;
   try {
     const execution = await executeOcrJobRequest({ ...request, dryRun: true }, {
       cwd,
@@ -668,10 +722,12 @@ async function planMcpRequest(
       // The live run that follows reports its own warnings.
       onWarning: () => undefined,
       noConfig: request.noConfig,
+      boundary: 'mcp',
+      onResolvedOptions: (resolved) => { options = resolved; },
     });
-    return execution.result;
+    return { result: execution.result, options };
   } catch (error) {
-    return toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error)));
+    return { result: toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error))) };
   } finally {
     context.mcpReq.signal.removeEventListener('abort', relayAbort);
   }
@@ -715,11 +771,11 @@ async function confirmationGate(
   // A request that fails before any document could be sent (bad config, no
   // inputs) or whose every document fails local validation bills nothing:
   // return that outcome instead of asking a person to approve it.
-  const planned = await planMcpRequest(request, context, cwd);
-  if (!('documents' in planned) || planned.documents.every((document) => document.error)) {
+  const { result: planned, options: plannedOptions } = await planMcpRequest(request, context, cwd);
+  if (!('documents' in planned) || planned.documents.every((document) => document.error) || !plannedOptions) {
     return mcpResult(planned);
   }
-  const plan = confirmationPlan(planned);
+  const plan = confirmationPlan(planned, plannedOptions);
   const ask = async (): Promise<InputRequiredResult> => inputRequired({
     inputRequests: {
       [CONFIRM_KEY]: inputRequired.elicit({
@@ -1062,6 +1118,9 @@ async function executeMcpRequest(
         process.stderr.write(`${message}\n`);
       },
       noConfig: request.noConfig,
+      // The MCP caller is untrusted relative to the operator: confine its
+      // paths, refuse routing from its configPath, and cap it by the operator.
+      boundary: 'mcp',
     });
     const artifactWarnings = await artifacts.remember(execution.result);
     if (artifactWarnings.length > 0) {
@@ -1130,6 +1189,7 @@ export function createOcrMcpServer(version: string, cwd = process.cwd()): McpSer
       // working directory here is what lets a relative path be a choice
       // rather than a guess.
       instructions: `Working directory: ${cwd}. Relative paths in tool arguments resolve against it; prefer absolute paths. `
+        + 'Inputs, configPath, schemaPath, and outputDirectory must stay inside it; operator limits are ceilings. '
         + 'Call ocr_capabilities first for presets, per-model thinking levels, accepted MIME types, and limits. '
         + 'Tool calls block until the whole batch finishes, so bound work with maxFiles, maxTotalMb, maxCostUsd, and timeoutSeconds. '
         + 'Use dryRun for local validation, prefer reference delivery, read warnings[] in every result, '
