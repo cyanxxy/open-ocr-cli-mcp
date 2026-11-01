@@ -462,7 +462,9 @@ export class OcrJobService {
           throw asCliExitError(error, 2);
         }
       }
-      summary = await this.runBatchInternal(inputs, options, runtime, events, providerRuntime, plan, warn);
+      summary = await this.runBatchInternal(
+        inputs, options, runtime, events, providerRuntime, plan, warn, batchLock?.acquiredAtMs,
+      );
     } catch (error) {
       failure = error;
     }
@@ -522,6 +524,7 @@ export class OcrJobService {
     providerRuntime: ProviderExecutionContext,
     plan: OutputPlan,
     warn: (message: string) => void,
+    lockAcquiredAtMs?: number,
   ): Promise<BatchSummary> {
     const started = performance.now();
     const startedAt = new Date().toISOString();
@@ -562,8 +565,9 @@ export class OcrJobService {
       });
       // A process killed mid-commit leaves `<artifact>.<pid>-<uuid>.tmp|.bak`
       // beside its targets (and the manifest/summary). This run holds the
-      // batch lock, so no live writer can own them: restore orphaned backups
-      // and remove staging files. A dry run only reports them.
+      // batch lock, so no live writer can own any file last touched before the
+      // lock was taken, even when its PID has since been reused: restore
+      // orphaned backups and remove staging files. A dry run only reports them.
       const transactionTargets = new Set<string>([
         manifest.path,
         path.join(outputDirectory, 'batch-summary.json'),
@@ -585,7 +589,7 @@ export class OcrJobService {
             );
           }
         } else {
-          const recovered = await recoverStaleTransactionFiles(transactionTargets);
+          const recovered = await recoverStaleTransactionFiles(transactionTargets, { lockAcquiredAtMs });
           if (recovered.removed.length > 0 || recovered.restored.length > 0) {
             warn(
               `Recovered an interrupted run in ${outputDirectory}: removed ${recovered.removed.length} stale `

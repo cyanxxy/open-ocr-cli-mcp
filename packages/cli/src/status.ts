@@ -479,7 +479,12 @@ export function renderBatchStatus(report: BatchStatusReport): string {
     lines.push(`Untracked files: ${report.untrackedArtifacts.length} artifact-like file(s) no manifest entry owns; resume will not replace them`);
   }
   if (report.strayTempFiles.length > 0) {
-    lines.push(`Leftover temp files: ${report.strayTempFiles.length} (from an interrupted write; the next extract cleans them up)`);
+    // Recovery runs under the batch lock and removes every leftover last
+    // touched before the lock was taken, whatever its embedded PID, so this
+    // promise holds unless a batch is writing here right now.
+    lines.push(report.activeLock?.state === 'live'
+      ? `Leftover temp files: ${report.strayTempFiles.length} (a batch is running here; they may be its in-progress writes)`
+      : `Leftover temp files: ${report.strayTempFiles.length} (from an interrupted write; the next extract into this directory cleans them up)`);
   }
   const usageLine = (label: string, usage: BatchSummary['usage']): string => (
     `${label}: ${usage.totalTokens} tokens, ${usage.requests} requests, estimated $${usage.estimatedCostUsd.toFixed(6)}`

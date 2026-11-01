@@ -513,20 +513,54 @@ export function isTransactionFileName(name: string): boolean {
   return TRANSACTION_SUFFIX.test(name);
 }
 
+export interface TransactionRecoveryOptions {
+  /**
+   * When the caller's batch lock was taken (the lock file's mtime, so the same
+   * filesystem clock stamps both). See {@link recoverStaleTransactionFiles}.
+   */
+  lockAcquiredAtMs?: number;
+}
+
+/** The later of a file's mtime and ctime (a rename moves ctime), or undefined if it is gone. */
+async function lastTouchedMs(filePath: string): Promise<number | undefined> {
+  try {
+    const stats = await fs.lstat(filePath);
+    return Math.max(stats.mtimeMs, stats.ctimeMs);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
 /**
  * Remove leftovers of a killed artifact or manifest transaction. Must run only
- * while holding the batch lock, so no live writer of this directory can own
- * them. A `.bak` is the previous artifact moved aside mid-commit: it is put
- * back when its target is missing, otherwise discarded. Files whose embedded
- * PID belongs to another live process are left alone.
+ * while holding the batch lock. A `.bak` is the previous artifact moved aside
+ * mid-commit: it is put back when its target is missing, otherwise discarded.
+ *
+ * A leftover whose embedded PID is dead is always stale. A transaction file
+ * cannot record its writer's start time, so a live PID alone does not prove
+ * the writer is still running (the PID may have been reused). With
+ * `lockAcquiredAtMs`, the rule is: every writer of these targets holds the
+ * batch lock, so a file last touched (mtime or ctime) strictly before this
+ * lock was taken belongs to no live transaction and is stale whatever its
+ * PID; files touched since are kept (another process's in-flight lock
+ * staging). Without it, files of other live PIDs are left alone.
  */
 export async function recoverStaleTransactionFiles(
   targets: Iterable<string>,
+  options: TransactionRecoveryOptions = {},
 ): Promise<{ removed: string[]; restored: string[] }> {
   const removed: string[] = [];
   const restored: string[] = [];
   for (const file of await findStaleTransactionFiles(targets)) {
-    if (file.pid !== process.pid && processIsAlive(file.pid)) continue;
+    if (processIsAlive(file.pid)) {
+      if (options.lockAcquiredAtMs === undefined) {
+        if (file.pid !== process.pid) continue;
+      } else {
+        const touched = await lastTouchedMs(file.path);
+        if (touched === undefined || touched >= options.lockAcquiredAtMs) continue;
+      }
+    }
     if (file.kind === 'bak' && !(await pathExists(file.target))) {
       await fs.rename(file.path, file.target);
       restored.push(file.target);
@@ -982,6 +1016,12 @@ export class BatchOutputLock {
   private constructor(
     readonly lockPath: string,
     private readonly owner: BatchLockOwner,
+    /**
+     * The lock file's mtime when it was taken. Leftover transaction files last
+     * touched before it cannot belong to a live writer (see
+     * {@link recoverStaleTransactionFiles}).
+     */
+    readonly acquiredAtMs: number | undefined,
   ) {}
 
   static async acquire(
@@ -1004,7 +1044,13 @@ export class BatchOutputLock {
     for (let attempt = 0; attempt < MAX_LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
       try {
         await writeTextFileAtomically(lockPath, `${JSON.stringify(owner, null, 2)}\n`, false);
-        return new BatchOutputLock(lockPath, owner);
+        let acquiredAtMs: number | undefined;
+        try {
+          acquiredAtMs = (await fs.stat(lockPath)).mtimeMs;
+        } catch {
+          // Without a timestamp, recovery falls back to keeping live PIDs' files.
+        }
+        return new BatchOutputLock(lockPath, owner, acquiredAtMs);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         lastError = error;

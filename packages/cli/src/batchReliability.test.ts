@@ -13,7 +13,7 @@ import {
   processStartIdentity,
   recoverStaleTransactionFiles,
 } from './output';
-import { inspectBatchStatus } from './status';
+import { inspectBatchStatus, renderBatchStatus } from './status';
 import type { ManifestEntry, ResolvedCliOptions } from './types';
 
 const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
@@ -116,6 +116,41 @@ describe('crash-safe resume', () => {
     expect(recovered.restored).toEqual([target]);
     expect(recovered.removed).toEqual([`${target}.${TX}.tmp`]);
     await expect(readFile(target, 'utf8')).resolves.toBe('# previous');
+  });
+
+  it('cleans up leftovers whose embedded PID is alive but was reused, and status turns healthy', async () => {
+    const docs = await seedDocs(['a.jpg']);
+    const options = batchOptions();
+    const out = path.join(directory, 'out');
+    const service = new OcrJobService({ extractDocument: markdownExtractor() });
+    expect((await run(service, [docs], options)).summary.succeeded).toBe(1);
+
+    // A live PID that is not the writer: this test's parent process.
+    const reused = `${process.ppid}-0f8fad5b-d9cb-469f-a165-70867728950e`;
+    const artifact = path.join(out, 'docs', 'a.md');
+    await writeFile(`${artifact}.${reused}.tmp`, 'partial');
+    await writeFile(path.join(out, `.open-ocr-manifest.json.${reused}.tmp`), '{');
+    const before = await inspectBatchStatus(out, directory);
+    expect(before.strayTempFiles).toHaveLength(2);
+    expect(renderBatchStatus(before)).toContain('the next extract into this directory cleans them up');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const warnings: string[] = [];
+    await run(service, [docs], options, warnings);
+    expect(warnings.some((warning) => warning.includes('removed 2 stale staging file(s)'))).toBe(true);
+    const after = await inspectBatchStatus(out, directory);
+    expect(after).toMatchObject({ healthy: true, strayTempFiles: [] });
+  });
+
+  it('keeps a live PID\'s transaction file touched after the lock was taken', async () => {
+    const target = path.join(directory, '.open-ocr.lock');
+    const staging = `${target}.${process.ppid}-0f8fad5b-d9cb-469f-a165-70867728950e.tmp`;
+    await writeFile(staging, '{}');
+    const touched = (await stat(staging)).mtimeMs;
+    const kept = await recoverStaleTransactionFiles([target], { lockAcquiredAtMs: touched });
+    expect(kept.removed).toEqual([]);
+    const removed = await recoverStaleTransactionFiles([target], { lockAcquiredAtMs: touched + 1_000 });
+    expect(removed.removed).toEqual([staging]);
   });
 
   it('recognises its own artifacts across a markdown -> json -> markdown format switch', async () => {
