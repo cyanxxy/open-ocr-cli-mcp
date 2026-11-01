@@ -1,5 +1,105 @@
 # Changelog
 
+## 5.0.0 - 2026-11-01
+
+A security and correctness release. The MCP server now treats its caller as
+untrusted relative to the operator who launched it, which breaks MCP setups
+that read or write outside the server's working directory or route requests
+through a caller-supplied `configPath`. CLI flags behave as before except
+where noted.
+
+### Breaking
+
+- MCP: inputs, globs, `schemaPath`, `configPath`, and `outputDirectory` must
+  resolve inside the server working directory (real paths, so symbolic links
+  pointing out are refused). Launch the server in the documents folder.
+  `outputDirectory` may not be inside a hidden directory other than
+  `.open-ocr-results`.
+- MCP: a `configPath` file may not set `baseUrl`, `apiKeyEnv`, a non-direct
+  `gateway`, `cloudflare*` keys, or BYOK settings (`CONFIG_INVALID`). Set a
+  custom endpoint in `~/.config/open-ocr-cli/config.json` instead.
+- MCP: `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`, and
+  `concurrency` from the operator's configuration are ceilings; larger caller
+  values are lowered with a warning, and `noConfig` no longer removes them.
+- Template results with required-field validation errors are `partial`
+  (`partialReason: "validation_failed"`, exit 1) instead of succeeded.
+- `--max-cost` is enforced on cumulative spend across resumed runs of the same
+  output directory. `--overwrite` and `--no-resume` start a new total.
+- Inputs named like agent instruction files (`CLAUDE`, `AGENTS`, `GEMINI`,
+  `copilot-instructions`, and similar) are written as `<name>.ocr.<ext>`, and
+  agent configuration directories in an input path (`.claude`, `.github`,
+  `.cursor`, ...) become `_claude`, `_github`, ... in the output tree.
+
+### Security
+
+- An MCP caller could send any server environment variable as a credential to
+  any host by pointing `configPath` at a file that set `baseUrl` and
+  `apiKeyEnv`, even with `OPEN_OCR_NO_CONFIG=1`. That is now refused.
+- An MCP caller could write artifacts anywhere, for example a new
+  `~/.config/open-ocr-cli/config.json` or `~/.claude/CLAUDE.md`.
+- The `OPEN_OCR_MCP_CONFIRM` prompt names the destination host and credential
+  variable, and the plan hash covers them and the resolved options, so a
+  change between approval and run asks again.
+- Resolved key values are redacted verbatim (and URL-encoded) from error text,
+  hints, and warnings, not only by pattern. Plain-text MCP errors escape
+  newlines, control, and bidi characters.
+- Config and schema file errors give a position, never file content. Schema
+  and MCP config files must be regular files, so a FIFO cannot hang the server.
+  Config files over 1 MB are refused.
+- Artifact directories are re-resolved right before each write and must stay
+  inside the output directory, narrowing symbolic-link swap races.
+- Public URL fetches have a 120-second total deadline.
+- `glob` 14.0.3 (patched `minimatch`); caller glob length and brace groups are
+  bounded under MCP.
+
+### Fixed
+
+- Markdown output keeps the model's Markdown: heading levels are no longer
+  flattened to `##`, blank lines are not doubled, an H1 after leading text is
+  not demoted, indented code and nested fences are not read as headings.
+  CRLF becomes LF and leading or trailing `<think>` blocks are removed. JSON
+  sections carry an optional heading `level`.
+- Money values keep their sign after a currency code, as a trailing minus, in
+  accounting parentheses, and with U+2212. One separator before exactly three
+  digits is read as grouping (`€1.234` is 1234.00, not 1.23) except for
+  three-decimal currencies, with a warning either way.
+- A preset with fixed columns and no rows gives a header-only CSV with a
+  warning instead of failing.
+- New `OUTPUT_INVALID` error code (category `output`, retryable) for model
+  output that breaks the requested schema, instead of `SCHEMA_INVALID` or
+  `PROVIDER_FAILURE`; messages name the failing path or key.
+- One tolerant JSON extractor (fenced blocks, surrounding prose, balanced and
+  string-aware) serves template, `--schema`, and simple JSON modes.
+- Template mode honours `--max-tokens` (default 16384). Truncation hints say to
+  raise it. Provider refusals are reported as refusals. `{"sections":[]}` is
+  no longer a success.
+- Typed preset fields warn on non-ISO dates and bad emails; non-http(s) URLs
+  are nulled. Unknown field keys and dropped row columns are listed in
+  warnings. Agentic Markdown escapes field values.
+- A SIGKILL mid-batch no longer leaves an unresumable directory: entries are
+  claimed as `pending` before artifacts are written, manifest writes are
+  atomic, and resume cleans stale temp and backup files.
+- Resume fingerprints inputs by SHA-256, so same-size, same-mtime edits are
+  re-extracted. Entries from 4.3.0 are trusted once and upgraded.
+- Resume recognises every artifact a batch wrote, so switching `--format`
+  between runs no longer conflicts with the tool's own files.
+- `Retry-After` (seconds, HTTP-date, `retry-after-ms`, Gemini retry delay) is
+  honoured on 429/503, capped at 60 s. OpenAI `insufficient_quota`, billing
+  and credit errors, HTTP 402, and Gemini daily or zero-limit quotas are not
+  retried.
+- `usage.requests` counts every attempt. Responses without usage are counted
+  in `unreportedUsageRequests`; with `--max-cost` and non-zero prices the run
+  stops new paid work instead of spending without a measure.
+- `--exclude` matches relative to the working directory for directory and glob
+  inputs alike and warns when a pattern matches nothing. A symbolic link and
+  its target are processed once.
+- Batch locks record the process start time, so a reused PID is stale, and
+  racing reclaims get `OUTPUT_CONFLICT` instead of `ENOENT`. `status` reports
+  lock state, interrupted entries, untracked artifacts, stray temp files, and
+  cumulative usage.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.3.0...v5.0.0)
+
 ## 4.3.0 - 2026-10-29
 
 The 4.2.0 tag was created, but its release run failed before publishing, so

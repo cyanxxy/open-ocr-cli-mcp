@@ -149,6 +149,12 @@ on it, because that would bill the same work twice.
 
 ## Output and resume
 
+Artifact names never match files coding agents load as instructions. An input
+named `CLAUDE.png` (or `AGENTS`, `GEMINI`, `copilot-instructions`, and similar)
+is written as `CLAUDE.ocr.md`, and agent configuration directories in an input
+path (`.claude`, `.github`, `.cursor`, ...) become `_claude`, `_github`, ... in
+the output tree. Extracted text is untrusted document content.
+
 Single-file `extract` normally prints content to stdout. `--output` or
 `--format all` writes artifacts; batch `extract` defaults to `./open-ocr-output`.
 Machine/MCP reference jobs default to `.open-ocr-results/<runId>`.
