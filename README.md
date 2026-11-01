@@ -65,9 +65,17 @@ tool_timeout_sec = 600
 | `ocr_web` | Extract content from public URLs |
 | `ocr_read_artifact` | Read a saved result in bounded chunks |
 
+The server's working directory (Claude Code's launch directory, or Codex's
+`cwd`) is its boundary: inputs, `configPath`, `schemaPath`, and
+`outputDirectory` must resolve inside it. Endpoint, credential variable, and
+limits such as `maxCostUsd` belong to whoever starts the server, through
+`~/.config/open-ocr-cli/config.json` or its environment; tool arguments can
+lower those limits but not raise them or reroute requests.
+
 Set `OPEN_OCR_MCP_CONFIRM=1` in the server environment to approve each paid
-run, with the real document count and cost ceiling shown first. Setup for
-other hosts and the full contract: [agent integrations](docs/agent-integrations.md).
+run, with the real document count, cost ceiling, destination host, and
+credential variable shown first. Setup for other hosts, a custom endpoint, and
+the full contract: [agent integrations](docs/agent-integrations.md).
 
 ## CLI
 

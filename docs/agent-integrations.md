@@ -33,7 +33,10 @@ Register a locally installed executable:
 claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
-Start Claude with the provider key already in its environment. Claude Code
+Start Claude with the provider key already in its environment, from the
+directory that holds the documents: the server's working directory is where
+Claude Code launches it, and every MCP path must stay inside it (see
+[Trust boundary](#trust-boundary)). Claude Code
 uses its v2 MCP runtime, which asks stdio servers for revision 2026-07-28, from
 **2.1.232** in sessions that fetch feature flags and from **2.1.274** in the
 others (Bedrock, Vertex, Foundry, telemetry off); nothing needs to be set.
@@ -69,7 +72,10 @@ tool_timeout_sec = 600
 ```
 
 Forward the chosen provider's credential variable instead when appropriate.
-`codex mcp list` checks configuration. The [official MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+`cwd` is the server's working directory and therefore its boundary: inputs,
+`configPath`, `schemaPath`, and `outputDirectory` must all resolve inside it,
+so point it at the folder that holds the documents rather than at `/` or your
+home directory. `codex mcp list` checks configuration. The [official MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 documents these launch, environment, directory, and timeout fields but does not
 establish this exact protocol revision for every Codex client. Revision support
 remains unverified here; use the CLI protocol if the host cannot connect. The
@@ -107,7 +113,8 @@ artifacts, and typed failure recovery; it does not require MCP.
 Launch `open-ocr-cli mcp`. Its server identity is `open-ocr-cli-mcp`; the
 configuration name `open-ocr` in the examples is a host-chosen label. Call
 `ocr_capabilities` first: its result is `{ workingDirectory, capabilities }`.
-Use `capabilities` for providers and model limits, and prefer absolute paths.
+Use `capabilities` for providers and model limits, and prefer absolute paths
+inside `workingDirectory`.
 The installed [TypeScript SDK is 2.3.0](https://github.com/modelcontextprotocol/typescript-sdk/releases/tag/v2.3.0).
 
 | Tool | Purpose |
@@ -145,13 +152,78 @@ available in structured content; prefer references to avoid context overload.
 Set `OPEN_OCR_MCP_CONFIRM=1` in the server environment for operator-controlled
 confirmation before provider calls. The server plans the request locally first,
 so the prompt names the real document count after folder and glob expansion,
-the resolved provider/model, and the effective cost ceiling; a request that
-would send nothing is answered without a prompt, and if the plan changes before
-the confirmed retry the server asks again. The client must support form
+the resolved provider/model, the effective cost ceiling, the destination host
+(the endpoint or gateway the documents go to), and the environment variable
+whose value is sent as the credential; a request that would send nothing is
+answered without a prompt. If the plan changes before the confirmed retry
+(documents, route, credential variable, or any other resolved option, for
+example an edited configuration file) the server asks again. The client must support form
 elicitation through the current protocol's continuation mechanism; Claude Code
 answers it only in interactive sessions, so `claude -p` and Agent SDK runs
 cannot confirm. Dry runs need none. Only the server's own environment enables
 it; a project `.env` cannot. Never put this switch under model control.
+
+## Trust boundary
+
+The MCP server separates two parties. The **operator** starts
+`open-ocr-cli mcp` and controls its environment, its working directory, and
+`~/.config/open-ocr-cli/config.json`. The **caller** is the agent sending tool
+calls, which may be acting on instructions planted in a document it read, so
+the server does not let tool arguments override the operator:
+
+- **Routing and credentials.** Only the operator chooses where requests go and
+  which variable's value is sent. A `configPath` file, like a project
+  `.open-ocr-cli.json`, may not set `baseUrl`, `apiKeyEnv`, a non-`direct`
+  `gateway`, any `cloudflare*` key, or BYOK settings; the call fails with
+  `CONFIG_INVALID`. This also holds under `OPEN_OCR_NO_CONFIG=1`. The `provider`
+  argument picks a provider, which then uses its own documented endpoint and
+  default key variable; the `gateway: "cloudflare"` argument uses only the
+  operator's `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_AI_GATEWAY_ID` (or user
+  configuration) and token variable.
+- **Paths.** Inputs (paths and globs), `configPath`, `schemaPath`, and
+  `outputDirectory` must resolve inside the server working directory, with
+  symbolic links followed; a link that points outside is refused, globs may not
+  be absolute or contain `..`, and every matched file is checked again after
+  expansion. `outputDirectory` (and a `configPath` `output`) may not be inside a
+  hidden directory such as `.git` or `.claude`, except the default
+  `.open-ocr-results`. Configuration and schema files must be regular files.
+- **Limits.** `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`, and
+  `concurrency` in the operator's user configuration are ceilings. A caller
+  argument, `configPath`, or project file may lower them; a larger value (or an
+  unlimited `requestsPerMinute: 0` or missing `maxCostUsd`) is lowered to the
+  ceiling with a warning in `warnings`. `noConfig: true` drops configuration
+  settings but not these ceilings.
+- **Errors.** Credential values in use are scrubbed from every error message,
+  hint, and warning, as are credential-shaped strings. Configuration and schema
+  parse errors report a position, never the file's contents.
+
+The `run` command is unaffected: its caller is the person at the terminal.
+
+### Custom endpoint for the operator
+
+To use an OpenAI-compatible endpoint (vLLM, Ollama on another host, an internal
+gateway) over MCP, put the route in the operator's user configuration, which
+the server reads at each call:
+
+```json
+{
+  "provider": "openai-compatible",
+  "baseUrl": "https://ocr.internal.example/v1",
+  "model": "your-model-id",
+  "apiKeyEnv": "INTERNAL_OCR_KEY",
+  "maxCostUsd": 5,
+  "maxFiles": 200
+}
+```
+
+Save it as `~/.config/open-ocr-cli/config.json` (`open-ocr-cli init --global`
+writes the same file) and forward `INTERNAL_OCR_KEY` to the server, for example
+`env_vars = ["INTERNAL_OCR_KEY"]` in Codex. Provider, gateway, and model can
+also come from the server environment (`OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`,
+`OPEN_OCR_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_GATEWAY_ID`); a custom
+`baseUrl` or `apiKeyEnv` has no environment variable and needs the user
+configuration. Do not set `OPEN_OCR_NO_CONFIG=1` for such a server, since it
+disables the user configuration.
 
 ## Other runtimes and verification
 

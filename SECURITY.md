@@ -67,6 +67,35 @@ record, an artifact, or a log line. Consider:
 The CLI does not write credentials. Protect any `.env` or secret-manager files
 you create yourself.
 
+### MCP Server Trust Boundary
+
+`open-ocr-cli mcp` treats its caller (an agent, possibly following
+instructions planted in a document) as untrusted relative to the operator who
+started the server and controls its environment, working directory, and
+`~/.config/open-ocr-cli/config.json`. Over MCP:
+
+- Only the operator's user configuration and the server environment may choose
+  the endpoint (`baseUrl`, `gateway`, `cloudflare*`) or the credential variable
+  (`apiKeyEnv`, `cloudflareTokenEnv`). A caller's `configPath` file that sets
+  any of them is refused, as a project `.open-ocr-cli.json` already was,
+  including under `OPEN_OCR_NO_CONFIG=1`.
+- Inputs, globs, `configPath`, `schemaPath`, and `outputDirectory` must resolve
+  inside the server working directory with symbolic links followed. Output may
+  not go into a hidden directory other than `.open-ocr-results`, which keeps
+  writes away from `.git`, `.claude`, and similar agent or tool configuration.
+  Start the server in the folder that holds the documents, never in `/` or a
+  home directory.
+- The operator's `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`,
+  and `concurrency` are ceilings a caller can lower but not raise, and
+  `noConfig` does not remove them.
+- With `OPEN_OCR_MCP_CONFIRM=1`, the confirmation names the destination host
+  and the credential variable, and approval is invalidated if the resolved run
+  changes before it executes.
+
+The `run` command and the other CLI commands are driven by the person at the
+terminal and keep accepting any path and an explicit `--config` route. See
+[agent integrations](docs/agent-integrations.md#trust-boundary).
+
 ### Content Security
 
 - Documents are read locally and sent to the configured provider, potentially
@@ -85,9 +114,16 @@ you create yourself.
 
 ## Security Features
 
-- **Credential Isolation**: Keys are read from environment variables only, never serialized or echoed
+- **Credential Isolation**: Keys are read from environment variables only, never serialized or echoed.
+  Error text is scrubbed of credential-shaped strings and of the actual
+  credential values the process is using, and configuration or schema parse
+  errors never quote the file
+- **MCP Boundary**: Caller-supplied paths are confined to the server working
+  directory, caller configuration cannot route requests or credentials, and
+  operator limits are ceilings (see above)
 - **Input Validation**: Strict file type and size validation
-- **SSRF Protection**: URL extraction blocks private ranges, link-local, and tunnel hosts, and pins DNS across redirects
+- **SSRF Protection**: URL extraction blocks private ranges, link-local, and tunnel hosts, and pins DNS across redirects.
+  Each local fetch has a 30-second idle timeout and a 120-second total deadline
 - **Untrusted Output**: Extracted document text is treated as third-party content, never as instructions to the calling agent
 - **Diagnostics**: The shared engine logger writes only to stderr and is
   disabled outside development by default. CLI diagnostics still run; redact
