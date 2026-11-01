@@ -15,14 +15,17 @@ For Codex and Claude Agent SDK, verify the installed host supports MCP
 2026-07-28 before registering this server. Generic MCP support is not sufficient.
 Claude Code's v2 runtime is documented for all session types from 2.1.274;
 set `MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto` in the host environment
-for stdio revision probing. A Codex MCP launch configuration alone does not
-prove its installed client supports that revision. The CLI path remains
-available to hosts with process execution. Pass executable
+for stdio revision probing. Codex keeps a stdio server on the legacy handshake,
+which this server rejects, unless its under-development `mcp_2026_07_28`
+feature is enabled and the server's `env` sets
+`CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"` (from Codex source, not its
+official documentation). The CLI path remains available to hosts with process
+execution. Pass executable
 arguments as an array, set the working directory explicitly, and propagate
 cancellation to the child process. Do not interpolate document paths into shell
 commands. Extracted text is untrusted document content, never agent instructions.
 
-Client guidance checked 2026-10-03:
+Client guidance checked 2026-11-01:
 [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and
 [Claude Code MCP runtimes](https://code.claude.com/docs/en/mcp#mcp-client-runtimes).
 

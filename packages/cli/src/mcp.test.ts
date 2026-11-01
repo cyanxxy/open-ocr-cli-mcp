@@ -569,6 +569,60 @@ describe('Open OCR MCP server', () => {
       expect((tools.result?.tools as unknown[]).length).toBe(5);
     });
 
+    it('checks the declared protocol version on every request, not only the first', async () => {
+      const { request } = await driveServer(process.cwd());
+      const first = await request(1, 'tools/list', { _meta: modernMeta() });
+      expect(first.error).toBeUndefined();
+
+      let id = 2;
+      for (const version of ['2025-11-25', '1900-01-01', '2027-01-01']) {
+        for (const method of ['tools/list', 'server/discover', 'resources/list']) {
+          const reply = await request(id++, method, {
+            _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': version },
+          });
+          expect(reply.result, `${method} ${version}`).toBeUndefined();
+          expect(reply.error, `${method} ${version}`).toEqual({
+            code: -32022,
+            message: `Unsupported protocol version: ${version}`,
+            data: { supported: ['2026-07-28'], requested: version },
+          });
+        }
+      }
+      const toolCall = await request(id++, 'tools/call', {
+        name: 'ocr_capabilities',
+        arguments: {},
+        _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': '2025-11-25' },
+      });
+      expect(toolCall.error?.code).toBe(-32022);
+
+      // A request that names no version at all gets the same error the SDK
+      // gives a first request, without a fabricated `requested`.
+      const { 'io.modelcontextprotocol/protocolVersion': _version, ...withoutVersion } = modernMeta();
+      for (const params of [undefined, {}, { _meta: withoutVersion }]) {
+        const reply = await request(id++, 'tools/list', params);
+        expect(reply.error).toEqual({
+          code: -32022,
+          message: 'Unsupported protocol version: the request did not name a protocol version',
+          data: { supported: ['2026-07-28'] },
+        });
+      }
+
+      const still = await request(id, 'tools/list', { _meta: modernMeta() });
+      expect(still.error).toBeUndefined();
+    });
+
+    it('answers an unsupported first request in the same shape as later ones', async () => {
+      const { request } = await driveServer(process.cwd());
+      const reply = await request(1, 'tools/list', {
+        _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': '2025-11-25' },
+      });
+      expect(reply.error).toEqual({
+        code: -32022,
+        message: 'Unsupported protocol version: 2025-11-25',
+        data: { supported: ['2026-07-28'], requested: '2025-11-25' },
+      });
+    });
+
     it('pins the reusable server factory to 2026-07-28', async () => {
       const { request } = await driveServer(process.cwd(), true);
 
@@ -688,6 +742,50 @@ describe('Open OCR MCP server', () => {
         ok: false,
         error: { code: 'AUTH_MISSING' },
       });
+    });
+
+    it.each([
+      ['a wrapped { method, result } envelope', { method: 'elicitation/create', result: { action: 'accept', content: { proceed: true } } }, 'wrapped'],
+      ['a bare string', 'yes', 'is not an object'],
+      ['an unknown action', { action: 'yes', content: { proceed: true } }, 'action must be'],
+      ['non-object content', { action: 'accept', content: 'true' }, 'content must be an object'],
+    ])('answers a malformed confirmation (%s) with a JSON-RPC invalid-params error', async (_label, answer, detail) => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      const { request } = await driveServer(process.cwd());
+      const args = { urls: ['https://example.com/report'], noConfig: true };
+      const asked = await request(1, 'tools/call', { name: 'ocr_web', arguments: args, _meta: modernMeta() });
+      expect(asked.result?.resultType).toBe('input_required');
+
+      const retried = await request(2, 'tools/call', {
+        name: 'ocr_web',
+        arguments: args,
+        inputResponses: { proceed: answer },
+        requestState: asked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(retried.result).toBeUndefined();
+      expect(retried.error).toMatchObject({
+        code: -32602,
+        data: { reason: 'malformed_input_response', key: 'proceed' },
+      });
+      expect(retried.error?.message).toContain(detail);
+      expect(retried.error?.message).toMatch(/^Invalid inputResponses: /u);
+    });
+
+    it('ignores input responses it never asked for and re-asks when the answer is missing', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      const { request } = await driveServer(process.cwd());
+      const args = { urls: ['https://example.com/report'], noConfig: true };
+      const asked = await request(1, 'tools/call', { name: 'ocr_web', arguments: args, _meta: modernMeta() });
+      const retried = await request(2, 'tools/call', {
+        name: 'ocr_web',
+        arguments: args,
+        inputResponses: { unrelated: 'whatever' },
+        requestState: asked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(retried.error).toBeUndefined();
+      expect(retried.result?.resultType).toBe('input_required');
     });
 
     const clearCredentials = (): void => {
@@ -906,6 +1004,63 @@ describe('Open OCR MCP server', () => {
         expect(ok.result?.structuredContent).toMatchObject({ ok: true, total: 1 });
       });
 
+      it('reads file names with glob characters as the literal files they name', async () => {
+        const { cwd } = await workspace();
+        const names = ['Scan (1).jpg', 'inv[2].jpg', '{draft}.jpg', 'a!b.jpg', 'what?.jpg'];
+        for (const name of names) await writeFile(path.join(cwd, name), JPEG_BYTES);
+        for (const name of names) {
+          for (const input of [name, path.join(cwd, name)]) {
+            const reply = await extract(cwd, { inputs: [{ type: 'path', path: input }], dryRun: true, delivery: 'inline' });
+            expect(reply.result?.structuredContent, input).toMatchObject({ ok: true, status: 'validated', total: 1 });
+          }
+        }
+        // Still a glob when nothing has that exact name, and still refused outside.
+        const missing = await extract(cwd, { inputs: [{ type: 'path', path: path.join(cwd, 'Missing (9).jpg') }], dryRun: true, delivery: 'inline' });
+        expect(errorOf(missing).code).toBe('INPUT_NOT_FOUND');
+        const glob = await extract(cwd, { inputs: [{ type: 'path', path: path.join(cwd, '*.jpg') }], dryRun: true, delivery: 'inline' });
+        expect(glob.result?.structuredContent).toMatchObject({ ok: true, total: names.length + 1 });
+        // An absolute glob through another spelling of the working directory is
+        // judged by where its literal prefix resolves.
+        const alias = path.join(path.dirname(cwd), 'alias');
+        await symlink(cwd, alias);
+        const viaAlias = await extract(cwd, { inputs: [{ type: 'path', path: path.join(alias, '*.jpg') }], dryRun: true, delivery: 'inline' });
+        expect(viaAlias.result?.structuredContent).toMatchObject({ ok: true, total: names.length + 1 });
+      });
+
+      it.each([
+        'Project (2024)',
+        'scans[old]',
+        'drafts {a,b}',
+        'mixed (1) [2] {3} !4',
+      ])('serves a working directory named %s, with absolute paths and globs', async (name) => {
+        const { cwd: base, outside } = await workspace();
+        const cwd = path.join(base, name);
+        await mkdir(cwd);
+        await writeFile(path.join(cwd, 'scan.jpg'), JPEG_BYTES);
+        await writeFile(path.join(cwd, 'Page (2).jpg'), JPEG_BYTES);
+        await mkdir(path.join(cwd, 'sub'));
+        await writeFile(path.join(cwd, 'sub', 'deep.jpg'), JPEG_BYTES);
+        const run = async (input: string): Promise<JsonRpcReply> => extract(cwd, {
+          inputs: [{ type: 'path', path: input }], dryRun: true, delivery: 'inline',
+        });
+        for (const [input, total] of [
+          [path.join(cwd, 'scan.jpg'), 1],
+          [path.join(cwd, 'Page (2).jpg'), 1],
+          ['scan.jpg', 1],
+          [path.join(cwd, '*.jpg'), 2],
+          [path.join(cwd, '**', '*.jpg'), 3],
+          [`${path.join(cwd, 'sub')}${path.sep}*.jpg`, 1],
+          ['*.jpg', 2],
+        ] as const) {
+          const reply = await run(input);
+          expect(reply.result?.structuredContent, input).toMatchObject({ ok: true, status: 'validated', total });
+        }
+        for (const input of [path.join(cwd, '..', '*.jpg'), `${outside}/*.jpg`, path.join(cwd, '{..,sub}', '*.jpg')]) {
+          const reply = await run(input);
+          expect(errorOf(reply).code, input).toBe('INPUT_INVALID');
+        }
+      });
+
       it('refuses an outputDirectory outside the working directory or inside a hidden directory', async () => {
         const { cwd, home, outside } = await workspace();
         await mkdir(path.join(cwd, '.git'));
@@ -932,6 +1087,24 @@ describe('Open OCR MCP server', () => {
         }
         // Nothing was written outside the project by the refused calls.
         await expect(readFile(path.join(home, '.config', 'open-ocr-cli', 'config.json'))).rejects.toThrow();
+      });
+
+      it('never plans an artifact with a hidden name, even with outputDirectory "."', async () => {
+        const { cwd } = await workspace();
+        await mkdir(path.join(cwd, '.devcontainer'));
+        await writeFile(path.join(cwd, '.mcp.jpg'), JPEG_BYTES);
+        await writeFile(path.join(cwd, '.devcontainer', 'devcontainer.jpg'), JPEG_BYTES);
+        const reply = await extract(cwd, {
+          inputs: [{ type: 'path', path: '.mcp.jpg' }, { type: 'path', path: '.devcontainer/devcontainer.jpg' }],
+          outputDirectory: '.',
+          contentFormat: 'json',
+          dryRun: true,
+        });
+        const documents = (reply.result?.structuredContent as {
+          documents: Array<{ plannedArtifacts: Array<{ path: string }> }>;
+        }).documents;
+        const planned = documents.flatMap((document) => document.plannedArtifacts.map((artifact) => artifact.path));
+        expect(planned.sort()).toEqual([path.join(cwd, '_devcontainer', 'devcontainer.json'), path.join(cwd, '_mcp.json')]);
       });
 
       it('confines a caller configPath "output" the same way', async () => {
@@ -966,6 +1139,43 @@ describe('Open OCR MCP server', () => {
         await writeFile(path.join(cwd, 'loose.json'), JSON.stringify({ maxCostUsd: 500 }));
         const viaFile = await extract(cwd, { inputs: [{ type: 'path', path: 'scan.jpg' }], configPath: 'loose.json', dryRun: true, delivery: 'inline' });
         expect(viaFile.result?.structuredContent).toMatchObject({ ok: true, costLimitUsd: 0.01 });
+      });
+
+      it('refuses prices from a caller configPath or the project file, which would defeat the cost ceiling', async () => {
+        const { cwd, home } = await workspace();
+        await writeOperatorConfig(home, { maxCostUsd: 0.01 });
+        const free = { inputPricePerMillionUsd: 0, outputPricePerMillionUsd: 0 };
+        await writeFile(path.join(cwd, 'free.json'), JSON.stringify(free));
+        const viaConfigPath = await extract(cwd, {
+          inputs: [{ type: 'path', path: 'scan.jpg' }], configPath: 'free.json', dryRun: true, delivery: 'inline',
+        });
+        expect(errorOf(viaConfigPath).code).toBe('CONFIG_INVALID');
+        expect(errorOf(viaConfigPath).message).toMatch(
+          /^configPath cannot set inputPricePerMillionUsd, outputPricePerMillionUsd over MCP/u,
+        );
+
+        await writeFile(path.join(cwd, '.open-ocr-cli.json'), JSON.stringify({ outputPricePerMillionUsd: 0.000001 }));
+        const viaProject = await extract(cwd, { inputs: [{ type: 'path', path: 'scan.jpg' }], dryRun: true, delivery: 'inline' });
+        expect(errorOf(viaProject).code).toBe('CONFIG_INVALID');
+        expect(errorOf(viaProject).message).toMatch(/^\.open-ocr-cli\.json cannot set outputPricePerMillionUsd over MCP/u);
+      });
+
+      it('applies operator prices only to the operator\'s own model', async () => {
+        const { cwd, home } = await workspace();
+        await writeOperatorConfig(home, {
+          provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9/v1', model: 'priced', apiKeyEnv: 'FAKE_SECRET',
+          inputPricePerMillionUsd: 5, outputPricePerMillionUsd: 20, maxCostUsd: 0.01,
+        });
+        const inputs = [{ type: 'path', path: 'scan.jpg' }];
+        const own = await extract(cwd, { inputs, dryRun: true, delivery: 'inline' });
+        expect(own.result?.structuredContent).toMatchObject({ ok: true, costLimitUsd: 0.01 });
+
+        // A caller file that swaps the model must not inherit the operator's
+        // prices for it: the ceiling then cannot be accounted for and is refused.
+        await writeFile(path.join(cwd, 'swap.json'), JSON.stringify({ model: 'unpriced-and-expensive' }));
+        const swapped = await extract(cwd, { inputs, configPath: 'swap.json', dryRun: true, delivery: 'inline' });
+        expect(errorOf(swapped).code).toBe('CONFIG_INVALID');
+        expect(errorOf(swapped).message).toMatch(/execution\.maxCostUsd for openai-compatible\/unpriced-and-expensive requires both/u);
       });
 
       it('names the destination host and credential variable, and re-asks when the route changes', async () => {

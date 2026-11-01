@@ -85,9 +85,22 @@ started the server and controls its environment, working directory, and
   writes away from `.git`, `.claude`, and similar agent or tool configuration.
   Start the server in the folder that holds the documents, never in `/` or a
   home directory.
+- An input that exists is confined as the literal path it names, even when the
+  name contains glob characters (`Scan (1).pdf`, or any file under a working
+  directory named `Project (2024)`); only a path that does not exist is expanded
+  as a glob. An absolute glob is accepted only when it starts with the working
+  directory or its literal prefix resolves inside it, a glob may not contain
+  `..`, and every match is realpath-checked again after expansion.
 - The operator's `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`,
   and `concurrency` are ceilings a caller can lower but not raise, and
   `noConfig` does not remove them.
+- Token prices (`inputPricePerMillionUsd`, `outputPricePerMillionUsd`) come only
+  from the operator's user configuration or the verified price table. A
+  caller's `configPath` or a project `.open-ocr-cli.json` that sets them is
+  refused, because a price of 0 would make every request free on paper and
+  defeat both the `maxCostUsd` ceiling and the fail-closed stop for a paid
+  response that reports no usage. The operator's prices are dropped when the
+  caller's configuration switches the provider or model they describe.
 - With `OPEN_OCR_MCP_CONFIRM=1`, the confirmation names the destination host
   and the credential variable, and approval is invalidated if the resolved run
   changes before it executes.
@@ -95,6 +108,25 @@ started the server and controls its environment, working directory, and
 The `run` command and the other CLI commands are driven by the person at the
 terminal and keep accepting any path and an explicit `--config` route. See
 [agent integrations](docs/agent-integrations.md#trust-boundary).
+
+### Artifact Paths
+
+These apply to every run, CLI and MCP alike, because extracted text and input
+file names are document-controlled:
+
+- No directory or file an extraction writes starts with a dot. Artifact paths
+  mirror the input's relative path, so an input `.mcp.png` would otherwise
+  become `.mcp.json` (a project MCP server configuration Claude Code loads) and
+  `.devcontainer/devcontainer.png` would become `.devcontainer/devcontainer.json`.
+  The leading dot of each hidden segment is rewritten to `_` (`_mcp.json`,
+  `_devcontainer/`), and agent instruction names such as `CLAUDE` or `AGENTS`
+  gain `.ocr` (`CLAUDE.ocr.md`).
+- Missing artifact directories are created one level at a time from the output
+  directory. Each existing component is checked first, and a non-directory or a
+  symbolic link that resolves outside the output directory is refused before
+  anything is created beneath it, so a directory swapped for a link cannot make
+  the run create directories elsewhere. (Node has no per-component
+  `openat`/`O_NOFOLLOW`, so this narrows the race rather than closing it.)
 
 ### Content Security
 

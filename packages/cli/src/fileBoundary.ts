@@ -186,3 +186,74 @@ export function assertCallerPatternBounded(cwd: string, pattern: string, kind: '
     throw callerBoundaryError('input', `${label} may not contain ".." segments: ${pattern}`, cwd);
   }
 }
+
+/** Glob syntax, as discovery reads it (see `isGlobPattern` in inputs.ts). */
+export const GLOB_SYNTAX = /[*?{}[\]()!]/u;
+
+/**
+ * The part of an absolute pattern below `directory`, or `undefined` when the
+ * pattern does not start with it.
+ */
+function patternBelowDirectory(directory: string, pattern: string): string | undefined {
+  const spellings = new Set([directory, directory.split(path.sep).join('/')]);
+  for (const spelling of spellings) {
+    for (const separator of new Set([path.sep, '/'])) {
+      const prefix = spelling.endsWith(separator) ? spelling : `${spelling}${separator}`;
+      if (pattern.startsWith(prefix) && pattern.length > prefix.length) return pattern.slice(prefix.length);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Bound and confine a glob an MCP caller sent as an input, and return the
+ * pattern discovery should expand.
+ *
+ * A relative pattern is checked by {@link assertCallerPatternBounded}. An
+ * absolute one that starts with the working directory (as spelled, or as its
+ * real path) is handed to discovery relative to it. Stripping the directory,
+ * instead of escaping it into the pattern, is what lets a working directory
+ * such as `Project (2024)`, `scans[old]` or `{draft}` hold globs at all:
+ * discovery matches a relative pattern against `cwd` as a literal path, while
+ * an escaped absolute prefix would rely on the glob library escaping every
+ * metacharacter (its `escape` leaves braces alone) the same way everywhere.
+ *
+ * Any other absolute pattern is accepted only when the literal directory
+ * before its first glob character resolves, symbolic links followed, inside
+ * the working directory; that prefix holds no glob syntax by construction, so
+ * the pattern is used as sent. Matches are realpath-checked again after
+ * discovery either way.
+ */
+export async function confineCallerPattern(cwd: string, pattern: string): Promise<string> {
+  if (!path.isAbsolute(pattern)) {
+    assertCallerPatternBounded(cwd, pattern, 'input');
+    return pattern;
+  }
+  const root = await realpath(cwd);
+  for (const directory of new Set([path.resolve(cwd), root])) {
+    const relative = patternBelowDirectory(directory, pattern);
+    if (relative !== undefined) {
+      assertCallerPatternBounded(cwd, relative, 'input');
+      return relative;
+    }
+  }
+  // The same length, brace, and `..` limits as a relative pattern; only the
+  // "must be relative" rule is lifted, by checking the pattern below its root.
+  assertCallerPatternBounded(cwd, pattern.replace(/^(?:[A-Za-z]:)?[\\/]+/u, ''), 'input');
+  const literal = pattern.slice(0, pattern.search(GLOB_SYNTAX));
+  const literalDirectory = /[\\/]$/u.test(literal) ? literal : path.dirname(literal);
+  let resolved: string;
+  try {
+    resolved = await realpathOfNearestAncestor(literalDirectory);
+  } catch {
+    resolved = path.resolve(literalDirectory);
+  }
+  if (escapesRoot(path.relative(root, resolved))) {
+    throw callerBoundaryError(
+      'input',
+      `Input pattern resolves outside the MCP server working directory: ${pattern}`,
+      cwd,
+    );
+  }
+  return pattern;
+}

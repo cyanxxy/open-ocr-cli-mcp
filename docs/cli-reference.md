@@ -154,11 +154,17 @@ on it, because that would bill the same work twice.
 
 ## Output and resume
 
-Artifact names never match files coding agents load as instructions. An input
-named `CLAUDE.png` (or `AGENTS`, `GEMINI`, `copilot-instructions`, and similar)
-is written as `CLAUDE.ocr.md`, and agent configuration directories in an input
-path (`.claude`, `.github`, `.cursor`, ...) become `_claude`, `_github`, ... in
-the output tree. Extracted text is untrusted document content.
+Artifact names never match files coding agents load as instructions or tools
+load as configuration. An input named `CLAUDE.png` (or `AGENTS`, `GEMINI`,
+`copilot-instructions`, and similar) is written as `CLAUDE.ocr.md`. No
+directory or file name in the output tree starts with a dot: the leading dot of
+every hidden segment of the input path becomes `_`, so `.claude/x.png` is
+written under `_claude/`, `.devcontainer/devcontainer.png` as
+`_devcontainer/devcontainer.json`, and `.mcp.png` as `_mcp.json` rather than a
+project MCP configuration. This applies to every run, CLI and MCP alike. A
+resumed entry whose recorded artifact still has a hidden name (written before
+5.0) is re-extracted into the new layout. Extracted text is untrusted document
+content.
 
 Single-file `extract` normally prints content to stdout. `--output` or
 `--format all` writes artifacts; batch `extract` defaults to `./open-ocr-output`.

@@ -68,7 +68,7 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
 5. Confirm both the automatic dispatch and tagged release runs succeeded and
    published all five surfaces: npm, GitHub Release,
    `ghcr.io/cyanxxy/open-ocr-cli`, the attached Homebrew formula, and the moving
-   matching major GitHub Action tag (currently `v4`). The workflow only moves
+   matching major GitHub Action tag (currently `v5`). The workflow only moves
    that major tag forward from an ancestor
    and uses a force-with-lease so a concurrent tag change cannot be overwritten.
    Install from npm and run `open-ocr-cli doctor` once outside the repository.

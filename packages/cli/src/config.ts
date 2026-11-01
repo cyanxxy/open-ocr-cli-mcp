@@ -393,6 +393,9 @@ export interface McpCallerConfig {
  * - The caller's `configPath` must be a regular file inside the working
  *   directory and, like `.open-ocr-cli.json`, may not route; its `output` must
  *   stay inside the working directory and out of hidden directories.
+ * - Neither the caller's `configPath` nor `.open-ocr-cli.json` may set token
+ *   prices, which decide whether the cost ceiling can trip; the operator's
+ *   prices apply only while the caller keeps the operator's provider and model.
  * - The operator's `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`
  *   and `concurrency` are ceilings, and `noConfig` does not remove them: it
  *   drops the configuration's settings, never the operator's limits.
@@ -416,6 +419,7 @@ export async function loadMcpCallerConfig(
     const absolute = await confineCallerPath(cwd, configPath, 'configPath');
     explicit = await readConfigFile(absolute, true, configPath, true);
     assertConfigDoesNotRoute(explicit, 'mcp');
+    assertMcpConfigDoesNotPrice(explicit, 'configPath');
     if (explicit.output !== undefined) await confineCallerPath(cwd, explicit.output, 'output', 'write');
   }
   if (operatorDisabled) return { fileConfig: explicit, ceilings, operatorSchema: false };
@@ -423,13 +427,71 @@ export async function loadMcpCallerConfig(
   const projectPath = path.join(cwd, '.open-ocr-cli.json');
   const project = await readConfigFile(projectPath, false, projectPath, true);
   assertProjectConfigDoesNotRoute(project);
+  // The caller's agent can usually edit the project file as easily as its own
+  // configPath, so over MCP the same price rule applies to it.
+  assertMcpConfigDoesNotPrice(project, '.open-ocr-cli.json');
   await assertProjectOutputStaysInProject(project, cwd);
-  const fileConfig = { ...user, ...project, ...explicit };
+  const fileConfig = withOperatorPricesOnlyForOperatorModel({ ...user, ...project, ...explicit }, user);
   return {
     fileConfig,
     ceilings,
     operatorSchema: user.schema !== undefined && project.schema === undefined && explicit.schema === undefined,
   };
+}
+
+/**
+ * Keys that feed the cost estimate behind `maxCostUsd` and the fail-closed
+ * "paid response without usage" gate. A per-million price of 0 makes every
+ * request free on paper, so the operator's cost ceiling never trips and a
+ * response without usage is no longer treated as paid.
+ */
+const PRICE_CONFIG_KEYS = [
+  'inputPricePerMillionUsd', 'outputPricePerMillionUsd',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+/**
+ * Over MCP, prices come only from the operator's user configuration (or the
+ * verified price table). A caller-chosen `configPath` or the project file that
+ * could set them would turn the operator's `maxCostUsd` ceiling into a number
+ * the caller controls. Refused rather than ignored, like routing keys, so a
+ * setup that relied on them fails visibly instead of being billed differently.
+ */
+function assertMcpConfigDoesNotPrice(config: CliConfigFile, source: 'configPath' | '.open-ocr-cli.json'): void {
+  const pricing = PRICE_CONFIG_KEYS.filter((key) => config[key] !== undefined);
+  if (pricing.length === 0) return;
+  throw new CliExitError(
+    `${source} cannot set ${pricing.join(', ')} over MCP: prices decide whether the operator's maxCostUsd ceiling and the usage-unknown cost gate can trip`,
+    2,
+    {
+      code: 'CONFIG_INVALID',
+      category: 'configuration',
+      retryable: false,
+      hint: 'Prices belong to the operator who starts the MCP server: set inputPricePerMillionUsd and '
+        + 'outputPricePerMillionUsd in ~/.config/open-ocr-cli/config.json, or rely on the verified price table.',
+    },
+  );
+}
+
+/**
+ * The operator's prices describe the operator's provider and model. If the
+ * caller's configuration switches either, those prices would be applied to a
+ * model they were never meant for (a cheap model's prices on an expensive one
+ * under-counts spend), so they are dropped and resolution falls back to the
+ * verified price table, or refuses a cost ceiling it cannot account for.
+ * (A provider or model switched through tool arguments is already handled by
+ * `resolveCliOptions`, which keeps file prices only for the file's model.)
+ */
+function withOperatorPricesOnlyForOperatorModel(merged: CliConfigFile, user: CliConfigFile): CliConfigFile {
+  if (PRICE_CONFIG_KEYS.every((key) => merged[key] === undefined)) return merged;
+  const provider = (config: CliConfigFile): string => config.provider ?? DEFAULT_CONFIG.provider;
+  const model = (config: CliConfigFile): string | undefined => {
+    const id = provider(config);
+    // An unknown provider is reported by option resolution; it has no default here.
+    return config.model ?? (PROVIDER_IDS.includes(id as ProviderId) ? providerDefaultModel(id as ProviderId) : undefined);
+  };
+  if (provider(merged) === provider(user) && model(merged) === model(user)) return merged;
+  const { inputPricePerMillionUsd: _input, outputPricePerMillionUsd: _output, ...rest } = merged;
+  return rest;
 }
 
 /**

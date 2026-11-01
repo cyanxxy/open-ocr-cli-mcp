@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { open, realpath } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 
@@ -20,7 +20,9 @@ import {
   assertCallerPatternBounded,
   callerBoundaryError,
   confineCallerPath,
+  confineCallerPattern,
   escapesRoot,
+  GLOB_SYNTAX,
 } from './fileBoundary';
 import { describeDiscoverySkips, discoverInputSet } from './inputs';
 import { createOcrJobService } from './runner';
@@ -277,28 +279,52 @@ function machineConfigurationError(request: OcrJobRequest, fileConfig: CliConfig
   return undefined;
 }
 
-/** Glob syntax, as discovery reads it (see `isGlobPattern` in inputs.ts). */
-const GLOB_SYNTAX = /[*?{}[\]()!]/u;
+/**
+ * Whether discovery will read this input as a literal path. It stats the path
+ * first and only expands it as a glob on ENOENT (see `expandInput` in
+ * inputs.ts); deciding the same way here means `Scan (1).pdf`, `inv[2].pdf`, or
+ * any path inside a working directory named `Project (2024)` is confined as
+ * the file it names instead of being refused as an absolute glob.
+ */
+async function existsAsLiteralPath(cwd: string, value: string): Promise<boolean> {
+  try {
+    await stat(path.resolve(cwd, value));
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
 
 /**
  * Keep an MCP caller's inputs inside the server working directory: paths and
- * the static prefix of a glob are realpath-checked, and a glob may not be
- * absolute or climb with `..`. Matches are checked again after discovery,
+ * the static prefix of a glob are realpath-checked, and a glob may not climb
+ * with `..` or start outside. Matches are checked again after discovery,
  * because a glob can still walk through a symbolic link part-way down.
+ *
+ * Returns the inputs discovery should expand: an absolute glob below the
+ * working directory is rewritten relative to it (see `confineCallerPattern`).
  */
-async function assertMcpInputsInside(
+async function confineMcpInputs(
   request: OcrJobRequest,
   fileConfig: CliConfigFile,
   cwd: string,
-): Promise<void> {
+): Promise<OcrJobRequest['inputs']> {
   for (const pattern of [...(request.discovery?.exclude ?? []), ...(fileConfig.exclude ?? [])]) {
     assertCallerPatternBounded(cwd, pattern, 'exclude');
   }
+  const confined: OcrJobRequest['inputs'] = [];
   for (const input of request.inputs) {
-    if (input.type !== 'path') continue;
-    if (GLOB_SYNTAX.test(input.path)) assertCallerPatternBounded(cwd, input.path, 'input');
-    await confineCallerPath(cwd, input.path, 'input');
+    if (input.type !== 'path') {
+      confined.push(input);
+      continue;
+    }
+    const value = GLOB_SYNTAX.test(input.path) && !(await existsAsLiteralPath(cwd, input.path))
+      ? await confineCallerPattern(cwd, input.path)
+      : input.path;
+    await confineCallerPath(cwd, value, 'input');
+    confined.push(value === input.path ? input : { ...input, path: value });
   }
+  return confined;
 }
 
 async function assertMcpMatchesInside(
@@ -368,13 +394,14 @@ export async function executeOcrJobRequest(
   let fileConfig: CliConfigFile;
   let ceilings: OperatorCeilings = {};
   let operatorSchema = false;
+  let discoveryInputs = request.inputs;
   if (mcp) {
     ({ fileConfig, ceilings, operatorSchema } = await loadMcpCallerConfig(
       execution.cwd,
       request.configPath,
       hermetic,
     ));
-    await assertMcpInputsInside(request, fileConfig, execution.cwd);
+    discoveryInputs = await confineMcpInputs(request, fileConfig, execution.cwd);
   } else {
     fileConfig = await loadCliConfig(execution.cwd, request.configPath, hermetic);
   }
@@ -472,7 +499,7 @@ export async function executeOcrJobRequest(
       enableSingleInputResume: deliveryMode === 'reference',
     });
   }
-  const discovery = await discoverInputSet(request.inputs.map((input) => (
+  const discovery = await discoverInputSet(discoveryInputs.map((input) => (
     input.type === 'stdin' ? '-' : input.type === 'path' ? input.path : input.url
   )), options, execution.abortController.signal);
   // A directory scan that drops files hands back fewer documents than were

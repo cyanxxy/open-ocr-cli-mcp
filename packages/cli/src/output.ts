@@ -248,28 +248,35 @@ export function assertArtifactFormatAvailable(
 
 /**
  * Basenames (lower-cased, without extension) that coding agents load as
- * instructions, and directory names they load configuration, rules, or
- * commands from. Extracted text is untrusted document content, so an input
- * named `CLAUDE.png` or stored under `.claude/commands/` must never become a
- * file an agent later reads as instructions. Such names are rewritten:
- * `CLAUDE.png` becomes `CLAUDE.ocr.md`, `.claude/x.png` becomes `_claude/x.md`.
+ * instructions. Extracted text is untrusted document content, so an input
+ * named `CLAUDE.png` must never become a file an agent later reads as
+ * instructions: `CLAUDE.png` becomes `CLAUDE.ocr.md`.
  */
 const AGENT_INSTRUCTION_BASENAMES = new Set([
   'claude', 'claude.local', 'agents', 'agent', 'gemini', 'copilot-instructions',
   'codex', 'cursorrules', '.cursorrules', 'windsurfrules', '.windsurfrules',
   '.clinerules', 'conventions', 'skill',
 ]);
-const AGENT_CONFIG_DIRECTORIES = new Set([
-  '.claude', '.codex', '.cursor', '.gemini', '.github', '.windsurf', '.clinerules',
-  '.continue', '.vscode', '.idea', '.agents', '.git',
-]);
+
+/**
+ * No artifact path segment, directory or file, may start with a dot.
+ *
+ * Hidden names are where tools look for configuration rather than content:
+ * `.claude/commands/`, `.git/hooks/`, `.devcontainer/devcontainer.json`, and a
+ * project `.mcp.json` that Claude Code loads as MCP server configuration. An
+ * artifact mirrors its input's relative directory and basename, so without
+ * this `.mcp.png` OCR'd into `.` would be written as `.mcp.json`. The leading
+ * dot becomes `_`: `.claude/x.png` is written under `_claude/`, `.mcp.png` as
+ * `_mcp.json`. This applies to every run, CLI included; an enumerated list of
+ * dangerous names would always be one tool behind.
+ */
+function withoutLeadingDot(segment: string): string {
+  return segment.startsWith('.') ? `_${segment.slice(1)}` : segment;
+}
 
 export function neutralizeAgentInstructionPath(directorySegments: string[], name: string): string[] {
-  const safeDirectories = directorySegments.map((segment) => (
-    AGENT_CONFIG_DIRECTORIES.has(segment.toLowerCase()) ? `_${segment.slice(1)}` : segment
-  ));
   const safeName = AGENT_INSTRUCTION_BASENAMES.has(name.toLowerCase()) ? `${name}.ocr` : name;
-  return [...safeDirectories, safeName];
+  return [...directorySegments.map(withoutLeadingDot), withoutLeadingDot(safeName)];
 }
 
 function safeOutputRelative(input: ResolvedInput): string {
@@ -279,6 +286,17 @@ function safeOutputRelative(input: ResolvedInput): string {
     .split('/')
     .filter((segment) => segment && segment !== '.' && segment !== '..');
   return path.join(...neutralizeAgentInstructionPath(segments, parsed.name));
+}
+
+/**
+ * True when a recorded artifact path has a hidden segment below the output
+ * directory: it was written by a release that kept leading dots, a layout
+ * this one never produces.
+ */
+function hasHiddenArtifactSegment(outputDirectory: string, filePath: string): boolean {
+  const relative = path.relative(outputDirectory, path.resolve(filePath));
+  if (escapesRoot(relative)) return false;
+  return relative.split(path.sep).some((segment) => segment.startsWith('.'));
 }
 
 function plannedArtifactExtensions(options: ResolvedCliOptions): ArtifactExtension[] {
@@ -706,12 +724,61 @@ async function commitStagedNoClobber(
   }
 }
 
+/**
+ * Create `directory` below `containRoot` one level at a time, refusing any
+ * component that is not a directory or that resolves outside the output
+ * directory's real path (`realRoot`) before anything is created beneath it.
+ *
+ * A recursive `mkdir` followed by a containment check would already have
+ * created the missing tail wherever a swapped symbolic link pointed, so the
+ * refusal came after directories appeared outside the output root. A symbolic
+ * link that stays inside the output directory is still followed.
+ */
+async function mkdirInsideRoot(containRoot: string, realRoot: string, directory: string): Promise<void> {
+  const outside = (): CliExitError => outputConflict(
+    `Output artifact directory resolves outside the output directory: ${directory}`,
+  );
+  const relative = path.relative(containRoot, directory);
+  if (escapesRoot(relative)) throw outside();
+  let current = containRoot;
+  for (const segment of relative.split(path.sep).filter((part) => part.length > 0)) {
+    current = path.join(current, segment);
+    let metadata = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (metadata === undefined) {
+      try {
+        await fs.mkdir(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      metadata = await fs.lstat(current);
+    }
+    if (metadata.isSymbolicLink()) {
+      let real: string;
+      try {
+        real = await fs.realpath(current);
+      } catch {
+        throw outside();
+      }
+      if (escapesRoot(path.relative(realRoot, real))) throw outside();
+      metadata = await fs.stat(current);
+    }
+    if (!metadata.isDirectory()) {
+      throw outputConflict(`Output artifact path component is not a directory: ${current}`);
+    }
+  }
+}
+
 async function commitArtifacts(
   targets: ReadonlyArray<readonly [string, string]>,
   overwrite: boolean,
   reclaimable: ReadonlySet<string> = new Set(),
   /**
-   * The job's output directory. Every artifact's parent directory is resolved
+   * The job's output directory. Missing parent directories are created one
+   * level at a time from here, each existing level checked first (see
+   * {@link mkdirInsideRoot}), and every artifact's parent directory is resolved
    * again right before it is staged and must still lie inside this directory's
    * real path, so a directory swapped for a symbolic link after planning cannot
    * redirect the write elsewhere. (Node has no openat/O_NOFOLLOW per component,
@@ -736,7 +803,11 @@ async function commitArtifacts(
   }> = [];
   try {
     for (const [target, content] of targets) {
-      await fs.mkdir(path.dirname(target), { recursive: true });
+      if (containRoot !== undefined && realRoot !== undefined) {
+        await mkdirInsideRoot(containRoot, realRoot, path.dirname(target));
+      } else {
+        await fs.mkdir(path.dirname(target), { recursive: true });
+      }
       if (realRoot !== undefined) {
         const realDirectory = await fs.realpath(path.dirname(target));
         if (escapesRoot(path.relative(realRoot, realDirectory))) {
@@ -965,6 +1036,11 @@ export class ManifestStore {
       && entry.fingerprintVersion === undefined
       && entry.fingerprint === legacy;
     if (!matchesCurrent && !matchesLegacy) return undefined;
+    // Outputs from the pre-5.0 layout (a hidden name such as `.mcp.json`) are
+    // not what this run would write: re-extract into the current layout. The
+    // old paths stay owned by the entry, so they never block the new write.
+    const outputDirectory = path.dirname(this.manifestPath);
+    if (entry.outputFiles.some((file) => hasHiddenArtifactSegment(outputDirectory, file))) return undefined;
     if (!(await Promise.all(entry.outputFiles.map(artifactFileExists))).every(Boolean)) return undefined;
     return {
       ...entry,

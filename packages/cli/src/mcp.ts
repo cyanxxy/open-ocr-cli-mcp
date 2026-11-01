@@ -5,8 +5,11 @@ import { pathToFileURL } from 'node:url';
 
 import {
   McpServer,
+  PROTOCOL_VERSION_META_KEY,
   ProtocolError,
+  ProtocolErrorCode,
   ResourceTemplate,
+  UnsupportedProtocolVersionError,
   createRequestStateCodec,
   fromJsonSchema,
   inputRequired,
@@ -140,11 +143,98 @@ interface McpCapabilitiesResult {
 const ocrResultOutputSchema = fromJsonSchema<OcrMachineResult>(selfContainedResultSchema());
 const ocrCapabilitiesOutputSchema = fromJsonSchema<McpCapabilitiesResult>(selfContainedCapabilitiesToolSchema());
 
+/** The one protocol revision this server serves. */
+export const SERVED_PROTOCOL_VERSIONS: readonly string[] = ['2026-07-28'];
+
+// Discovery contains the process working directory; static catalogs may be shared.
+const STATIC_CACHE_HINT: CacheHint = { ttlMs: 3_600_000, cacheScope: 'public' };
+
+// Elicited confirmation before a billed run. Opt-in through the environment
+// rather than a tool argument: a safety gate the model can switch off by
+// omitting a field is not a safety gate.
+const CONFIRM_ENV = 'OPEN_OCR_MCP_CONFIRM';
+const CONFIRM_KEY = 'proceed';
+const CONFIRM_TTL_MS = 600_000;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type JsonRpcErrorBody = { code: number; message: string; data?: unknown };
+
+/**
+ * The `UnsupportedProtocolVersionError` (-32022) for a request whose declared
+ * protocol version this server does not serve, in the SDK's own shape: data
+ * lists `supported` and echoes `requested`, which is omitted (not invented)
+ * when the request named no version at all.
+ */
+function unsupportedProtocolVersion(message: { params?: unknown }): JsonRpcErrorBody | undefined {
+  const meta = isPlainRecord(message.params) ? message.params._meta : undefined;
+  const requested = isPlainRecord(meta) ? meta[PROTOCOL_VERSION_META_KEY] : undefined;
+  const supported = [...SERVED_PROTOCOL_VERSIONS];
+  if (typeof requested === 'string' && supported.includes(requested)) return undefined;
+  const error = typeof requested === 'string'
+    ? new UnsupportedProtocolVersionError({ supported, requested })
+    : new ProtocolError(
+        ProtocolErrorCode.UnsupportedProtocolVersion,
+        'Unsupported protocol version: the request did not name a protocol version',
+        { supported },
+      );
+  return { code: error.code, message: error.message, data: error.data };
+}
+
+/**
+ * A JSON-RPC error for a confirmation answer that is present but cannot be
+ * read as the `ElicitResult` this server asked for.
+ *
+ * The MRTR rules make a malformed `inputResponses` a protocol error that
+ * SHOULD be answered with a JSON-RPC error, and only a missing answer is
+ * re-asked. The SDK either drops such an entry (a wrapped `{ method, result }`
+ * or a non-object) or hands it on unrecognised (`{ action: "yes" }`), and the
+ * tool handler can only return results, so it is answered here, before
+ * dispatch. Only the key this server requests is judged, and only while
+ * confirmation is on; anything else in `inputResponses` is ignored, as the
+ * specification asks.
+ */
+function malformedConfirmationAnswer(message: { method: string; params?: unknown }): JsonRpcErrorBody | undefined {
+  if (message.method !== 'tools/call' || process.env[CONFIRM_ENV] !== '1') return undefined;
+  if (!isPlainRecord(message.params) || !('inputResponses' in message.params)) return undefined;
+  const responses = message.params.inputResponses;
+  const invalid = (detail: string): JsonRpcErrorBody => ({
+    code: ProtocolErrorCode.InvalidParams,
+    message: `Invalid inputResponses: ${detail}. Answer the confirmation with the bare ElicitResult it requested `
+      + `({ "action": "accept" | "decline" | "cancel", "content": { "${CONFIRM_KEY}": true } }), or re-run the tool call to be asked again.`,
+    data: { reason: 'malformed_input_response', key: CONFIRM_KEY },
+  });
+  if (responses === undefined) return undefined;
+  if (!isPlainRecord(responses)) return invalid('expected an object keyed by input request');
+  if (!Object.hasOwn(responses, CONFIRM_KEY)) return undefined;
+  const answer = responses[CONFIRM_KEY];
+  if (!isPlainRecord(answer)) return invalid(`"${CONFIRM_KEY}" is not an object`);
+  if ('method' in answer || 'result' in answer) {
+    return invalid(`"${CONFIRM_KEY}" is a wrapped { method, result } envelope, not a bare ElicitResult`);
+  }
+  if (answer.action !== 'accept' && answer.action !== 'decline' && answer.action !== 'cancel') {
+    return invalid(`"${CONFIRM_KEY}".action must be "accept", "decline", or "cancel"`);
+  }
+  if (answer.content !== undefined && !isPlainRecord(answer.content)) {
+    return invalid(`"${CONFIRM_KEY}".content must be an object`);
+  }
+  return undefined;
+}
+
 /**
  * Keep the modern-only stdio architecture while giving legacy clients an
  * actionable diagnosis. The SDK's strict rejection currently reports an
  * `initialize` request naming 2026-07-28 as both unsupported and supported;
  * the method itself is the legacy-era signal, regardless of that string.
+ *
+ * Every request is also held to the revision it declares. The SDK checks the
+ * declared version only on the first request of a stdio connection; after one
+ * modern request, later ones naming `2025-11-25` or `1900-01-01` were served,
+ * although the versioning rules say a server MUST answer each request whose
+ * version it does not implement with -32022. A malformed confirmation answer
+ * is refused here too (see {@link malformedConfirmationAnswer}).
  */
 export class ModernMcpDiagnosticTransport implements Transport {
   readonly hasPerRequestStream: boolean | undefined;
@@ -160,15 +250,19 @@ export class ModernMcpDiagnosticTransport implements Transport {
     return this.inner.sessionId;
   }
 
+  private reject(id: string | number, error: JsonRpcErrorBody): void {
+    void this.inner.send({ jsonrpc: '2.0', id, error }).catch((sendError: unknown) => {
+      this.onerror?.(sendError instanceof Error ? sendError : new Error(String(sendError)));
+    });
+  }
+
   async start(): Promise<void> {
     this.inner.onclose = () => this.onclose?.();
     this.inner.onerror = (error) => this.onerror?.(error);
     this.inner.onmessage = <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo): void => {
-      if (isJSONRPCRequest(message) && message.method === 'initialize') {
-        void this.inner.send({
-          jsonrpc: '2.0',
-          id: message.id,
-          error: {
+      if (isJSONRPCRequest(message)) {
+        if (message.method === 'initialize') {
+          this.reject(message.id, {
             code: -32600,
             message: 'Legacy initialize handshake removed in MCP 2026-07-28; use server/discover or include the modern per-request _meta envelope.',
             data: {
@@ -179,11 +273,14 @@ export class ModernMcpDiagnosticTransport implements Transport {
                 'io.modelcontextprotocol/clientCapabilities',
               ],
             },
-          },
-        }).catch((error: unknown) => {
-          this.onerror?.(error instanceof Error ? error : new Error(String(error)));
-        });
-        return;
+          });
+          return;
+        }
+        const rejection = unsupportedProtocolVersion(message) ?? malformedConfirmationAnswer(message);
+        if (rejection) {
+          this.reject(message.id, rejection);
+          return;
+        }
       }
       this.onmessage?.(message, extra);
     };
@@ -206,16 +303,6 @@ export class ModernMcpDiagnosticTransport implements Transport {
     this.inner.setSupportedProtocolVersions?.(versions);
   }
 }
-
-// Discovery contains the process working directory; static catalogs may be shared.
-const STATIC_CACHE_HINT: CacheHint = { ttlMs: 3_600_000, cacheScope: 'public' };
-
-// Elicited confirmation before a billed run. Opt-in through the environment
-// rather than a tool argument: a safety gate the model can switch off by
-// omitting a field is not a safety gate.
-const CONFIRM_ENV = 'OPEN_OCR_MCP_CONFIRM';
-const CONFIRM_KEY = 'proceed';
-const CONFIRM_TTL_MS = 600_000;
 
 interface ConfirmationState {
   nonce: string;
@@ -256,7 +343,7 @@ const limits = OCR_REQUEST_LIMITS;
 
 const sharedFields = {
   configPath: z.string().min(1).optional()
-    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys; routing and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys, or token prices; routing, prices, and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
   noConfig: z.boolean().optional()
     .describe('Ignore configuration files and the project .env. Cannot be combined with configPath. The operator\'s limits still apply, as do environment overrides; pass explicit provider/model/options for reproducibility.'),
   provider: z.enum(PROVIDER_IDS).optional()
@@ -757,9 +844,11 @@ async function confirmationGate(
   if (request.dryRun) return undefined;
   if (process.env[CONFIRM_ENV] !== '1') return undefined;
 
-  // The client answered but the SDK could not read the answer. Asking again
-  // would produce the same unreadable reply every round until the shim gives
-  // up, so this refuses once instead of looping.
+  // The client answered but the SDK could not read the answer. Over stdio the
+  // transport has already answered that with a JSON-RPC -32602 (see
+  // malformedConfirmationAnswer); this covers a server driven over another
+  // transport. Asking again would produce the same unreadable reply every
+  // round, so this refuses once instead of looping.
   if (context.mcpReq.droppedInputResponseKeys?.includes(CONFIRM_KEY)) {
     return ocrFailure(
       'The confirmation answer could not be read.',
@@ -1182,7 +1271,7 @@ export function createOcrMcpServer(version: string, cwd = process.cwd()): McpSer
   const server = new McpServer(
     { name: 'open-ocr-cli-mcp', version },
     {
-      supportedProtocolVersions: ['2026-07-28'],
+      supportedProtocolVersions: [...SERVED_PROTOCOL_VERSIONS],
       maxToolInputElements: 100_000,
       // Roots is deprecated in this revision; its stated replacement is to
       // pass paths via tool parameters or server configuration. Publishing the
