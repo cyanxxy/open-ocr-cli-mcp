@@ -13,6 +13,8 @@ export interface ExtractedContent {
   sections: {
     /** The heading for this section */
     heading?: string;
+    /** The heading's level (1-6) when the section has one: `###` is 3. */
+    level?: number;
     /** An array of strings, where each string is a line of content within the section */
     content: string[];
   }[];
@@ -167,6 +169,12 @@ export interface PresetStructuredOutput {
    * normalization. Empty/undefined when every rule passed. See audit T-02.
    */
   validationErrors?: string[];
+  /**
+   * Non-fatal findings from normalization: ambiguous number separators, values
+   * that do not look like their declared type, keys the preset does not define.
+   * The extraction is still usable; these say what to double-check.
+   */
+  validationWarnings?: string[];
 }
 
 /**
@@ -267,7 +275,13 @@ export interface GeminiClientConfig {
 export enum OcrErrorType {
   API_KEY_MISSING = 'API_KEY_MISSING',
   /** The caller's response schema is why the provider refused the request. */
-  SCHEMA_INVALID = 'SCHEMA_INVALID'
+  SCHEMA_INVALID = 'SCHEMA_INVALID',
+  /**
+   * The model answered, but its output did not conform to the requested
+   * contract: not JSON, JSON of the wrong shape, or no content at all. The
+   * request itself was fine, so another attempt can succeed.
+   */
+  OUTPUT_INVALID = 'OUTPUT_INVALID'
 }
 
 /**

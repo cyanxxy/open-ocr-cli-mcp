@@ -13,9 +13,12 @@ import {
   coerceExtractionResult,
   extractStructuredDataFromFile,
   extractTextFromFile,
+  joinPromptParts,
 } from '../gemini/extraction';
+import { parseJsonPayload } from '../gemini/structured';
 import { withReadableProviderErrors } from '../gemini/errorPayload';
 import {
+  DEFAULT_TEMPLATE_MAX_TOKENS,
   buildPresetPrompt,
   buildPresetResponseSchema,
   presetRunResultFromText,
@@ -55,7 +58,7 @@ function extractionPrompt(
   parts.push(wantsJson
     ? 'Return only JSON matching the response schema.'
     : 'Preserve layout, headings, tables, lists, code, equations, and reading order in Markdown.');
-  return parts.join(' ');
+  return joinPromptParts(parts);
 }
 
 async function providerMessages(
@@ -126,13 +129,13 @@ export async function extractStructuredWithProvider(
       options,
     ));
   }
-  const prompt = [
+  const prompt = joinPromptParts([
     'Extract the document into the exact JSON structure described by the response schema.',
     'Use only information visible in the document. Do not invent missing values. Return JSON only.',
     ...(instructions?.map((instruction) => instruction.prompt) ?? []),
     ...(options?.detectImages ? ['Include relevant information visible in charts, diagrams, or images.'] : []),
     ...(options?.detectMathEquations ? ['Represent mathematical expressions accurately.'] : []),
-  ].join(' ');
+  ]);
   const result = await createChatCompletion(config, {
     messages: await providerMessages(config, dataUrl, mimeType, filename, prompt, options?.abortSignal),
     maxTokens: options?.maxTokens ?? 32768,
@@ -143,12 +146,11 @@ export async function extractStructuredWithProvider(
       ? { extraBody: { plugins: [{ id: 'file-parser' }] } }
       : {}),
   });
-  try {
-    return JSON.parse(result.text) as JsonValue;
-  } catch {
-    throw new Error('Schema extraction returned invalid JSON');
-  }
+  // Same tolerance as template and simple JSON mode: a ```json fence or a
+  // sentence of prose around the object is unwrapped, not rejected.
+  return parseJsonPayload<JsonValue>(result.text, 'Schema extraction');
 }
+
 
 export async function extractPresetWithProvider(
   dataUrl: string,
@@ -157,15 +159,17 @@ export async function extractPresetWithProvider(
   config: ProviderRuntimeConfig,
   preset: ExtractionPreset,
   signal?: AbortSignal,
+  options?: { maxTokens?: number },
 ): Promise<PresetRunResult> {
+  const maxTokens = options?.maxTokens ?? DEFAULT_TEMPLATE_MAX_TOKENS;
   if (config.provider === 'gemini') {
     return withReadableProviderErrors(
-      () => runExtractionPreset(dataUrl, mimeType, geminiConfig(config), preset, { abortSignal: signal }),
+      () => runExtractionPreset(dataUrl, mimeType, geminiConfig(config), preset, { abortSignal: signal, maxTokens }),
     );
   }
   const result = await createChatCompletion(config, {
     messages: await providerMessages(config, dataUrl, mimeType, filename, buildPresetPrompt(preset), signal),
-    maxTokens: 16384,
+    maxTokens,
     responseSchema: buildPresetResponseSchema(preset),
     schemaName: `${preset.id.replace(/[^a-zA-Z0-9_-]/g, '_')}_ocr`,
     signal,
