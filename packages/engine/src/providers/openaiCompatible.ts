@@ -382,51 +382,152 @@ function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
   return {};
 }
 
-function isOpenAIStrictSchema(schema: Record<string, unknown>): boolean {
-  const visit = (value: unknown, seen: Set<object>): boolean => {
-    if (Array.isArray(value)) return value.every((entry) => visit(entry, seen));
+/**
+ * Strict structured-output subsets, as each provider documents them. A schema
+ * outside the subset is rejected with HTTP 400 when `strict: true` is sent, so
+ * `strict` is only claimed for schemas inside it; every returned value is still
+ * validated locally either way.
+ *
+ * - OpenAI (developers.openai.com/api/docs/guides/structured-outputs, "Supported
+ *   schemas"): the root must be an object and not `anyOf`; `allOf`, `not`,
+ *   `dependentRequired`, `dependentSchemas`, `if`/`then`/`else` are unsupported;
+ *   `oneOf` is not among the supported types (only `anyOf` is); `$defs`/`$ref`
+ *   and recursion are supported.
+ * - Meta (dev.meta.ai/docs/structured-output, "Enforce strict mode"): the root
+ *   must be a plain object with no top-level `anyOf`/`oneOf`/`allOf`/`enum`/
+ *   `not`; `allOf` and `oneOf` are unsupported anywhere; recursive (`$ref`-cycle)
+ *   schemas are rejected; the subset is validated inside `$defs` too.
+ * - Both: every object sets `additionalProperties: false` and lists every
+ *   property in `required`.
+ *
+ * `conservative` is the union of both rule sets, for OpenRouter routes whose
+ * upstream family publishes no strict subset of its own.
+ */
+type StrictSchemaDialect = 'openai' | 'meta' | 'conservative';
+
+interface StrictSchemaRules {
+  /** Keywords rejected anywhere in the schema. */
+  forbidden: readonly string[];
+  /** Keywords additionally rejected on the root schema. */
+  rootForbidden: readonly string[];
+  allowRecursion: boolean;
+}
+
+const OPENAI_FORBIDDEN = ['allOf', 'oneOf', 'not', 'dependentRequired', 'dependentSchemas', 'if', 'then', 'else'];
+const META_FORBIDDEN = ['allOf', 'oneOf'];
+
+const STRICT_SCHEMA_RULES: Record<StrictSchemaDialect, StrictSchemaRules> = {
+  openai: { forbidden: OPENAI_FORBIDDEN, rootForbidden: ['anyOf', 'enum', '$ref'], allowRecursion: true },
+  meta: { forbidden: META_FORBIDDEN, rootForbidden: ['anyOf', 'enum', 'not', '$ref'], allowRecursion: false },
+  conservative: {
+    forbidden: [...new Set([...OPENAI_FORBIDDEN, ...META_FORBIDDEN])],
+    rootForbidden: ['anyOf', 'enum', 'not', '$ref'],
+    allowRecursion: false,
+  },
+};
+
+const SUBSCHEMA_RECORD_KEYS = ['items', 'additionalProperties', 'not', 'if', 'then', 'else', 'contains'];
+const SUBSCHEMA_ARRAY_KEYS = ['anyOf', 'oneOf', 'allOf', 'prefixItems', 'items'];
+const SUBSCHEMA_MAP_KEYS = ['properties', '$defs', 'definitions', 'dependentSchemas', 'patternProperties'];
+
+function isObjectSchema(value: Record<string, unknown>): boolean {
+  return value.type === 'object'
+    || (Array.isArray(value.type) && value.type.includes('object'))
+    || isRecord(value.properties);
+}
+
+/** Resolve a local JSON-pointer `$ref` ("#", "#/$defs/x", "#/definitions/x/..."). */
+function resolveLocalRef(root: Record<string, unknown>, ref: string): unknown {
+  if (ref === '#') return root;
+  if (!ref.startsWith('#/')) return undefined;
+  let current: unknown = root;
+  for (const raw of ref.slice(2).split('/')) {
+    const segment = decodeURIComponent(raw).replace(/~1/gu, '/').replace(/~0/gu, '~');
+    if (!isRecord(current) && !Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function subschemasOf(value: Record<string, unknown>): unknown[] {
+  const children: unknown[] = [];
+  for (const key of SUBSCHEMA_RECORD_KEYS) if (isRecord(value[key])) children.push(value[key]);
+  for (const key of SUBSCHEMA_ARRAY_KEYS) if (Array.isArray(value[key])) children.push(...(value[key] as unknown[]));
+  for (const key of SUBSCHEMA_MAP_KEYS) {
+    if (isRecord(value[key])) children.push(...Object.values(value[key]));
+  }
+  return children;
+}
+
+function hasRecursiveRef(root: Record<string, unknown>): boolean {
+  const onPath = new Set<unknown>();
+  const done = new Set<unknown>();
+  const visit = (value: unknown): boolean => {
+    if (!isRecord(value)) return false;
+    if (onPath.has(value)) return true;
+    if (done.has(value)) return false;
+    onPath.add(value);
+    const target = typeof value.$ref === 'string' ? resolveLocalRef(root, value.$ref) : undefined;
+    const recursive = (target !== undefined && visit(target)) || subschemasOf(value).some(visit);
+    onPath.delete(value);
+    done.add(value);
+    return recursive;
+  };
+  return visit(root);
+}
+
+function isStrictSchema(schema: Record<string, unknown>, dialect: StrictSchemaDialect): boolean {
+  const rules = STRICT_SCHEMA_RULES[dialect];
+  if (!isObjectSchema(schema) || rules.rootForbidden.some((key) => key in schema)) return false;
+  const seen = new Set<object>();
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.every(visit);
     if (!isRecord(value)) return true;
     if (seen.has(value)) return true;
     seen.add(value);
-    if ('$ref' in value) return false;
-
-    const properties = isRecord(value.properties) ? value.properties : undefined;
-    if (value.type === 'object' || properties) {
-      if (!properties || value.additionalProperties !== false) return false;
+    if (rules.forbidden.some((key) => key in value)) return false;
+    // Only local references can be validated (and resolved by the provider).
+    if (typeof value.$ref === 'string' && resolveLocalRef(schema, value.$ref) === undefined) return false;
+    if (isObjectSchema(value)) {
+      const properties = isRecord(value.properties) ? value.properties : {};
+      if (value.additionalProperties !== false) return false;
       const required = Array.isArray(value.required)
         ? new Set(value.required.filter((entry): entry is string => typeof entry === 'string'))
         : new Set<string>();
       if (Object.keys(properties).some((key) => !required.has(key))) return false;
-      if (!Object.values(properties).every((property) => visit(property, seen))) return false;
     }
-
-    for (const key of ['items', 'not', 'if', 'then', 'else', 'additionalProperties']) {
-      if (isRecord(value[key]) && !visit(value[key], seen)) return false;
-    }
-    for (const key of ['anyOf', 'oneOf', 'allOf', 'prefixItems']) {
-      if (Array.isArray(value[key]) && !visit(value[key], seen)) return false;
-    }
-    if (isRecord(value.$defs) && !Object.values(value.$defs).every((entry) => visit(entry, seen))) {
-      return false;
-    }
-    return true;
+    return subschemasOf(value).every(visit);
   };
-  return visit(schema, new Set<object>());
+  if (!visit(schema)) return false;
+  return rules.allowRecursion || !hasRecursiveRef(schema);
+}
+
+function strictSchemaDialect(config: ProviderRuntimeConfig): StrictSchemaDialect | undefined {
+  if (config.provider === 'muse') return 'meta';
+  if (config.provider === 'openrouter') {
+    const routedModel = config.model.split(':')[0] ?? config.model;
+    if (routedModel.startsWith('openai/')) return 'openai';
+    if (routedModel.startsWith('meta/')) return 'meta';
+    return 'conservative';
+  }
+  return undefined;
 }
 
 /**
- * Kimi's MFJS dialect permits optional properties in strict mode. Other named
- * compatible routes receive `strict: true` only when the supplied schema meets
- * the narrower all-properties-required dialect. Generic endpoints get no
- * unverified strict-mode claim; every returned value is still validated locally.
+ * Kimi's MFJS dialect permits optional properties in strict mode. Muse and
+ * OpenRouter routes receive `strict: true` only when the supplied schema is
+ * inside the documented strict subset for that provider family. Generic
+ * endpoints get no unverified strict-mode claim; every returned value is still
+ * validated locally.
  */
 function strictSchemaSupport(
   config: ProviderRuntimeConfig,
   schema: Record<string, unknown>,
 ): true | undefined {
   if (config.provider === 'kimi') return true;
-  if (config.provider === 'openai-compatible') return undefined;
-  return isOpenAIStrictSchema(schema) ? true : undefined;
+  const dialect = strictSchemaDialect(config);
+  if (!dialect) return undefined;
+  return isStrictSchema(schema, dialect) ? true : undefined;
 }
 
 function compatibleTools(config: ProviderRuntimeConfig, tools: OpenAITool[]): OpenAITool[] {
@@ -549,6 +650,22 @@ function messageForWire(message: OpenAIMessage): Record<string, unknown> {
   };
 }
 
+/**
+ * Prefer sequential tool execution where the provider accepts the flag; the
+ * agent runtime still handles parallel batches safely when it does not.
+ *
+ * - Meta's Chat Completions schema lists `parallel_tool_calls` (boolean).
+ * - Kimi's Chat Completions schema has no such field.
+ * - OpenRouter: almost no endpoint lists it in `supported_parameters` (none for
+ *   any Gemini, Claude, GPT, Grok, Mistral, Muse, or Kimi K3.1 route in
+ *   GET /api/v1/models/<id>/endpoints, 2026-11-01), and tool requests set
+ *   `provider.require_parameters`, so sending it left no endpoint to route to.
+ * - Generic OpenAI-compatible servers follow OpenAI's spelling.
+ */
+function sendsParallelToolCalls(config: ProviderRuntimeConfig): boolean {
+  return config.provider === 'muse' || config.provider === 'openai-compatible';
+}
+
 function completionRequestBody(
   config: ProviderRuntimeConfig,
   request: ChatCompletionRequest,
@@ -567,13 +684,15 @@ function completionRequestBody(
     ...extraBody,
     model: config.model,
     messages: request.messages.map(messageForWire),
-    // Kimi's Chat API has deprecated `max_tokens` in favour of the OpenAI
-    // spelling. OpenRouter keeps `max_tokens`: it is the only token cap every
-    // Gemini, Muse, and Kimi endpoint lists in `supported_parameters`, and
-    // structured/tool requests set `require_parameters`, which would otherwise
-    // filter those endpoints out. Generic endpoints keep `max_tokens` because a
-    // local server built against the older spec is the common case.
-    ...(config.provider === 'kimi'
+    // Kimi's and Meta's Chat APIs both mark `max_tokens` deprecated in favour
+    // of `max_completion_tokens` (platform.kimi.ai/docs/api/chat.md,
+    // dev.meta.ai/docs/api-reference/chat-completions/schemas). OpenRouter
+    // keeps `max_tokens`: it is the only token cap every Gemini, Muse, and Kimi
+    // endpoint lists in `supported_parameters`, and structured/tool requests set
+    // `require_parameters`, which would otherwise filter those endpoints out.
+    // Generic endpoints keep `max_tokens` because a local server built against
+    // the older spec is the common case.
+    ...(config.provider === 'kimi' || config.provider === 'muse'
       ? { max_completion_tokens: request.maxTokens }
       : { max_tokens: request.maxTokens }),
     stream,
@@ -597,9 +716,7 @@ function completionRequestBody(
     ...(request.tools?.length ? {
       tools: compatibleTools(config, request.tools),
       tool_choice: request.toolChoice ?? 'auto',
-      // Prefer sequential tool execution; the agent runtime still handles
-      // parallel batches safely, but disables them when the provider honors this.
-      parallel_tool_calls: false,
+      ...(sendsParallelToolCalls(config) ? { parallel_tool_calls: false } : {}),
     } : {}),
   };
 }
@@ -669,8 +786,9 @@ async function streamedChatCompletion(
     }
     const choice = Array.isArray(parsed.choices) ? parsed.choices.find(isRecord) : undefined;
     if (!choice) return;
-    // Kimi reports streaming usage on choices[0], while OpenRouter/OpenAI put
-    // it at the chunk root. Support both current wire shapes.
+    // Kimi, OpenRouter, and OpenAI report final streaming usage at the chunk
+    // root, on a last chunk whose `choices` is empty (handled above). Older
+    // Kimi releases put it on choices[0]; keep reading that shape too.
     if (choice.usage !== undefined) usage = choice.usage;
     if (isRecord(choice.error)) {
       throw providerErrorFromRecord(choice.error, 'Provider reported a streaming completion error');
@@ -947,11 +1065,12 @@ export async function documentContentParts(
       type: 'image_url',
       image_url: {
         url: dataUrl,
-        // OpenRouter documents this optional quality hint. Kimi's current
-        // multimodal contract allows only `url`, and generic/Muse routes do
-        // not get optional OpenAI fields that their public contract does not
-        // explicitly advertise.
-        ...(config.provider === 'openrouter' ? { detail: 'high' as const } : {}),
+        // OpenRouter and Meta document this optional quality hint (Meta:
+        // `image_url.detail`, enum auto/low/high, default auto); OCR wants
+        // `high` for fine print. Kimi's current multimodal contract allows only
+        // `url`, and generic routes do not get optional OpenAI fields that their
+        // public contract does not explicitly advertise.
+        ...(config.provider === 'openrouter' || config.provider === 'muse' ? { detail: 'high' as const } : {}),
       },
     }];
   }

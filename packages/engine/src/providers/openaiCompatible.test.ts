@@ -213,9 +213,17 @@ describe('OpenAI-compatible transport', () => {
       type: 'image_url',
       image_url: { url: dataUrl, detail: 'high' },
     }]);
+    // Meta's chat schema documents image_url.detail (auto/low/high).
     await expect(documentContentParts(config({
       provider: 'muse',
       baseUrl: 'https://api.meta.ai/v1',
+    }), dataUrl, 'image/png', 'invoice.png')).resolves.toEqual([{
+      type: 'image_url',
+      image_url: { url: dataUrl, detail: 'high' },
+    }]);
+    await expect(documentContentParts(config({
+      provider: 'kimi',
+      baseUrl: 'https://api.moonshot.ai/v1',
     }), dataUrl, 'image/png', 'invoice.png')).resolves.toEqual([{
       type: 'image_url',
       image_url: { url: dataUrl },
@@ -359,7 +367,10 @@ describe('OpenAI-compatible transport', () => {
     expect(new Headers(firstInit?.headers).get('accept')).toBe('text/event-stream');
     if (typeof firstInit?.body !== 'string') throw new Error('Expected a JSON request body');
     const firstBody = JSON.parse(firstInit.body) as Record<string, unknown>;
-    expect(firstBody.parallel_tool_calls).toBe(false);
+    // No OpenRouter endpoint for this route lists parallel_tool_calls, and tool
+    // requests set require_parameters: sending it would leave nothing to route to.
+    expect(firstBody).not.toHaveProperty('parallel_tool_calls');
+    expect(firstBody.provider).toEqual({ require_parameters: true });
     expect(firstBody).not.toHaveProperty('stream_options');
 
     await createChatCompletion(config({
@@ -734,9 +745,9 @@ describe('OpenAI-compatible transport', () => {
     if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
     expect(JSON.parse(init.body)).toMatchObject({
       reasoning_effort: 'minimal',
-      max_tokens: 1000,
+      max_completion_tokens: 1000,
     });
-    expect(JSON.parse(init.body)).not.toHaveProperty('max_completion_tokens');
+    expect(JSON.parse(init.body)).not.toHaveProperty('max_tokens');
   });
 
   it('uses the token field supported by the default local endpoint', async () => {
@@ -763,7 +774,11 @@ describe('OpenAI-compatible transport', () => {
 
   it.each([
     ['kimi', 'kimi-k3', 'https://api.moonshot.ai/v1', 'max_completion_tokens', 'max_tokens'],
+    // Meta's chat schema: max_tokens "Deprecated in favor of max_completion_tokens".
+    ['muse', 'muse-spark-1.3', 'https://api.meta.ai/v1', 'max_completion_tokens', 'max_tokens'],
     ['openrouter', 'google/gemini-3.8-flash', 'https://openrouter.ai/api/v1', 'max_tokens', 'max_completion_tokens'],
+    // OpenRouter's meta/* endpoints list only max_tokens.
+    ['openrouter', 'meta/muse-spark-1.3', 'https://openrouter.ai/api/v1', 'max_tokens', 'max_completion_tokens'],
   ] as const)('sends the output cap on %s as the field its endpoints accept', async (provider, model, baseUrl, field, absent) => {
     const fetchMock = vi.fn((_input: FetchInput, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],

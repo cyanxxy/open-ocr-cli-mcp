@@ -283,7 +283,8 @@ describe('provider agent loop', () => {
     ]));
     expect(firstRequest.prompt_cache_key).toMatch(/\S/u);
     expect(secondRequest.prompt_cache_key).toBe(firstRequest.prompt_cache_key);
-    expect(firstRequest.parallel_tool_calls).toBe(false);
+    // Kimi's Chat Completions schema has no parallel_tool_calls field.
+    expect(firstRequest).not.toHaveProperty('parallel_tool_calls');
   });
 
   it('runs region re-OCR through the compatible structured extractor end to end', async () => {
