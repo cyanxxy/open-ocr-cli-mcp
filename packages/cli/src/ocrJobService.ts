@@ -23,6 +23,7 @@ import {
   artifactTargetFromPath,
   BatchOutputLock,
   defaultOutputDirectory,
+  artifactPathVariants,
   findStaleTransactionFiles,
   ManifestStore,
   plannedArtifactTargets,
@@ -572,7 +573,9 @@ export class OcrJobService {
         manifest.path,
         path.join(outputDirectory, 'batch-summary.json'),
         path.join(outputDirectory, '.open-ocr.lock'),
-        ...manifest.allOwnedArtifactPaths(),
+        // Every artifact extension of every recorded path, the same set
+        // `status` reports leftovers for.
+        ...[...manifest.allOwnedArtifactPaths()].flatMap(artifactPathVariants),
       ]);
       for (const input of inputs) {
         for (const target of await possibleArtifactTargets(input, options, inputs.length)) {

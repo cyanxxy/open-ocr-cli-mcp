@@ -508,9 +508,25 @@ export async function findStaleTransactionFiles(
   return found.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-/** Any staging/backup file name, for a directory-wide status scan. */
-export function isTransactionFileName(name: string): boolean {
-  return TRANSACTION_SUFFIX.test(name);
+/** The target base name a staging/backup file name stands in for, or undefined for any other name. */
+export function transactionFileTarget(name: string): string | undefined {
+  const match = TRANSACTION_SUFFIX.exec(name);
+  return match ? name.slice(0, match.index) : undefined;
+}
+
+const ARTIFACT_FILE_EXTENSION = /\.(?:md|json|csv)$/iu;
+
+/**
+ * A recorded artifact path with every artifact extension (`a.md` -> `a.md`,
+ * `a.json`, `a.csv`): the paths a format switch of the same document writes.
+ * A path without an artifact extension is returned as is.
+ */
+export function artifactPathVariants(file: string): string[] {
+  const resolved = path.resolve(file);
+  const extension = ARTIFACT_FILE_EXTENSION.exec(resolved)?.[0];
+  if (!extension) return [resolved];
+  const stem = resolved.slice(0, -extension.length);
+  return ['.md', '.json', '.csv'].map((candidate) => `${stem}${candidate}`);
 }
 
 export interface TransactionRecoveryOptions {

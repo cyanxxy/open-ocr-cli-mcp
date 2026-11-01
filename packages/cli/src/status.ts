@@ -5,7 +5,13 @@ import { GATEWAY_IDS, GEMINI_MODELS, PROVIDER_IDS } from '@open-ocr/engine/provi
 import { batchMetadataError, CliExitError } from './errors';
 import { asRecord, isIsoTimestamp, isOneOf, parseBatchLockOwner } from './jsonValidation';
 import { artifactFileExists, parseCliManifest, parseUsageSnapshot } from './manifest';
-import { artifactPathKey, batchLockOwnerState, isTransactionFileName, type BatchLockState } from './output';
+import {
+  artifactPathKey,
+  artifactPathVariants,
+  batchLockOwnerState,
+  transactionFileTarget,
+  type BatchLockState,
+} from './output';
 import {
   CLI_MODES,
   type BatchSummary,
@@ -295,35 +301,78 @@ function parseSummary(value: unknown, summaryPath: string): ParsedSummary | unde
   };
 }
 
-const METADATA_FILES = new Set(['.open-ocr-manifest.json', 'batch-summary.json', '.open-ocr.lock']);
-const ARTIFACT_EXTENSION = /\.(?:md|json|csv)$/iu;
+const METADATA_FILES = ['.open-ocr-manifest.json', 'batch-summary.json', '.open-ocr.lock'];
+/** Directories never holding this tool's artifacts, even when a manifest path points inside one. */
+const SKIPPED_DIRECTORY_NAMES = new Set(['node_modules', '.git']);
+/** Upper bound on directories one status call lists. */
+export const MAX_STATUS_SCAN_DIRECTORIES = 4_096;
 
-/** Walk the output directory for files the manifest does not account for. */
+/**
+ * Every path the batch could have produced: each recorded artifact with its
+ * other artifact extensions (a format switch writes `a.json` beside `a.md`),
+ * plus the batch metadata files, grouped by directory.
+ */
+function possibleBatchPaths(
+  outputDirectory: string,
+  recorded: Iterable<string>,
+): Map<string, Set<string>> {
+  const byDirectory = new Map<string, Set<string>>();
+  const add = (file: string): void => {
+    const directory = path.dirname(file);
+    byDirectory.set(directory, (byDirectory.get(directory) ?? new Set()).add(path.basename(file)));
+  };
+  for (const name of METADATA_FILES) add(path.join(outputDirectory, name));
+  for (const file of recorded) {
+    for (const variant of artifactPathVariants(file)) add(variant);
+  }
+  return byDirectory;
+}
+
+/**
+ * Find files the manifest does not account for among the paths this batch
+ * could have produced: artifact-shaped siblings of its recorded artifacts
+ * that no entry owns (a resume refuses to replace them), and staging/backup
+ * leftovers (`<target>.<pid>-<uuid>.tmp|.bak`) of those paths and of the
+ * batch metadata. Unrelated files — a README.md or package.json beside the
+ * batch in `-o .`, anything under node_modules or .git — are never counted:
+ * only the directories holding recorded artifacts are listed, one level
+ * each, and at most {@link MAX_STATUS_SCAN_DIRECTORIES} of them.
+ */
 async function scanOutputDirectory(
   outputDirectory: string,
+  recorded: Iterable<string>,
   owned: ReadonlySet<string>,
 ): Promise<{ untrackedArtifacts: string[]; strayTempFiles: string[] }> {
   const untrackedArtifacts: string[] = [];
   const strayTempFiles: string[] = [];
-  let entries: Array<{ name: string; parentPath?: string; path?: string; isFile(): boolean }>;
-  try {
-    entries = await fs.readdir(outputDirectory, { recursive: true, withFileTypes: true });
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return { untrackedArtifacts, strayTempFiles };
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const directory = entry.parentPath ?? entry.path ?? outputDirectory;
-    const filePath = path.join(directory, entry.name);
-    if (isTransactionFileName(entry.name)) {
-      strayTempFiles.push(filePath);
+  const candidates = possibleBatchPaths(outputDirectory, recorded);
+  let scanned = 0;
+  for (const [directory, names] of candidates) {
+    if (path.relative(outputDirectory, directory).split(path.sep).some((segment) => SKIPPED_DIRECTORY_NAMES.has(segment))) {
       continue;
     }
-    if (directory === outputDirectory && METADATA_FILES.has(entry.name)) continue;
-    if (!ARTIFACT_EXTENSION.test(entry.name)) continue;
-    if (!owned.has(artifactPathKey(filePath))) untrackedArtifacts.push(filePath);
+    if (scanned >= MAX_STATUS_SCAN_DIRECTORIES) break;
+    scanned += 1;
+    let entries: Array<{ name: string; isFile(): boolean }>;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const filePath = path.join(directory, entry.name);
+      const transaction = transactionFileTarget(entry.name);
+      if (transaction !== undefined) {
+        if (names.has(transaction)) strayTempFiles.push(filePath);
+        continue;
+      }
+      if (!names.has(entry.name)) continue;
+      if (directory === outputDirectory && METADATA_FILES.includes(entry.name)) continue;
+      if (!owned.has(artifactPathKey(filePath))) untrackedArtifacts.push(filePath);
+    }
   }
   untrackedArtifacts.sort((left, right) => left.localeCompare(right));
   strayTempFiles.sort((left, right) => left.localeCompare(right));
@@ -359,10 +408,14 @@ export async function inspectBatchStatus(
     : parseCliManifest(manifestValue, manifestPath);
   const summary = parseSummary(summaryValue, summaryPath);
   const owned = new Set<string>();
+  const recorded: string[] = [];
   for (const entry of Object.values(manifest?.entries ?? {})) {
-    for (const file of [...entry.outputFiles, ...(entry.ownedFiles ?? [])]) owned.add(artifactPathKey(file));
+    for (const file of [...entry.outputFiles, ...(entry.ownedFiles ?? [])]) {
+      owned.add(artifactPathKey(file));
+      recorded.push(file);
+    }
   }
-  const { untrackedArtifacts, strayTempFiles } = await scanOutputDirectory(outputDirectory, owned);
+  const { untrackedArtifacts, strayTempFiles } = await scanOutputDirectory(outputDirectory, recorded, owned);
   const entries = await Promise.all(Object.entries(manifest?.entries ?? {}).map(async ([source, entry]) => {
     const missingOutputFiles = (await Promise.all(entry.outputFiles.map(async (file) => ({
       file,
