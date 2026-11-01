@@ -569,6 +569,60 @@ describe('Open OCR MCP server', () => {
       expect((tools.result?.tools as unknown[]).length).toBe(5);
     });
 
+    it('checks the declared protocol version on every request, not only the first', async () => {
+      const { request } = await driveServer(process.cwd());
+      const first = await request(1, 'tools/list', { _meta: modernMeta() });
+      expect(first.error).toBeUndefined();
+
+      let id = 2;
+      for (const version of ['2025-11-25', '1900-01-01', '2027-01-01']) {
+        for (const method of ['tools/list', 'server/discover', 'resources/list']) {
+          const reply = await request(id++, method, {
+            _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': version },
+          });
+          expect(reply.result, `${method} ${version}`).toBeUndefined();
+          expect(reply.error, `${method} ${version}`).toEqual({
+            code: -32022,
+            message: `Unsupported protocol version: ${version}`,
+            data: { supported: ['2026-07-28'], requested: version },
+          });
+        }
+      }
+      const toolCall = await request(id++, 'tools/call', {
+        name: 'ocr_capabilities',
+        arguments: {},
+        _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': '2025-11-25' },
+      });
+      expect(toolCall.error?.code).toBe(-32022);
+
+      // A request that names no version at all gets the same error the SDK
+      // gives a first request, without a fabricated `requested`.
+      const { 'io.modelcontextprotocol/protocolVersion': _version, ...withoutVersion } = modernMeta();
+      for (const params of [undefined, {}, { _meta: withoutVersion }]) {
+        const reply = await request(id++, 'tools/list', params);
+        expect(reply.error).toEqual({
+          code: -32022,
+          message: 'Unsupported protocol version: the request did not name a protocol version',
+          data: { supported: ['2026-07-28'] },
+        });
+      }
+
+      const still = await request(id, 'tools/list', { _meta: modernMeta() });
+      expect(still.error).toBeUndefined();
+    });
+
+    it('answers an unsupported first request in the same shape as later ones', async () => {
+      const { request } = await driveServer(process.cwd());
+      const reply = await request(1, 'tools/list', {
+        _meta: { ...modernMeta(), 'io.modelcontextprotocol/protocolVersion': '2025-11-25' },
+      });
+      expect(reply.error).toEqual({
+        code: -32022,
+        message: 'Unsupported protocol version: 2025-11-25',
+        data: { supported: ['2026-07-28'], requested: '2025-11-25' },
+      });
+    });
+
     it('pins the reusable server factory to 2026-07-28', async () => {
       const { request } = await driveServer(process.cwd(), true);
 
@@ -688,6 +742,50 @@ describe('Open OCR MCP server', () => {
         ok: false,
         error: { code: 'AUTH_MISSING' },
       });
+    });
+
+    it.each([
+      ['a wrapped { method, result } envelope', { method: 'elicitation/create', result: { action: 'accept', content: { proceed: true } } }, 'wrapped'],
+      ['a bare string', 'yes', 'is not an object'],
+      ['an unknown action', { action: 'yes', content: { proceed: true } }, 'action must be'],
+      ['non-object content', { action: 'accept', content: 'true' }, 'content must be an object'],
+    ])('answers a malformed confirmation (%s) with a JSON-RPC invalid-params error', async (_label, answer, detail) => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      const { request } = await driveServer(process.cwd());
+      const args = { urls: ['https://example.com/report'], noConfig: true };
+      const asked = await request(1, 'tools/call', { name: 'ocr_web', arguments: args, _meta: modernMeta() });
+      expect(asked.result?.resultType).toBe('input_required');
+
+      const retried = await request(2, 'tools/call', {
+        name: 'ocr_web',
+        arguments: args,
+        inputResponses: { proceed: answer },
+        requestState: asked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(retried.result).toBeUndefined();
+      expect(retried.error).toMatchObject({
+        code: -32602,
+        data: { reason: 'malformed_input_response', key: 'proceed' },
+      });
+      expect(retried.error?.message).toContain(detail);
+      expect(retried.error?.message).toMatch(/^Invalid inputResponses: /u);
+    });
+
+    it('ignores input responses it never asked for and re-asks when the answer is missing', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      const { request } = await driveServer(process.cwd());
+      const args = { urls: ['https://example.com/report'], noConfig: true };
+      const asked = await request(1, 'tools/call', { name: 'ocr_web', arguments: args, _meta: modernMeta() });
+      const retried = await request(2, 'tools/call', {
+        name: 'ocr_web',
+        arguments: args,
+        inputResponses: { unrelated: 'whatever' },
+        requestState: asked.result?.requestState,
+        _meta: modernMeta(),
+      });
+      expect(retried.error).toBeUndefined();
+      expect(retried.result?.resultType).toBe('input_required');
     });
 
     const clearCredentials = (): void => {
