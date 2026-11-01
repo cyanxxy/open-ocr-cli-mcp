@@ -7,6 +7,7 @@ import path from 'node:path';
 import type { ProviderUsageSnapshot } from '@open-ocr/engine/providers';
 import { parseBatchLockOwner, type BatchLockOwner } from './jsonValidation';
 import { batchMetadataError, CliExitError } from './errors';
+import { escapesRoot } from './fileBoundary';
 import { artifactFileExists, parseCliManifest } from './manifest';
 import type {
   BatchSummary,
@@ -180,14 +181,39 @@ export function assertArtifactFormatAvailable(
   void artifactEntries(artifacts, format);
 }
 
+/**
+ * Basenames (lower-cased, without extension) that coding agents load as
+ * instructions, and directory names they load configuration, rules, or
+ * commands from. Extracted text is untrusted document content, so an input
+ * named `CLAUDE.png` or stored under `.claude/commands/` must never become a
+ * file an agent later reads as instructions. Such names are rewritten:
+ * `CLAUDE.png` becomes `CLAUDE.ocr.md`, `.claude/x.png` becomes `_claude/x.md`.
+ */
+const AGENT_INSTRUCTION_BASENAMES = new Set([
+  'claude', 'claude.local', 'agents', 'agent', 'gemini', 'copilot-instructions',
+  'codex', 'cursorrules', '.cursorrules', 'windsurfrules', '.windsurfrules',
+  '.clinerules', 'conventions', 'skill',
+]);
+const AGENT_CONFIG_DIRECTORIES = new Set([
+  '.claude', '.codex', '.cursor', '.gemini', '.github', '.windsurf', '.clinerules',
+  '.continue', '.vscode', '.idea', '.agents', '.git',
+]);
+
+export function neutralizeAgentInstructionPath(directorySegments: string[], name: string): string[] {
+  const safeDirectories = directorySegments.map((segment) => (
+    AGENT_CONFIG_DIRECTORIES.has(segment.toLowerCase()) ? `_${segment.slice(1)}` : segment
+  ));
+  const safeName = AGENT_INSTRUCTION_BASENAMES.has(name.toLowerCase()) ? `${name}.ocr` : name;
+  return [...safeDirectories, safeName];
+}
+
 function safeOutputRelative(input: ResolvedInput): string {
   const normalized = input.relativePath.replaceAll('\\', '/');
   const parsed = path.posix.parse(normalized);
-  const safeDirectory = parsed.dir
+  const segments = parsed.dir
     .split('/')
-    .filter((segment) => segment && segment !== '.' && segment !== '..')
-    .join(path.sep);
-  return path.join(safeDirectory, parsed.name);
+    .filter((segment) => segment && segment !== '.' && segment !== '..');
+  return path.join(...neutralizeAgentInstructionPath(segments, parsed.name));
 }
 
 function plannedArtifactExtensions(options: ResolvedCliOptions): ArtifactExtension[] {
@@ -569,8 +595,21 @@ async function commitArtifacts(
   targets: ReadonlyArray<readonly [string, string]>,
   overwrite: boolean,
   reclaimable: ReadonlySet<string> = new Set(),
+  /**
+   * The job's output directory. Every artifact's parent directory is resolved
+   * again right before it is staged and must still lie inside this directory's
+   * real path, so a directory swapped for a symbolic link after planning cannot
+   * redirect the write elsewhere. (Node has no openat/O_NOFOLLOW per component,
+   * so this narrows the window to the staging call rather than closing it.)
+   */
+  containRoot?: string,
 ): Promise<void> {
   const transactionId = `${process.pid}-${randomUUID()}`;
+  let realRoot: string | undefined;
+  if (containRoot !== undefined) {
+    await fs.mkdir(containRoot, { recursive: true });
+    realRoot = await fs.realpath(containRoot);
+  }
   const staged: Array<{
     target: string;
     temporary: string;
@@ -583,6 +622,14 @@ async function commitArtifacts(
   try {
     for (const [target, content] of targets) {
       await fs.mkdir(path.dirname(target), { recursive: true });
+      if (realRoot !== undefined) {
+        const realDirectory = await fs.realpath(path.dirname(target));
+        if (escapesRoot(path.relative(realRoot, realDirectory))) {
+          throw outputConflict(
+            `Output artifact directory resolves outside the output directory: ${path.dirname(target)}`,
+          );
+        }
+      }
       const replace = overwrite || reclaimable.has(artifactPathKey(target));
       if (!replace && await pathExists(target)) {
         throw outputConflict(`Output already exists: ${target}. ${OUTPUT_CONFLICT_HINT}`);
@@ -701,6 +748,7 @@ export async function writeArtifacts(
     targets.map((target, index) => [target.path, entries[index][1]] as const),
     options.overwrite,
     reclaimable,
+    await resolvesToSingleArtifactFile(options, totalInputs) ? undefined : defaultOutputDirectory(options),
   );
   return targets;
 }

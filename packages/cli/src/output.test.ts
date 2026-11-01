@@ -599,3 +599,36 @@ describe('CLI output', () => {
     }
   });
 });
+
+describe('artifact path hardening', () => {
+  it('rewrites names coding agents load as instructions', async () => {
+    const { neutralizeAgentInstructionPath } = await import('./output');
+    expect(neutralizeAgentInstructionPath([], 'CLAUDE')).toEqual(['CLAUDE.ocr']);
+    expect(neutralizeAgentInstructionPath([], 'agents')).toEqual(['agents.ocr']);
+    expect(neutralizeAgentInstructionPath(['.claude', 'commands'], 'deploy')).toEqual(['_claude', 'commands', 'deploy']);
+    expect(neutralizeAgentInstructionPath(['docs', '.GitHub'], 'copilot-instructions'))
+      .toEqual(['docs', '_GitHub', 'copilot-instructions.ocr']);
+    expect(neutralizeAgentInstructionPath(['scans'], 'invoice')).toEqual(['scans', 'invoice']);
+  });
+});
+
+describe('artifact write containment', () => {
+  it('refuses a write whose directory was swapped for a symbolic link out of the output directory', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'open-ocr-outside-'));
+    try {
+      const { symlink } = await import('node:fs/promises');
+      await symlink(outside, path.join(directory, 'nested'));
+      await expect(writeArtifacts(input, artifacts, options, 2)).rejects.toMatchObject({ code: 'OUTPUT_CONFLICT' });
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('writes an input named CLAUDE.png as CLAUDE.ocr.md', async () => {
+    const claude = { ...input, absolutePath: '/workspace/CLAUDE.png', relativePath: 'CLAUDE.png', displayPath: 'CLAUDE.png', name: 'CLAUDE.png' };
+    const written = await writeArtifacts(claude, artifacts, options, 2);
+    expect(written.map((target) => path.basename(target.path))).toContain('CLAUDE.ocr.md');
+    expect(await fs.readdir(directory)).not.toContain('CLAUDE.md');
+  });
+});
