@@ -40,7 +40,7 @@ open-ocr-cli extract scan.png --provider openai-compatible \
 | Profile | Credential variable | Documents |
 | --- | --- | --- |
 | `gemini` | `GEMINI_API_KEY` | PNG, JPEG, WebP, HEIC/HEIF; native PDFs |
-| `kimi` | `MOONSHOT_API_KEY` | PNG, JPEG, WebP, GIF; PDF text via file extraction |
+| `kimi` | `MOONSHOT_API_KEY` | PNG, JPEG, WebP, GIF, HEIC/HEIF; PDF text via file extraction |
 | `muse` | `META_API_KEY` | PNG, JPEG, WebP, GIF; native PDFs |
 | `openrouter` | `OPENROUTER_API_KEY` | PNG, JPEG, WebP, GIF; PDFs/tools/schema depend on model |
 | `openai-compatible` | `OPEN_OCR_API_KEY` | Images depend on endpoint; PDFs rejected locally |

@@ -142,7 +142,7 @@ describe('CLI configuration', () => {
 
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       thinking: 'MAX',
     });
     // The same provider keeps them, whether named by flag or left ambient.
@@ -177,7 +177,7 @@ describe('CLI configuration', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',
@@ -319,7 +319,7 @@ describe('CLI configuration', () => {
     }, '/workspace');
     expect(options).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',

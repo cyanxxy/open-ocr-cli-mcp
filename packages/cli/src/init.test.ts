@@ -133,7 +133,8 @@ describe('CLI init', () => {
     expect(result).toMatchObject({ written: true, provider: 'kimi', gateway: 'direct' });
     const config = JSON.parse(await readFile(result.configPath, 'utf8')) as Record<string, unknown>;
     expect(config.model).toBe('kimi-custom-vision');
-    expect(output.join('')).toContain('1. kimi-k3 (default)');
+    expect(output.join('')).toContain('1. kimi-k3.1-pro (default)');
+    expect(output.join('')).toContain('3. kimi-k3\n');
     expect(output.join('')).toContain('4. Enter a custom model ID');
   });
 
@@ -150,7 +151,7 @@ describe('CLI init', () => {
     });
 
     const config = JSON.parse(await readFile(result.configPath, 'utf8')) as Record<string, unknown>;
-    expect(config).toMatchObject({ model: 'kimi-k3', thinking: 'MAX' });
+    expect(config).toMatchObject({ model: 'kimi-k3.1-pro', thinking: 'MAX' });
     expect(config).not.toHaveProperty('inputPricePerMillionUsd');
     expect(config).not.toHaveProperty('outputPricePerMillionUsd');
   });

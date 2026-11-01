@@ -48,7 +48,7 @@ from the process environment; CLI configuration files are not read.
 | Provider (`EVAL_PROVIDER`) | Default model | Default key variable |
 | --- | --- | --- |
 | `gemini` | `gemini-3.8-flash` | `GEMINI_API_KEY` |
-| `kimi` | `kimi-k3` | `MOONSHOT_API_KEY` |
+| `kimi` | `kimi-k3.1-pro` | `MOONSHOT_API_KEY` |
 | `muse` | `muse-spark-1.3` | `META_API_KEY` |
 | `openrouter` | `google/gemini-3.8-flash` | `OPENROUTER_API_KEY` |
 | `openai-compatible` | Set `OPEN_OCR_MODEL` | `OPEN_OCR_API_KEY` |
