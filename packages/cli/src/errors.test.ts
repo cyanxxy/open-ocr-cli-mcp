@@ -567,3 +567,43 @@ describe('Gemini quota verdicts (gemini-cli googleQuotaErrors rule)', () => {
       .toMatchObject({ code: 'RATE_LIMITED', retryable: true });
   });
 });
+
+describe('OpenAI-compatible provider error bodies', () => {
+  it('reports an OpenAI spend-limit 429 as a non-retryable balance problem', () => {
+    expect(ocrErrorPayload(new ProviderApiError(
+      'You exceeded your current quota.',
+      429,
+      'project_spend_limit_exceeded',
+      { type: 'insufficient_quota' },
+    ), 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+      hint: 'Check the provider account balance and quota before retrying.',
+    });
+  });
+
+  it('reports an OpenRouter in-flight-budget 402 with Retry-After as retryable', () => {
+    const inFlight = new ProviderApiError(
+      'This request would exceed your available credits given your current in-flight requests.',
+      402,
+      undefined,
+      { limitSource: 'openrouter_in_flight_budget' },
+    );
+    inFlight.retryAfterMs = 4_000;
+    expect(ocrErrorPayload(inFlight, 1)).toMatchObject({ code: 'RATE_LIMITED', retryable: true });
+    const credits = new ProviderApiError('Insufficient credits', 402, undefined, { limitSource: 'openrouter_credits' });
+    expect(ocrErrorPayload(credits, 1)).toMatchObject({ code: 'RATE_LIMITED', retryable: false });
+  });
+
+  it('reports an OpenRouter 403 refusal or content-policy block as a refusal, not a credential problem', () => {
+    for (const errorType of ['refusal', 'content_policy_violation']) {
+      // providerErrorFromRecord keeps metadata.error_type as the code when error.code is numeric.
+      const payload = ocrErrorPayload(new ProviderApiError('The model declined this request.', 403, errorType), 1);
+      expect(payload).toMatchObject({ code: 'PROVIDER_FAILURE', retryable: false });
+      expect(payload.hint).toContain('declined');
+      expect(payload.hint).not.toContain('credential');
+    }
+    expect(ocrErrorPayload(new ProviderApiError('Forbidden', 403, 'permission_denied'), 1))
+      .toMatchObject({ code: 'PERMISSION_DENIED' });
+  });
+});

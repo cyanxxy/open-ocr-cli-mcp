@@ -7,6 +7,7 @@ import {
   type ProviderErrorPayload,
   type ProviderErrorSubject,
 } from '@open-ocr/engine/gemini/errorPayload';
+import { isTransientBudgetProviderError } from '@open-ocr/engine/providers/openaiCompatible';
 import { isQuotaExhaustedError } from '@open-ocr/engine/providers/retry';
 
 /**
@@ -348,7 +349,15 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     if (name === 'OcrError' && ocrType === 'OUTPUT_INVALID') {
       return OUTPUT_INVALID_DETAILS;
     }
-    if (structuredCode === 'MODEL_REFUSAL') {
+    // OpenRouter reports a provider-side refusal, or a separate content filter
+    // (e.g. Gemini SAFETY), as HTTP 403 with `metadata.error_type` `refusal` /
+    // `content_policy_violation` (openrouter.ai/docs/api_reference/
+    // errors-and-debugging). The credential is fine; the document was declined.
+    if (
+      structuredCode === 'MODEL_REFUSAL'
+      || structuredCode === 'REFUSAL'
+      || structuredCode === 'CONTENT_POLICY_VIOLATION'
+    ) {
       return {
         code: 'PROVIDER_FAILURE',
         category: 'provider',
@@ -373,6 +382,14 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     // "retry later". This is the same verdict the engine's retry loop uses, so
     // `retryable` here never contradicts what the CLI actually did. A Gemini
     // per-minute 429 falls through to the retryable branches below.
+    if (isTransientBudgetProviderError(current)) {
+      return {
+        code: 'RATE_LIMITED',
+        category: 'provider',
+        retryable: true,
+        hint: 'Retry after the provider\'s Retry-After delay, once in-flight requests settle, or lower request concurrency.',
+      };
+    }
     if (isQuotaExhaustedError(current)) {
       return {
         code: 'RATE_LIMITED',

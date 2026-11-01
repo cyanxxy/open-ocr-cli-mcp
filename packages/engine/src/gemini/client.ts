@@ -344,7 +344,7 @@ export type GeminiQuotaVerdict = 'terminal' | 'retryable';
  * - a project spending cap;
  * - a `RetryInfo.retryDelay` (or "Please retry in Xs") longer than 300s;
  * - the Interactions API's `quota_exceeded` (daily quota) or
- *   `payment_required` (prepaid credit depleted) codes, or HTTP 402;
+ *   `payment_required` (prepaid credit depleted) codes;
  * - outside a 429 only, a project without billing enabled.
  *
  * Every other 429 / RESOURCE_EXHAUSTED is retryable: per-minute quota IDs, a
@@ -359,7 +359,7 @@ export function classifyGeminiQuotaError(error: unknown): GeminiQuotaVerdict | u
   const evidence = collectGoogleQuotaEvidence(error);
   const text = evidence.texts.join('\n');
   const { codes, status } = evidence;
-  if (codes.has('QUOTA_EXCEEDED') || codes.has('PAYMENT_REQUIRED') || status === 402) return 'terminal';
+  if (codes.has('QUOTA_EXCEEDED') || codes.has('PAYMENT_REQUIRED')) return 'terminal';
   const throttled = status === 429
     || codes.has('RESOURCE_EXHAUSTED')
     || codes.has('RATE_LIMIT_EXCEEDED')

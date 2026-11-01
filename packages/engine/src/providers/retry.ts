@@ -1,5 +1,9 @@
 import { isGeminiQuotaExhaustedError, isRetryableGeminiError } from '../gemini/client';
-import { isQuotaExhaustedProviderError, isRetryableProviderError } from './openaiCompatible';
+import {
+  isQuotaExhaustedProviderError,
+  isRetryableProviderError,
+  isTransientBudgetProviderError,
+} from './openaiCompatible';
 import { parseRetryAfterHeader } from './retryAfter';
 import type { ProviderId } from './types';
 
@@ -20,8 +24,11 @@ export function isRetryableExtractionError(
  * OpenAI `insufficient_quota`, an HTTP 402, Moonshot's exhausted balance, a
  * Gemini per-day or zero-limit quota. Retrying such a request cannot succeed
  * until someone changes the account, and every attempt is a wasted request.
+ * OpenRouter's in-flight-budget 402 with Retry-After is the one documented
+ * transient 402 and is never reported as exhausted.
  */
 export function isQuotaExhaustedError(error: unknown): boolean {
+  if (isTransientBudgetProviderError(error)) return false;
   return isQuotaExhaustedProviderError(error) || isGeminiQuotaExhaustedError(error);
 }
 
