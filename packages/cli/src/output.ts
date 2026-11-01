@@ -183,28 +183,35 @@ export function assertArtifactFormatAvailable(
 
 /**
  * Basenames (lower-cased, without extension) that coding agents load as
- * instructions, and directory names they load configuration, rules, or
- * commands from. Extracted text is untrusted document content, so an input
- * named `CLAUDE.png` or stored under `.claude/commands/` must never become a
- * file an agent later reads as instructions. Such names are rewritten:
- * `CLAUDE.png` becomes `CLAUDE.ocr.md`, `.claude/x.png` becomes `_claude/x.md`.
+ * instructions. Extracted text is untrusted document content, so an input
+ * named `CLAUDE.png` must never become a file an agent later reads as
+ * instructions: `CLAUDE.png` becomes `CLAUDE.ocr.md`.
  */
 const AGENT_INSTRUCTION_BASENAMES = new Set([
   'claude', 'claude.local', 'agents', 'agent', 'gemini', 'copilot-instructions',
   'codex', 'cursorrules', '.cursorrules', 'windsurfrules', '.windsurfrules',
   '.clinerules', 'conventions', 'skill',
 ]);
-const AGENT_CONFIG_DIRECTORIES = new Set([
-  '.claude', '.codex', '.cursor', '.gemini', '.github', '.windsurf', '.clinerules',
-  '.continue', '.vscode', '.idea', '.agents', '.git',
-]);
+
+/**
+ * No artifact path segment, directory or file, may start with a dot.
+ *
+ * Hidden names are where tools look for configuration rather than content:
+ * `.claude/commands/`, `.git/hooks/`, `.devcontainer/devcontainer.json`, and a
+ * project `.mcp.json` that Claude Code loads as MCP server configuration. An
+ * artifact mirrors its input's relative directory and basename, so without
+ * this `.mcp.png` OCR'd into `.` would be written as `.mcp.json`. The leading
+ * dot becomes `_`: `.claude/x.png` is written under `_claude/`, `.mcp.png` as
+ * `_mcp.json`. This applies to every run, CLI included; an enumerated list of
+ * dangerous names would always be one tool behind.
+ */
+function withoutLeadingDot(segment: string): string {
+  return segment.startsWith('.') ? `_${segment.slice(1)}` : segment;
+}
 
 export function neutralizeAgentInstructionPath(directorySegments: string[], name: string): string[] {
-  const safeDirectories = directorySegments.map((segment) => (
-    AGENT_CONFIG_DIRECTORIES.has(segment.toLowerCase()) ? `_${segment.slice(1)}` : segment
-  ));
   const safeName = AGENT_INSTRUCTION_BASENAMES.has(name.toLowerCase()) ? `${name}.ocr` : name;
-  return [...safeDirectories, safeName];
+  return [...directorySegments.map(withoutLeadingDot), withoutLeadingDot(safeName)];
 }
 
 function safeOutputRelative(input: ResolvedInput): string {
@@ -214,6 +221,17 @@ function safeOutputRelative(input: ResolvedInput): string {
     .split('/')
     .filter((segment) => segment && segment !== '.' && segment !== '..');
   return path.join(...neutralizeAgentInstructionPath(segments, parsed.name));
+}
+
+/**
+ * True when a recorded artifact path has a hidden segment below the output
+ * directory: it was written by a release that kept leading dots, a layout
+ * this one never produces.
+ */
+function hasHiddenArtifactSegment(outputDirectory: string, filePath: string): boolean {
+  const relative = path.relative(outputDirectory, path.resolve(filePath));
+  if (escapesRoot(relative)) return false;
+  return relative.split(path.sep).some((segment) => segment.startsWith('.'));
 }
 
 function plannedArtifactExtensions(options: ResolvedCliOptions): ArtifactExtension[] {
@@ -839,6 +857,11 @@ export class ManifestStore {
       && entry.fingerprintVersion === undefined
       && entry.fingerprint === legacy;
     if (!matchesCurrent && !matchesLegacy) return undefined;
+    // Outputs from the pre-5.0 layout (a hidden name such as `.mcp.json`) are
+    // not what this run would write: re-extract into the current layout. The
+    // old paths stay owned by the entry, so they never block the new write.
+    const outputDirectory = path.dirname(this.manifestPath);
+    if (entry.outputFiles.some((file) => hasHiddenArtifactSegment(outputDirectory, file))) return undefined;
     if (!(await Promise.all(entry.outputFiles.map(artifactFileExists))).every(Boolean)) return undefined;
     return {
       ...entry,

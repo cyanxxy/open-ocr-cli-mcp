@@ -219,12 +219,14 @@ describe('CLI output', () => {
   });
 
   it('can reserve job metadata for a reference-first single-document run', async () => {
+    // `.open-ocr-manifest.jpg` can no longer collide: hidden names lose their
+    // leading dot (`_open-ocr-manifest.json`). The summary is still reserved.
     const metadataCollision = {
       ...input,
-      absolutePath: '/workspace/.open-ocr-manifest.jpg',
-      relativePath: '.open-ocr-manifest.jpg',
-      displayPath: '.open-ocr-manifest.jpg',
-      name: '.open-ocr-manifest.jpg',
+      absolutePath: '/workspace/batch-summary.jpg',
+      relativePath: 'batch-summary.jpg',
+      displayPath: 'batch-summary.jpg',
+      name: 'batch-summary.jpg',
     };
     await expect(assertNoOutputCollisions(
       [metadataCollision],
@@ -609,6 +611,60 @@ describe('artifact path hardening', () => {
     expect(neutralizeAgentInstructionPath(['docs', '.GitHub'], 'copilot-instructions'))
       .toEqual(['docs', '_GitHub', 'copilot-instructions.ocr']);
     expect(neutralizeAgentInstructionPath(['scans'], 'invoice')).toEqual(['scans', 'invoice']);
+  });
+
+  it('never starts a directory or file segment with a dot', async () => {
+    const { neutralizeAgentInstructionPath } = await import('./output');
+    expect(neutralizeAgentInstructionPath([], '.mcp')).toEqual(['_mcp']);
+    expect(neutralizeAgentInstructionPath(['.devcontainer'], 'devcontainer')).toEqual(['_devcontainer', 'devcontainer']);
+    expect(neutralizeAgentInstructionPath(['docs', '.vscode', '.config'], '.env')).toEqual(['docs', '_vscode', '_config', '_env']);
+    // Both rules apply: the instruction name gains `.ocr`, then loses its dot.
+    expect(neutralizeAgentInstructionPath([], '.cursorrules')).toEqual(['_cursorrules.ocr']);
+    expect(neutralizeAgentInstructionPath(['a..b'], 'x.y')).toEqual(['a..b', 'x.y']);
+  });
+
+  it.each([
+    ['.mcp.png', '_mcp'],
+    ['.devcontainer/devcontainer.png', path.join('_devcontainer', 'devcontainer')],
+    ['.github/workflows/ci.png', path.join('_github', 'workflows', 'ci')],
+    ['scans/.hidden/.page.png', path.join('scans', '_hidden', '_page')],
+  ])('writes %s without a hidden segment, consistently with planning', async (relativePath, expected) => {
+    const hidden: ResolvedInput = {
+      ...input, absolutePath: `/workspace/${relativePath}`, relativePath, displayPath: relativePath, name: path.basename(relativePath),
+    };
+    const planned = await plannedArtifactTargets(hidden, options, 2);
+    const written = await writeArtifacts(hidden, artifacts, options, 2);
+    // Planning lists the guaranteed artifacts; the optional CSV comes on top.
+    expect(written.map((target) => target.path)).toEqual(expect.arrayContaining(planned.map((target) => target.path)));
+    expect(planned.length).toBeGreaterThan(0);
+    expect(written.map((target) => path.relative(directory, target.path))).toEqual(
+      expect.arrayContaining([`${expected}.md`, `${expected}.json`]),
+    );
+    for (const target of written) {
+      expect(path.relative(directory, target.path).split(path.sep).some((segment) => segment.startsWith('.'))).toBe(false);
+    }
+    await expect(fs.lstat(path.join(directory, '.mcp.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.lstat(path.join(directory, '.devcontainer'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('re-extracts a resumed entry whose recorded artifact has a hidden name from the old layout', async () => {
+    const legacy = path.join(directory, '.mcp.json');
+    const current = path.join(directory, '_mcp.json');
+    await writeFile(legacy, '{}\n');
+    await writeFile(current, '{}\n');
+    const manifest = new ManifestStore(directory);
+    await manifest.load();
+    await manifest.update('/workspace/.mcp.png', {
+      fingerprint: 'abc', status: 'succeeded', outputFiles: [legacy], completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry('/workspace/.mcp.png', 'abc')).resolves.toBeUndefined();
+    // The old path stays owned, so the new write is not blocked by it.
+    expect(manifest.recordedArtifactPaths('/workspace/.mcp.png').has(legacy)).toBe(true);
+
+    await manifest.update('/workspace/.mcp.png', {
+      fingerprint: 'abc', status: 'succeeded', outputFiles: [current], completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry('/workspace/.mcp.png', 'abc')).resolves.toMatchObject({ outputFiles: [current] });
   });
 });
 

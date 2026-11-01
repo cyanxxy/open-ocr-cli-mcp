@@ -934,6 +934,24 @@ describe('Open OCR MCP server', () => {
         await expect(readFile(path.join(home, '.config', 'open-ocr-cli', 'config.json'))).rejects.toThrow();
       });
 
+      it('never plans an artifact with a hidden name, even with outputDirectory "."', async () => {
+        const { cwd } = await workspace();
+        await mkdir(path.join(cwd, '.devcontainer'));
+        await writeFile(path.join(cwd, '.mcp.jpg'), JPEG_BYTES);
+        await writeFile(path.join(cwd, '.devcontainer', 'devcontainer.jpg'), JPEG_BYTES);
+        const reply = await extract(cwd, {
+          inputs: [{ type: 'path', path: '.mcp.jpg' }, { type: 'path', path: '.devcontainer/devcontainer.jpg' }],
+          outputDirectory: '.',
+          contentFormat: 'json',
+          dryRun: true,
+        });
+        const documents = (reply.result?.structuredContent as {
+          documents: Array<{ plannedArtifacts: Array<{ path: string }> }>;
+        }).documents;
+        const planned = documents.flatMap((document) => document.plannedArtifacts.map((artifact) => artifact.path));
+        expect(planned.sort()).toEqual([path.join(cwd, '_devcontainer', 'devcontainer.json'), path.join(cwd, '_mcp.json')]);
+      });
+
       it('confines a caller configPath "output" the same way', async () => {
         const { cwd, outside } = await workspace();
         await writeFile(path.join(cwd, 'out.json'), JSON.stringify({ output: outside }));
