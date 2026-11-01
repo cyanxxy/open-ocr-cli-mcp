@@ -182,7 +182,7 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
 **GitHub Actions**
 
 ```yaml
-- uses: cyanxxy/open-ocr-cli-mcp@v5
+- uses: cyanxxy/open-ocr-cli-mcp@v4
   env:
     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
   with:

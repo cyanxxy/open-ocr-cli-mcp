@@ -1,14 +1,15 @@
 # Changelog
 
-## 5.0.0 - 2026-11-01
+## 4.4.0 - 2026-11-01
 
 A security and correctness release. The MCP server now treats its caller as
-untrusted relative to the operator who launched it, which breaks MCP setups
-that read or write outside the server's working directory or route requests
-through a caller-supplied `configPath`. CLI flags behave as before except
-where noted.
+untrusted relative to the operator who launched it. Although this is a minor
+version, some changes below can break existing setups: MCP calls that read or
+write outside the server's working directory, or that set routing or prices
+through a caller-supplied `configPath`, are now refused. Review the first
+section before upgrading. CLI flags behave as before except where noted.
 
-### Breaking
+### Changed (review before upgrading)
 
 - MCP: inputs, globs, `schemaPath`, `configPath`, and `outputDirectory` must
   resolve inside the server working directory (real paths, so symbolic links
@@ -157,9 +158,9 @@ where noted.
 - Docs: Codex needs `CODEX_MCP_PROTOCOL_VERSION` and the `mcp_2026_07_28`
   feature for this server (from Codex source; not yet in its docs); Claude
   Code's 30-minute stdio idle timeout; the full Claude Code runtime list;
-  elicitation without an interactive dialog; the GitHub Action tag is `@v5`.
+  elicitation without an interactive dialog.
 
-[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.3.0...v5.0.0)
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.3.0...v4.4.0)
 
 ## 4.3.0 - 2026-10-29
 
