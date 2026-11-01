@@ -9,6 +9,7 @@ import { describeDiscoverySkips, discoverInputSet, inputFingerprint } from './in
 import { modeFingerprint, OcrJobService, type OcrDocumentExtractor } from './ocrJobService';
 import {
   BatchOutputLock,
+  MANIFEST_FLUSH_INTERVAL_MS,
   ManifestStore,
   processStartIdentity,
   recoverStaleTransactionFiles,
@@ -106,6 +107,67 @@ describe('crash-safe resume', () => {
     expect(warnings.some((warning) => warning.includes('Recovered an interrupted run'))).toBe(true);
     const after = await inspectBatchStatus(out, directory);
     expect(after).toMatchObject({ healthy: true, strayTempFiles: [], untrackedArtifacts: [] });
+  });
+
+  it('claims every document durably before extracting, then writes the manifest O(1) times, not twice per document', async () => {
+    const names = Array.from({ length: 60 }, (_, index) => `p${index}.jpg`);
+    const docs = await seedDocs(names);
+    const out = path.join(directory, 'out');
+    const manifestPath = path.join(out, '.open-ocr-manifest.json');
+    const claimsOnDiskAtFirstExtraction: string[] = [];
+    let first = true;
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
+      if (first) {
+        first = false;
+        const onDisk = JSON.parse(await readFile(manifestPath, 'utf8')) as { entries: Record<string, ManifestEntry> };
+        claimsOnDiskAtFirstExtraction.push(...Object.values(onDisk.entries).map((entry) => entry.status));
+      }
+      return { artifacts: { markdown: `# ${input.name}`, json: { name: input.name } }, attempts: 1 };
+    });
+    const { promises: fsPromises } = await import('node:fs');
+    const rename = vi.spyOn(fsPromises, 'rename');
+    const execution = await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ concurrency: '4' }));
+    const manifestWrites = rename.mock.calls.filter(([, to]) => String(to) === manifestPath).length;
+    expect(execution.summary.succeeded).toBe(60);
+    // The pending-before-artifacts invariant: every document is claimed on
+    // disk before the first one is even extracted.
+    expect(claimsOnDiskAtFirstExtraction).toEqual(names.map(() => 'pending'));
+    // One claim write, the final flush, and at most a few interval flushes.
+    expect(manifestWrites).toBeLessThanOrEqual(4);
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { entries: Record<string, ManifestEntry> };
+    expect(Object.values(manifest.entries).map((entry) => entry.status)).toEqual(names.map(() => 'succeeded'));
+  });
+
+  it('flushes finished documents within the bounded interval while the batch is still running', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg']);
+    const out = path.join(directory, 'out');
+    let statusOfAWhileBRuns: string | undefined;
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
+      if (input.name === 'b.jpg') {
+        await new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 400));
+        const onDisk = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+          entries: Record<string, ManifestEntry>;
+        };
+        statusOfAWhileBRuns = Object.entries(onDisk.entries).find(([key]) => key.endsWith('a.jpg'))?.[1].status;
+      }
+      return { artifacts: { markdown: `# ${input.name}`, json: { name: input.name } }, attempts: 1 };
+    });
+    await run(new OcrJobService({ extractDocument }), [docs], batchOptions());
+    expect(statusOfAWhileBRuns).toBe('succeeded');
+  });
+
+  it('withdraws the claims of documents a run never started', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg', 'c.jpg']);
+    const out = path.join(directory, 'out');
+    const extractDocument = vi.fn<OcrDocumentExtractor>(() => Promise.reject(new Error('provider down')));
+    const execution = await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ failFast: true }));
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(execution.summary.failed + execution.summary.skipped).toBe(3);
+    const manifest = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+      entries: Record<string, ManifestEntry>;
+    };
+    expect(Object.values(manifest.entries).map((entry) => entry.status)).toEqual(['failed']);
+    expect((await inspectBatchStatus(out, directory)).counts.interrupted).toBe(0);
   });
 
   it('restores an artifact a kill left moved aside as a .bak', async () => {

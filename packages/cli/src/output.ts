@@ -882,10 +882,21 @@ export interface ManifestFingerprints {
   legacy?: string;
 }
 
+/**
+ * Longest a deferred manifest update waits for a write. It bounds the work a
+ * crash can cost: documents finished within this window keep their pending
+ * claim on disk and are re-extracted by the resume.
+ */
+export const MANIFEST_FLUSH_INTERVAL_MS = 1_000;
+
 export class ManifestStore {
   private readonly manifestPath: string;
   private manifest: CliManifest = { ...EMPTY_MANIFEST, entries: {} };
   private pendingWrite: Promise<void> = Promise.resolve();
+  private queuedWrite: Promise<void> | undefined;
+  private deferredTimer: NodeJS.Timeout | undefined;
+  private deferredFailure: unknown;
+  private completedWrites = 0;
   private usageSource: (() => ProviderUsageSnapshot | undefined) | undefined;
 
   constructor(outputDirectory: string) {
@@ -986,8 +997,61 @@ export class ManifestStore {
    * Replace one entry and persist the whole manifest atomically (staged file,
    * then rename). Ownership only grows: paths the entry recorded before stay
    * in `ownedFiles`, so a later format switch still recognises them.
+   *
+   * By default the returned promise settles once a write containing this
+   * change is durable; updates made while a write is in flight share the next
+   * write (group commit). With `defer`, the change is only guaranteed to reach
+   * disk within {@link MANIFEST_FLUSH_INTERVAL_MS} (or at the next durable
+   * write or {@link flush}); use it only where losing the change to a crash is
+   * safe, such as recording a finished document whose pending claim is
+   * already durable (a resume then re-extracts it).
    */
-  update(key: string, entry: ManifestEntry): Promise<void> {
+  update(key: string, entry: ManifestEntry, options: { defer?: boolean } = {}): Promise<void> {
+    this.apply(key, entry);
+    if (options.defer) {
+      this.scheduleDeferredWrite();
+      return Promise.resolve();
+    }
+    return this.write();
+  }
+
+  /**
+   * Record several entries with one durable write, e.g. the pending claims of
+   * every document a batch may extract, before any of their artifacts exist.
+   */
+  updateMany(entries: Iterable<readonly [string, ManifestEntry]>): Promise<void> {
+    for (const [key, entry] of entries) this.apply(key, entry);
+    return this.write();
+  }
+
+  /**
+   * Put an entry back exactly as it was (or remove it), without the ownership
+   * merge of {@link update}: used to withdraw a pending claim for a document
+   * that was never started. Persisted with the next write or flush.
+   */
+  restore(key: string, entry: ManifestEntry | undefined): void {
+    if (entry) this.manifest.entries[key] = { ...entry, outputFiles: [...entry.outputFiles] };
+    else delete this.manifest.entries[key];
+  }
+
+  /**
+   * Persist the manifest (and the current cumulative usage) without changing
+   * entries, including every deferred update. Rejects if a deferred write
+   * failed since the last flush.
+   */
+  async flush(): Promise<void> {
+    await this.write();
+    const failure = this.deferredFailure;
+    this.deferredFailure = undefined;
+    if (failure !== undefined) throw failure instanceof Error ? failure : new Error(errorMessage(failure));
+  }
+
+  /** Number of manifest writes this store has completed. */
+  get writeCount(): number {
+    return this.completedWrites;
+  }
+
+  private apply(key: string, entry: ManifestEntry): void {
     const previous = this.manifest.entries[key];
     const owned = [...new Set([
       ...(previous?.ownedFiles ?? []),
@@ -999,16 +1063,34 @@ export class ManifestStore {
       ...entry,
       ...(owned.length > 0 ? { ownedFiles: owned } : {}),
     };
-    return this.write();
   }
 
-  /** Persist the manifest (and the current cumulative usage) without changing entries. */
-  flush(): Promise<void> {
-    return this.write();
+  private scheduleDeferredWrite(): void {
+    // Not reset by later updates, so a steady stream still reaches disk
+    // within the interval.
+    if (this.deferredTimer) return;
+    this.deferredTimer = setTimeout(() => {
+      this.deferredTimer = undefined;
+      this.write().catch((error: unknown) => {
+        this.deferredFailure ??= error;
+      });
+    }, MANIFEST_FLUSH_INTERVAL_MS);
+    this.deferredTimer.unref?.();
   }
 
+  /**
+   * Group commit: at most one write is queued behind the one in flight, and
+   * it serialises the manifest when it starts, so it carries every change
+   * made until then.
+   */
   private write(): Promise<void> {
-    this.pendingWrite = this.pendingWrite.then(async () => {
+    if (this.queuedWrite) return this.queuedWrite;
+    const queued = this.pendingWrite.catch(() => undefined).then(async () => {
+      this.queuedWrite = undefined;
+      if (this.deferredTimer) {
+        clearTimeout(this.deferredTimer);
+        this.deferredTimer = undefined;
+      }
       const usage = this.usageSource?.();
       if (usage) this.manifest.usage = usage;
       await writeTextFileAtomically(
@@ -1016,8 +1098,11 @@ export class ManifestStore {
         `${JSON.stringify(this.manifest, null, 2)}\n`,
         true,
       );
+      this.completedWrites += 1;
     });
-    return this.pendingWrite;
+    this.queuedWrite = queued;
+    this.pendingWrite = queued;
+    return queued;
   }
 }
 
