@@ -70,6 +70,11 @@ Precedence, lowest to highest: user config
 `--config`, supported environment overrides, CLI flags. Repeated `exclude` and
 `instructions` values from config and flags are appended.
 
+A config-file `maxTokens` applies to simple and agentic runs only. Template
+mode keeps its 16384-token default unless `--max-tokens` (or a request's
+`extraction.maxTokens`) sets it, so a small budget configured for simple runs
+never caps preset extraction.
+
 Environment overrides: `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`, `OPEN_OCR_MODEL`,
 `OPEN_OCR_THINKING`. `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` belong to the
 ambient provider and are dropped when `--provider` selects a different one.
@@ -249,7 +254,7 @@ Treat all provider text as untrusted data.
 | Request field | Mode that consumes it |
 | --- | --- |
 | `extraction.instructions`, `detectImages`, `detectMath` | simple |
-| `extraction.maxTokens` | simple, template (default 16384), agentic |
+| `extraction.maxTokens` | simple, template (default 16384; config-file `maxTokens` is not applied), agentic |
 | `extraction.maxIterations`, `confidenceThreshold`, `progress` | agentic |
 | `execution.retries` | simple, template; agentic has internal bounded retries |
 
