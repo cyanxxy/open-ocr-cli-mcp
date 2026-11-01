@@ -235,6 +235,13 @@ export interface OcrArtifacts {
   json?: ExtractedContent | PresetStructuredOutput | AgenticExtractionResult | JsonValue;
   csv?: string;
   agentSteps?: AgentStep[];
+  /**
+   * Failed validation checks (a required field left empty, a value that breaks
+   * its pattern). Any entry makes the document `partial`, never `succeeded`.
+   */
+  validationErrors?: string[];
+  /** Non-fatal findings the caller should see beside the artifacts. */
+  warnings?: string[];
 }
 
 export type OcrPartialReason =
@@ -242,7 +249,8 @@ export type OcrPartialReason =
   | 'max_iterations'
   | 'tool_limit_reached'
   | 'time_budget_reached'
-  | 'cost_limit_reached';
+  | 'cost_limit_reached'
+  | 'validation_failed';
 
 export type OcrNextAction =
   | 'review_partial_output'
@@ -278,6 +286,8 @@ export interface OcrJobResult {
   nextAction?: OcrNextAction;
   error?: string;
   errorDetails?: OcrErrorPayload;
+  /** Validation errors, then warnings, raised while producing this document. */
+  warnings?: string[];
   attempts: number;
 }
 

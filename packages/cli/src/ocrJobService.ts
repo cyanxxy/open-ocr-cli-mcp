@@ -706,18 +706,25 @@ export class OcrJobService {
             const agentResult = options.mode === 'agentic' && isAgenticExtractionResult(artifacts.json)
               ? artifacts.json
               : undefined;
-            const jobStatus: OcrJobResult['status'] = agentResult && agentResult.stopReason !== 'succeeded'
-              ? 'partial'
-              : 'succeeded';
+            // A template result with failed validation (a required field left
+            // empty, a pattern mismatch) is usable but incomplete: report it as
+            // partial so it never exits 0 as a success.
+            const validationFailed = (artifacts.validationErrors?.length ?? 0) > 0;
+            const agentPartial = Boolean(agentResult && agentResult.stopReason !== 'succeeded');
+            const jobStatus: OcrJobResult['status'] = agentPartial || validationFailed ? 'partial' : 'succeeded';
             if (agentResult?.stopReason === 'cost_limit_reached') costLimitReached = true;
-            const partialResolution = agentResult?.stopReason && agentResult.stopReason !== 'succeeded'
+            const partialResolution = agentResult && agentResult.stopReason !== 'succeeded'
               ? agentPartialResolution(agentResult.stopReason)
-              : undefined;
+              : validationFailed
+                ? { partialReason: 'validation_failed' as const, nextAction: 'review_partial_output' as const }
+                : undefined;
+            const documentWarnings = [...(artifacts.validationErrors ?? []), ...(artifacts.warnings ?? [])];
             result = {
               status: jobStatus, input, provider: options.provider, gateway: options.gateway,
               mode: options.mode, model: options.model, startedAt: jobStartedAt,
               completedAt: new Date().toISOString(), durationMs: performance.now() - jobStart,
               artifacts, outputFiles, outputArtifacts, attempts, ...partialResolution,
+              ...(documentWarnings.length > 0 ? { warnings: documentWarnings } : {}),
             };
             await manifest?.update(key, {
               fingerprint,

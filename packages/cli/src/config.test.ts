@@ -580,8 +580,8 @@ describe('CLI configuration', () => {
 
     expect(ignoredModeScopedOptions(['detectMath', 'maxIterations'], 'simple')).toEqual(['maxIterations']);
     expect(ignoredModeScopedOptions(['detectMath', 'maxIterations'], 'agentic')).toEqual(['detectMath']);
-    // --max-tokens reaches simple and agentic extraction but never the preset path.
-    expect(ignoredModeScopedOptions(['maxTokens'], 'template')).toEqual(['maxTokens']);
+    // --max-tokens reaches every extraction path, preset extraction included.
+    expect(ignoredModeScopedOptions(['maxTokens'], 'template')).toEqual([]);
     expect(ignoredModeScopedOptions(['maxTokens'], 'simple')).toEqual([]);
     expect(ignoredModeScopedOptions(['progress'], 'simple')).toEqual(['progress']);
 

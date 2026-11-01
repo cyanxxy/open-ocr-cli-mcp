@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import path from 'node:path';
 
-import Ajv2020, { type ValidateFunction } from 'ajv/dist/2020.js';
+import Ajv2020, { type ErrorObject, type ValidateFunction } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 
 import { findSchemaCompatibilityIssues } from '@open-ocr/engine/gemini/schemaCompat';
@@ -201,8 +201,42 @@ export function assertCustomSchemaOutput(
   schema: Record<string, unknown>,
   value: unknown,
 ): asserts value is JsonValue {
-  const { ajv, validate } = compileSchema(schema);
+  const { validate } = compileSchema(schema);
   if (validate(value)) return;
-  const details = ajv.errorsText(validate.errors, { separator: '; ' });
-  throw new Error(`Schema output validation failed: ${details}`);
+  const details = (validate.errors ?? []).slice(0, MAX_LISTED_OUTPUT_ERRORS).map(describeOutputError);
+  const remainder = (validate.errors?.length ?? 0) > MAX_LISTED_OUTPUT_ERRORS
+    ? `; and ${(validate.errors?.length ?? 0) - MAX_LISTED_OUTPUT_ERRORS} more`
+    : '';
+  // The schema compiled, so it is not what is wrong: the model's answer is.
+  // Typed as OUTPUT_INVALID (retryable) rather than SCHEMA_INVALID, whose hint
+  // tells the caller to go and fix a schema that is fine.
+  throw new CliExitError(
+    `Model output did not conform to the requested JSON Schema: ${details.join('; ')}${remainder}`,
+    1,
+    {
+      code: 'OUTPUT_INVALID',
+      category: 'output',
+      retryable: true,
+      hint: 'The model returned JSON that the schema rejects at the path named above; retry (--retries), '
+        + 'describe that field in an --instruction, or use a more capable model. The schema itself is valid.',
+    },
+  );
+}
+
+const MAX_LISTED_OUTPUT_ERRORS = 5;
+
+/** One Ajv error as "<path> <problem>", naming the offending key where Ajv knows it. */
+function describeOutputError(error: ErrorObject): string {
+  const path = error.instancePath || '/';
+  const params = error.params as Record<string, unknown>;
+  if (error.keyword === 'additionalProperties' && typeof params.additionalProperty === 'string') {
+    return `${path} has unexpected property "${params.additionalProperty}"`;
+  }
+  if (error.keyword === 'required' && typeof params.missingProperty === 'string') {
+    return `${path} is missing required property "${params.missingProperty}"`;
+  }
+  if (error.keyword === 'enum' && Array.isArray(params.allowedValues)) {
+    return `${path} must be one of ${params.allowedValues.map((entry) => JSON.stringify(entry)).join(', ')}`;
+  }
+  return `${path} ${error.message ?? `fails "${error.keyword}"`}`;
 }

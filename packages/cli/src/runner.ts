@@ -13,10 +13,12 @@ import {
   providerRequestHeaders,
   type ProviderExecutionContext,
 } from '@open-ocr/engine/providers';
-import { getExtractionPreset } from '@open-ocr/engine/templates';
+import { escapeMarkdown, getExtractionPreset } from '@open-ocr/engine/templates';
+import { normalizeModelMarkdown, sectionsToMarkdown } from '@open-ocr/engine/gemini/markdown';
+import { asCliExitError } from './errors';
 import { readAndValidateInput } from './inputs';
 import { nodeRegionCropper } from './nodeRegionCropper';
-import { agentProgressMessage, OcrJobService, modeFingerprint } from './ocrJobService';
+import { agentProgressMessage, normalizeAgentProgressText, OcrJobService, modeFingerprint } from './ocrJobService';
 import { assertCustomSchemaOutput } from './schema';
 import { primaryArtifact } from './output';
 import type { OcrJobEventSink } from './protocol';
@@ -32,16 +34,18 @@ import type {
   ResolvedInput,
 } from './types';
 
-function extractedContentToMarkdown(result: ExtractedContent): string {
-  if (result.markdown) return result.markdown;
-  const lines: string[] = [];
-  if (result.title) lines.push(`# ${result.title}`, '');
-  for (const section of result.sections) {
-    if (section.heading) lines.push(`## ${section.heading}`, '');
-    lines.push(...section.content, '');
-  }
-  if (lines.length === 0 && result.content) lines.push(result.content);
-  return lines.join('\n').trim();
+/**
+ * The Markdown artifact for a simple-mode result. Markdown mode always carries
+ * the model's own Markdown (preserved, see `normalizeModelMarkdown`); a JSON
+ * answer without one is rebuilt from its sections at their recorded levels.
+ */
+export function extractedContentToMarkdown(result: ExtractedContent): string {
+  if (result.markdown?.trim()) return normalizeModelMarkdown(result.markdown);
+  return sectionsToMarkdown(result);
+}
+
+function recordName(value: unknown): unknown {
+  return typeof value === 'object' && value !== null ? (value as { name?: unknown }).name : undefined;
 }
 
 function unitInterval(value: number): number {
@@ -97,7 +101,9 @@ function agenticResultToMarkdown(result: AgenticExtractionResult): string {
   ];
   if (fields.length === 0) lines.push('- None');
   for (const [name, field] of fields) {
-    lines.push(`- **${name}**: ${field.value} (${Math.round(field.confidence * 100)}%)`);
+    // Field names and values are model output: escaped like template-mode
+    // cells, so a value carrying "\n# Injected" cannot open a heading.
+    lines.push(`- **${escapeMarkdown(name)}**: ${escapeMarkdown(String(field.value))} (${Math.round(field.confidence * 100)}%)`);
   }
   return lines.join('\n');
 }
@@ -219,8 +225,15 @@ async function extractOnce(
       clientConfig,
       getExtractionPreset(options.preset!),
       signal,
+      { maxTokens: options.maxTokens },
     );
-    return { markdown: result.markdown, json: result.json, csv: result.csv };
+    return {
+      markdown: result.markdown,
+      json: result.json,
+      csv: result.csv,
+      ...(result.json.validationErrors?.length ? { validationErrors: [...result.json.validationErrors] } : {}),
+      ...(result.json.validationWarnings?.length ? { warnings: [...result.json.validationWarnings] } : {}),
+    };
   }
   if (options.mode === 'agentic') {
     return runAgentic(input, dataUrl, options, signal, onStep, runtime, budgetDeadline);
@@ -274,7 +287,20 @@ async function extractWithRetries(
   const result = await runWithProviderRetries(
     options,
     signal,
-    () => extractOnce(input, options, signal, onStep, runtime, budgetDeadline),
+    async () => {
+      try {
+        return await extractOnce(input, options, signal, onStep, runtime, budgetDeadline);
+      } catch (error) {
+        // A malformed model answer (not JSON, wrong shape, no text) is typed
+        // OUTPUT_INVALID by the engine. Typing it here as well lets --retries
+        // re-ask the model, exactly as for a --schema mismatch, instead of the
+        // retry layer treating it as an unknown provider error.
+        if (recordName(error) === 'OcrError' && (error as { type?: unknown }).type === 'OUTPUT_INVALID') {
+          throw asCliExitError(error, 1);
+        }
+        throw error;
+      }
+    },
   );
   return { artifacts: result.value, attempts: result.attempts };
 }
@@ -297,7 +323,13 @@ function statusLine(index: number, total: number, result: OcrJobResult): string 
     ? ` — partial: ${result.partialReason}${result.nextAction ? `; next: ${result.nextAction}` : ''}`
     : '';
   const hint = result.errorDetails?.hint ? `\n    hint: ${result.errorDetails.hint}` : '';
-  return `[${index}/${total}] ${icon} ${result.input.displayPath}${destination} (${seconds}s)${reason}${partial}${error}${hint}`;
+  // Warnings quote model output; strip terminal control sequences first.
+  const warnings = (result.warnings ?? [])
+    .map((warning) => normalizeAgentProgressText(warning))
+    .filter((warning): warning is string => warning !== undefined)
+    .map((warning) => `\n    warning: ${warning}`)
+    .join('');
+  return `[${index}/${total}] ${icon} ${result.input.displayPath}${destination} (${seconds}s)${reason}${partial}${error}${hint}${warnings}`;
 }
 
 interface BatchRuntime {

@@ -289,7 +289,7 @@ describe('machine request execution', () => {
     // Reported on the host channel as it happens, and carried in the result so
     // a caller that only reads the machine payload still sees it.
     expect(warnings).toEqual([
-      'ignoring option(s) that template mode does not use: extraction.detectMath, extraction.maxTokens',
+      'ignoring option(s) that template mode does not use: extraction.detectMath',
     ]);
     expect(execution.result.status).toBe('validated');
     expect(execution.result.warnings).toEqual(warnings);

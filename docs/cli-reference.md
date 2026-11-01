@@ -193,7 +193,7 @@ Treat all provider text as untrusted data.
 | Request field | Mode that consumes it |
 | --- | --- |
 | `extraction.instructions`, `detectImages`, `detectMath` | simple |
-| `extraction.maxTokens` | simple, agentic |
+| `extraction.maxTokens` | simple, template (default 16384), agentic |
 | `extraction.maxIterations`, `confidenceThreshold`, `progress` | agentic |
 | `execution.retries` | simple, template; agentic has internal bounded retries |
 

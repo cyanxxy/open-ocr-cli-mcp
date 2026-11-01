@@ -32,10 +32,17 @@ function assertString(args: Record<string, unknown>, key: string): string {
   return v;
 }
 
+function describeArgument(value: unknown): string {
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'string') return JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
+  if (value === null) return 'null';
+  return Array.isArray(value) ? 'array' : typeof value;
+}
+
 function assertNumber(args: Record<string, unknown>, key: string): number {
   const v = args[key];
   if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
-    throw new TypeError(`Expected a finite confidence between 0 and 1 for "${key}"`);
+    throw new TypeError(`Expected a finite confidence between 0 and 1 for "${key}", got ${describeArgument(v)}`);
   }
   return v;
 }
@@ -88,16 +95,30 @@ function normalizeStructuredFields(
   const acceptedFields: Record<string, AgentMemory['extractedFields'][string]> = {};
   const extractedSummaries: Array<Record<string, unknown>> = [];
 
-  for (const entry of entries) {
-    const rawFieldName = assertString(entry, 'field_name');
+  for (const [index, entry] of entries.entries()) {
+    // One malformed entry still rejects the whole batch (memory is updated
+    // atomically), but the error names which entry and field to fix, so the
+    // model can resend a corrected batch instead of guessing.
+    const entryLabel = typeof entry.field_name === 'string' && entry.field_name
+      ? `fields[${index}] ("${entry.field_name}")`
+      : `fields[${index}]`;
+    const checked = <T>(read: () => T): T => {
+      try {
+        return read();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new TypeError(`Invalid field entry ${entryLabel}: ${message}`, { cause: error });
+      }
+    };
+    const rawFieldName = checked(() => assertString(entry, 'field_name'));
     const field_name = normalizeAgentFieldName(memory.documentAnalysis.documentType, rawFieldName);
-    const field_value = assertString(entry, 'field_value');
-    const confidence = assertNumber(entry, 'confidence');
+    const field_value = checked(() => assertString(entry, 'field_value'));
+    const confidence = checked(() => assertNumber(entry, 'confidence'));
     const validation_rule = typeof entry.validation_rule === 'string'
       ? entry.validation_rule
       : inferValidationRule(field_name);
     const location = typeof entry.location === 'object' && entry.location !== null
-      ? assertNormalizedRegion(entry.location, 'location')
+      ? checked(() => assertNormalizedRegion(entry.location, 'location'))
       : undefined;
 
     const validationResult = validation_rule

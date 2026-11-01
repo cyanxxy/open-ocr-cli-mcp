@@ -48,7 +48,11 @@ An unknown name exits 2 with a typed error listing every accepted name.
 
 When a document status is `partial`, read its required `partialReason` and
 `nextAction` before deciding whether to accept useful output or rerun with a
-higher limit. Do not infer recovery from exit code 1 alone.
+higher limit. Do not infer recovery from exit code 1 alone. A template result
+whose required fields are missing or fail validation is `partial` with
+`partialReason: "validation_failed"`; the document's `warnings` list each
+failed check and any non-fatal finding (ambiguous amounts, unsafe URLs dropped,
+unknown keys ignored).
 
 Check the provider's `inputImageMimeTypes` before choosing a document: the profiles differ and the differences are not intuitive. The default `gemini` profile accepts HEIC/HEIF but **not** GIF; `kimi`, `muse`, and `openrouter` accept GIF but not HEIC/HEIF; `openai-compatible` refuses PDFs outright. A rejected type fails locally as `INPUT_INVALID` before any billed request.
 
@@ -183,6 +187,7 @@ or text feedback and do not treat missing `structuredContent` as success.
 - `PERMISSION_DENIED`: stop and report that the credential/project cannot use the model or operation.
 - `INPUT_NOT_FOUND`, `INPUT_INVALID`, `SCHEMA_INVALID`, `CONFIG_INVALID`: fix the request locally, then dry-run again.
 - `OUTPUT_CONFLICT`: choose a fresh output directory or resume a matching job; never add overwrite implicitly.
+- `OUTPUT_INVALID`: the model answered but not in the requested shape (invalid JSON, wrong shape, or a value your `--schema` rejects); the message names the path. Retry when `retryable` is true; do not edit a schema that is valid.
 - `RATE_LIMITED`, `TIMEOUT`: retry only when `retryable` is true, with bounded attempts or a user-approved timeout change.
 - `COST_LIMIT`: preserve and report partial artifact references; do not raise the limit without user approval.
 - `CANCELLED`: retain references already produced and offer a resumable rerun.

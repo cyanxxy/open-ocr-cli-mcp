@@ -302,6 +302,25 @@ function compatibleTools(config: ProviderRuntimeConfig, tools: OpenAITool[]): Op
   });
 }
 
+/**
+ * The model's refusal text, when it declined instead of answering. OpenAI-style
+ * APIs report it in `message.refusal` (or a `{type: "refusal"}` content part)
+ * with `content: null`, which otherwise reads as an "empty response".
+ */
+function parseRefusal(message: Record<string, unknown>): string | undefined {
+  if (typeof message.refusal === 'string' && message.refusal.trim()) return message.refusal.trim();
+  if (!Array.isArray(message.content)) return undefined;
+  const parts = message.content
+    .filter((part): part is Record<string, unknown> => isRecord(part) && part.type === 'refusal' && typeof part.refusal === 'string')
+    .map((part) => String(part.refusal).trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+function refusalError(refusal: string): ProviderApiError {
+  return new ProviderApiError(`Provider model refused the request: ${refusal}`, undefined, 'MODEL_REFUSAL');
+}
+
 function parseContent(value: unknown): string {
   if (typeof value === 'string') return value;
   if (!Array.isArray(value)) return '';
@@ -476,6 +495,7 @@ async function streamedChatCompletion(
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
+  let refusal = '';
   let reasoning = '';
   let reasoningContent = '';
   const reasoningDetails: unknown[] = [];
@@ -518,6 +538,7 @@ async function streamedChatCompletion(
     if (typeof choice.finish_reason === 'string') finishReason = choice.finish_reason;
     if (!isRecord(choice.delta)) return;
     const delta = choice.delta;
+    if (typeof delta.refusal === 'string') refusal += delta.refusal;
     const contentDelta = parseContent(delta.content);
     if (contentDelta) {
       text += contentDelta;
@@ -639,6 +660,7 @@ async function streamedChatCompletion(
     ...(annotations.length ? { annotations } : {}),
   };
   if (!text && completedToolCalls.length === 0) {
+    if (refusal.trim()) throw refusalError(refusal.trim());
     throw new ProviderApiError('Provider returned an empty response');
   }
   const raw = {
@@ -699,7 +721,11 @@ export async function createChatCompletion(
   if (finishReason === 'tool_calls' && !message.tool_calls?.length) {
     throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
   }
-  if (!text && !message.tool_calls?.length) throw new ProviderApiError('Provider returned an empty response');
+  if (!text && !message.tool_calls?.length) {
+    const refusal = parseRefusal(rawMessage);
+    if (refusal) throw refusalError(refusal);
+    throw new ProviderApiError('Provider returned an empty response');
+  }
   return { text, message, finishReason, raw: parsed };
 }
 

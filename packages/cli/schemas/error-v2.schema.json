@@ -16,6 +16,7 @@
         "PERMISSION_DENIED",
         "SCHEMA_INVALID",
         "OUTPUT_CONFLICT",
+        "OUTPUT_INVALID",
         "RATE_LIMITED",
         "TIMEOUT",
         "COST_LIMIT",
