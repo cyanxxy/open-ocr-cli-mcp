@@ -70,6 +70,11 @@ Precedence, lowest to highest: user config
 `--config`, supported environment overrides, CLI flags. Repeated `exclude` and
 `instructions` values from config and flags are appended.
 
+A config-file `maxTokens` applies to simple and agentic runs only. Template
+mode keeps its 16384-token default unless `--max-tokens` (or a request's
+`extraction.maxTokens`) sets it, so a small budget configured for simple runs
+never caps preset extraction.
+
 Environment overrides: `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`, `OPEN_OCR_MODEL`,
 `OPEN_OCR_THINKING`. `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` belong to the
 ambient provider and are dropped when `--provider` selects a different one.
@@ -168,13 +173,20 @@ longer needed; a live, cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
 Concurrent reclaimers of one stale lock get exactly one winner; the others
 report `OUTPUT_CONFLICT`.
 
-Resume is crash-safe. Before a document's artifacts are committed, its manifest
-entry is written as a `pending` claim naming every path it may write, and the
-manifest itself is replaced atomically. A run killed at any point (including
-`SIGKILL`) therefore leaves only files the next run recognises as its own: it
-re-extracts the interrupted document, removes leftover
+Resume is crash-safe. Before any artifact is committed, one manifest write
+records a `pending` claim for every document the run will extract, naming
+every path each may write, and the manifest itself is replaced atomically.
+Finished documents are then recorded at least once a second and when the run
+ends, so a large batch rewrites the manifest a handful of times rather than
+twice per document; a claim for a document the run never started (fail-fast,
+cost limit, cancellation) is withdrawn when it ends. A run killed at any point
+(including `SIGKILL`) therefore leaves only files the next run recognises as
+its own: it re-extracts the interrupted documents (at most the last second's
+finished documents are extracted again), removes leftover
 `<artifact>.<pid>-<uuid>.tmp` staging files, and puts back any `.bak` an
-interrupted replacement had moved aside. Each entry also keeps every artifact
+interrupted replacement had moved aside. Cleanup runs under the batch lock, so
+a leftover last modified before the lock was taken is removed even when its
+embedded PID now belongs to another live process. Each entry also keeps every artifact
 path it has ever written, so switching `--format` back and forth reuses the
 directory without conflicts. Resume compares a streamed SHA-256 of each input
 (plus path, size, and output-affecting settings), not its mtime: a content
@@ -198,10 +210,14 @@ Dry runs validate even resumed inputs and write no files.
 
 `status <dir>` reports the last run's usage and the cumulative usage of every
 run in the directory, documents left `pending` by an interrupted run,
-artifact-shaped files (`.md`, `.json`, `.csv`) no manifest entry owns, leftover
-staging/backup files, and whether a lock is held by a running process, is stale
-(the next extract reclaims it), or cannot be verified from this host. Any of
-these makes the directory unhealthy. A `--no-resume` run into a directory that
+artifact files the batch could have written (each recorded artifact under
+every artifact extension, `.md`, `.json`, `.csv`) that no manifest entry owns,
+leftover staging/backup files of those paths and of the batch metadata, and
+whether a lock is held by a running process, is stale (the next extract
+reclaims it), or cannot be verified from this host. Any of these makes the
+directory unhealthy. Only the directories holding recorded artifacts are
+listed, one level each, so unrelated files (a `README.md` or `package.json` in
+`-o .`, anything under `node_modules` or `.git`) never affect the result. A `--no-resume` run into a directory that
 already holds this job's artifacts fails with `OUTPUT_CONFLICT`; drop
 `--no-resume`, pass `--overwrite`, or choose a new `--output`.
 
@@ -249,7 +265,7 @@ Treat all provider text as untrusted data.
 | Request field | Mode that consumes it |
 | --- | --- |
 | `extraction.instructions`, `detectImages`, `detectMath` | simple |
-| `extraction.maxTokens` | simple, template (default 16384), agentic |
+| `extraction.maxTokens` | simple, template (default 16384; config-file `maxTokens` is not applied), agentic |
 | `extraction.maxIterations`, `confidenceThreshold`, `progress` | agentic |
 | `execution.retries` | simple, template; agentic has internal bounded retries |
 

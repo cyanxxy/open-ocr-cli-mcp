@@ -60,6 +60,50 @@ describe('money parsing keeps sign and magnitude', () => {
     expect(currency(raw).value).toBe(expected);
   });
 
+  it.each([
+    ['Rs.500', '500.00'],
+    ['Rs 500', '500.00'],
+    ['rs.1,500.00', '1500.00'],
+    ['Re.1', '1.00'],
+    ['Fr.25', '25.00'],
+    ['SFr.25.50', '25.50'],
+    ['Bs.100', '100.00'],
+    ['S/.100', '100.00'],
+    ['B/.12.50', '12.50'],
+    ['Kr.75', '75.00'],
+    ['kr.75', '75.00'],
+    ['Dhs.250', '250.00'],
+    ['Ksh.1,000', '1000.00'],
+    ['Rs.-500', '-500.00'],
+  ])('reads the currency abbreviation in %s as a word, not a decimal point (%s)', (raw, expected) => {
+    const { value, warnings } = currency(raw);
+    expect(value).toBe(expected);
+    expect(warnings.filter((warning) => !/three digits/.test(warning))).toEqual([]);
+  });
+
+  it.each(['$.50', '.5', '-.5', '€,50'])('still reads a leading separator after a symbol or sign as a decimal point (%s)', (raw) => {
+    expect(Math.abs(Number(currency(raw).value))).toBeLessThan(1);
+  });
+
+  it.each(['No.5', 'USD.50', 'Rs,500', 'abc.25'])('keeps text and warns when a separator follows letters it does not know (%s)', (raw) => {
+    const { value, warnings } = currency(raw);
+    expect(value).toBe(raw);
+    expect(warnings[0]).toMatch(/separator directly after letters/);
+    const numberWarnings: string[] = [];
+    expect(normalizeFieldValue(raw, 'number', { field: 'qty', warnings: numberWarnings })).toBe(raw);
+    expect(numberWarnings[0]).toMatch(/separator directly after letters/);
+  });
+
+  it.each([
+    ['€1.234', '1234.00'],
+    ['(27.00)', '-27.00'],
+    ['USD -5.00', '-5.00'],
+    ['1.234,56', '1234.56'],
+    ['1,234.56', '1234.56'],
+  ])('keeps reading %s as %s', (raw, expected) => {
+    expect(currency(raw).value).toBe(expected);
+  });
+
   it('reads a single separator before three digits as grouping, and warns', () => {
     const { value, warnings } = currency('€1.234');
     expect(value).toBe('1234.00');
@@ -158,7 +202,65 @@ describe('required-field and typed-field validation', () => {
     },
   );
 
-  it.each(['https://orbit.example', 'orbitpartners.com', 'www.orbit.example:8080/x'])('keeps an ordinary website (%s)', (website) => {
+  it.each([
+    'javascript:1;alert(document.cookie)',
+    'javascript:80',
+    'JaVaScRiPt:1;alert(1)',
+    'vbscript:1;msgbox(1)',
+    'VBScript:msgbox(1)',
+    'data:1,<script>alert(1)</script>',
+    'DATA:text/html;base64,PHNjcmlwdD4=',
+    ' javascript:alert(1)',
+    'java\nscript:alert(1)',
+    'java\u0000script:alert(1)',
+    'jav ascript:alert(1)',
+    'ht\ttp://evil.example',
+    'mailto:a@b.example',
+  ])('drops a non-http(s) or disguised scheme (%j) to null with a warning', (website) => {
+    const result = presetRunResultFromText(presetText({
+      full_name: { value: 'Nina', confidence: 0.9 },
+      company: { value: 'Orbit', confidence: 0.9 },
+      website: { value: website, confidence: 0.9 },
+    }), getExtractionPreset('business-card'));
+    expect(result.json.fields.website).toMatchObject({ value: null, confidence: 0 });
+    expect(result.json.validationWarnings?.join('\n')).toMatch(/the value was set to null/);
+  });
+
+  it('names the scheme of a host:port look-alike that is really a scheme', () => {
+    const result = presetRunResultFromText(presetText({
+      full_name: { value: 'Nina', confidence: 0.9 },
+      company: { value: 'Orbit', confidence: 0.9 },
+      website: { value: 'javascript:1;alert(document.cookie)', confidence: 0.9 },
+    }), getExtractionPreset('business-card'));
+    expect(result.json.validationWarnings).toContain(
+      'Field "website": "javascript:1;alert(document.cookie)" uses the "javascript:" scheme; only http and https URLs are kept, so the value was set to null.',
+    );
+  });
+
+  it.each(['see our website', '12345', 'orbit', 'https://', 'http://exa mple.com', 'user:pass@orbit.example'])(
+    'drops text that is not an http(s) URL or real host (%j) to null with a warning',
+    (website) => {
+      const result = presetRunResultFromText(presetText({
+        full_name: { value: 'Nina', confidence: 0.9 },
+        company: { value: 'Orbit', confidence: 0.9 },
+        website: { value: website, confidence: 0.9 },
+      }), getExtractionPreset('business-card'));
+      expect(result.json.fields.website).toMatchObject({ value: null, confidence: 0 });
+      expect(result.json.validationWarnings?.join('\n')).toMatch(/set to null/);
+    },
+  );
+
+  it.each([
+    'https://orbit.example',
+    'HTTPS://Orbit.Example/Path?q=1',
+    'http://localhost:3000/x',
+    'orbitpartners.com',
+    'www.orbit.example:8080/x',
+    'localhost:3000',
+    '192.168.1.10:8080/admin',
+    'xn--bcher-kva.example/path',
+    'bücher.example',
+  ])('keeps an ordinary website (%s)', (website) => {
     const result = presetRunResultFromText(presetText({
       full_name: { value: 'Nina', confidence: 0.9 },
       company: { value: 'Orbit', confidence: 0.9 },

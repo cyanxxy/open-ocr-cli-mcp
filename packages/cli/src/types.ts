@@ -194,6 +194,12 @@ export interface ResolvedCliOptions {
   maxFiles: number;
   maxTotalMb: number;
   excludes: string[];
+  /**
+   * The `excludes` that came only from configuration files. They are ambient,
+   * so discovery never reports them as having matched nothing; only patterns
+   * supplied on the command line or in a request are. Absent means none.
+   */
+  configExcludes?: string[];
   instructions: string[];
   hidden: boolean;
   /** Whether directory scans prune well-known dependency and build-output trees. */

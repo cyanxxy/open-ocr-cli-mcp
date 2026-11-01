@@ -9,11 +9,12 @@ import { describeDiscoverySkips, discoverInputSet, inputFingerprint } from './in
 import { modeFingerprint, OcrJobService, type OcrDocumentExtractor } from './ocrJobService';
 import {
   BatchOutputLock,
+  MANIFEST_FLUSH_INTERVAL_MS,
   ManifestStore,
   processStartIdentity,
   recoverStaleTransactionFiles,
 } from './output';
-import { inspectBatchStatus } from './status';
+import { inspectBatchStatus, renderBatchStatus } from './status';
 import type { ManifestEntry, ResolvedCliOptions } from './types';
 
 const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
@@ -108,6 +109,67 @@ describe('crash-safe resume', () => {
     expect(after).toMatchObject({ healthy: true, strayTempFiles: [], untrackedArtifacts: [] });
   });
 
+  it('claims every document durably before extracting, then writes the manifest O(1) times, not twice per document', async () => {
+    const names = Array.from({ length: 60 }, (_, index) => `p${index}.jpg`);
+    const docs = await seedDocs(names);
+    const out = path.join(directory, 'out');
+    const manifestPath = path.join(out, '.open-ocr-manifest.json');
+    const claimsOnDiskAtFirstExtraction: string[] = [];
+    let first = true;
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
+      if (first) {
+        first = false;
+        const onDisk = JSON.parse(await readFile(manifestPath, 'utf8')) as { entries: Record<string, ManifestEntry> };
+        claimsOnDiskAtFirstExtraction.push(...Object.values(onDisk.entries).map((entry) => entry.status));
+      }
+      return { artifacts: { markdown: `# ${input.name}`, json: { name: input.name } }, attempts: 1 };
+    });
+    const { promises: fsPromises } = await import('node:fs');
+    const rename = vi.spyOn(fsPromises, 'rename');
+    const execution = await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ concurrency: '4' }));
+    const manifestWrites = rename.mock.calls.filter(([, to]) => String(to) === manifestPath).length;
+    expect(execution.summary.succeeded).toBe(60);
+    // The pending-before-artifacts invariant: every document is claimed on
+    // disk before the first one is even extracted.
+    expect(claimsOnDiskAtFirstExtraction).toEqual(names.map(() => 'pending'));
+    // One claim write, the final flush, and at most a few interval flushes.
+    expect(manifestWrites).toBeLessThanOrEqual(4);
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { entries: Record<string, ManifestEntry> };
+    expect(Object.values(manifest.entries).map((entry) => entry.status)).toEqual(names.map(() => 'succeeded'));
+  });
+
+  it('flushes finished documents within the bounded interval while the batch is still running', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg']);
+    const out = path.join(directory, 'out');
+    let statusOfAWhileBRuns: string | undefined;
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
+      if (input.name === 'b.jpg') {
+        await new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 400));
+        const onDisk = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+          entries: Record<string, ManifestEntry>;
+        };
+        statusOfAWhileBRuns = Object.entries(onDisk.entries).find(([key]) => key.endsWith('a.jpg'))?.[1].status;
+      }
+      return { artifacts: { markdown: `# ${input.name}`, json: { name: input.name } }, attempts: 1 };
+    });
+    await run(new OcrJobService({ extractDocument }), [docs], batchOptions());
+    expect(statusOfAWhileBRuns).toBe('succeeded');
+  });
+
+  it('withdraws the claims of documents a run never started', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg', 'c.jpg']);
+    const out = path.join(directory, 'out');
+    const extractDocument = vi.fn<OcrDocumentExtractor>(() => Promise.reject(new Error('provider down')));
+    const execution = await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ failFast: true }));
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(execution.summary.failed + execution.summary.skipped).toBe(3);
+    const manifest = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+      entries: Record<string, ManifestEntry>;
+    };
+    expect(Object.values(manifest.entries).map((entry) => entry.status)).toEqual(['failed']);
+    expect((await inspectBatchStatus(out, directory)).counts.interrupted).toBe(0);
+  });
+
   it('restores an artifact a kill left moved aside as a .bak', async () => {
     const target = path.join(directory, 'doc.md');
     await writeFile(`${target}.${TX}.bak`, '# previous');
@@ -116,6 +178,41 @@ describe('crash-safe resume', () => {
     expect(recovered.restored).toEqual([target]);
     expect(recovered.removed).toEqual([`${target}.${TX}.tmp`]);
     await expect(readFile(target, 'utf8')).resolves.toBe('# previous');
+  });
+
+  it('cleans up leftovers whose embedded PID is alive but was reused, and status turns healthy', async () => {
+    const docs = await seedDocs(['a.jpg']);
+    const options = batchOptions();
+    const out = path.join(directory, 'out');
+    const service = new OcrJobService({ extractDocument: markdownExtractor() });
+    expect((await run(service, [docs], options)).summary.succeeded).toBe(1);
+
+    // A live PID that is not the writer: this test's parent process.
+    const reused = `${process.ppid}-0f8fad5b-d9cb-469f-a165-70867728950e`;
+    const artifact = path.join(out, 'docs', 'a.md');
+    await writeFile(`${artifact}.${reused}.tmp`, 'partial');
+    await writeFile(path.join(out, `.open-ocr-manifest.json.${reused}.tmp`), '{');
+    const before = await inspectBatchStatus(out, directory);
+    expect(before.strayTempFiles).toHaveLength(2);
+    expect(renderBatchStatus(before)).toContain('the next extract into this directory cleans them up');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const warnings: string[] = [];
+    await run(service, [docs], options, warnings);
+    expect(warnings.some((warning) => warning.includes('removed 2 stale staging file(s)'))).toBe(true);
+    const after = await inspectBatchStatus(out, directory);
+    expect(after).toMatchObject({ healthy: true, strayTempFiles: [] });
+  });
+
+  it('keeps a live PID\'s transaction file touched after the lock was taken', async () => {
+    const target = path.join(directory, '.open-ocr.lock');
+    const staging = `${target}.${process.ppid}-0f8fad5b-d9cb-469f-a165-70867728950e.tmp`;
+    await writeFile(staging, '{}');
+    const touched = (await stat(staging)).mtimeMs;
+    const kept = await recoverStaleTransactionFiles([target], { lockAcquiredAtMs: touched });
+    expect(kept.removed).toEqual([]);
+    const removed = await recoverStaleTransactionFiles([target], { lockAcquiredAtMs: touched + 1_000 });
+    expect(removed.removed).toEqual([staging]);
   });
 
   it('recognises its own artifacts across a markdown -> json -> markdown format switch', async () => {
@@ -258,6 +355,50 @@ describe('input discovery', () => {
     // And so does a glob input with the same cwd-relative pattern.
     const glob = await discoverInputSet(['docs/**/*.jpg'], { ...options, excludes: ['docs/drafts/**'] });
     expect(glob.inputs.map((input) => input.name)).toEqual(['keep.jpg']);
+  });
+
+  it.each(['scans{a,b}', 'scans[1]', 'scans(2)', 'a{b}[c](d)!+@'])(
+    'applies a cwd-relative exclude when the working directory has glob characters (%s)',
+    async (name) => {
+      const cwd = path.join(directory, name);
+      await mkdir(path.join(cwd, 'docs', 'drafts'), { recursive: true });
+      await writeFile(path.join(cwd, 'docs', 'keep.jpg'), JPEG_BYTES);
+      await writeFile(path.join(cwd, 'docs', 'drafts', 'skip.jpg'), JPEG_BYTES);
+      const options = {
+        ...resolveCliOptions({ output: path.join(cwd, 'out'), exclude: ['docs/drafts/**'] }, {}, cwd),
+        apiKey: 'test-key',
+      };
+      const scan = await discoverInputSet(['docs'], options);
+      expect(scan.inputs.map((input) => input.name)).toEqual(['keep.jpg']);
+      expect(scan.skipped.unmatchedExcludes).toBeUndefined();
+    },
+  );
+
+  it('reports only command-line excludes that matched nothing, and only after a walk', async () => {
+    const docs = await seedDocs(['keep.jpg']);
+    const resolve = (flags: Record<string, unknown>, config: Record<string, unknown>): ResolvedCliOptions => ({
+      ...resolveCliOptions({ output: path.join(directory, 'out'), ...flags }, config, directory),
+      apiKey: 'test-key',
+    });
+    // Config-file excludes are ambient: never reported, even after a walk.
+    const fromConfig = await discoverInputSet([docs], resolve({}, { exclude: ['nothing/**'] }));
+    expect(fromConfig.skipped.unmatchedExcludes).toBeUndefined();
+    // A single named file never consults excludes, so nothing is reported.
+    const singleFile = await discoverInputSet(
+      [path.join(docs, 'keep.jpg')],
+      resolve({ exclude: ['flagged/**'] }, { exclude: ['nothing/**'] }),
+    );
+    expect(singleFile.skipped.unmatchedExcludes).toBeUndefined();
+    expect(describeDiscoverySkips(singleFile.skipped)).toBeUndefined();
+    // A directory scan reports the command-line pattern, not the config one.
+    const scan = await discoverInputSet([docs], resolve({ exclude: ['flagged/**'] }, { exclude: ['nothing/**'] }));
+    expect(scan.skipped.unmatchedExcludes).toEqual(['flagged/**']);
+    // A pattern given both ways counts as given on the command line.
+    const both = await discoverInputSet([docs], resolve({ exclude: ['nothing/**'] }, { exclude: ['nothing/**'] }));
+    expect(both.skipped.unmatchedExcludes).toEqual(['nothing/**']);
+    // A glob walk counts as a walk.
+    const glob = await discoverInputSet(['docs/*.jpg'], resolve({ exclude: ['flagged/**'] }, {}));
+    expect(glob.skipped.unmatchedExcludes).toEqual(['flagged/**']);
   });
 
   it('extracts a symlink and its target once', async () => {

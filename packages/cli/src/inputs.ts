@@ -5,7 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import type { Readable } from 'node:stream';
 
-import { escape as escapeGlob, globIterate, Ignore, type IgnoreLike } from 'glob';
+import { globIterate, Ignore, type IgnoreLike } from 'glob';
 
 import { EXTENSION_TO_MIME, FILE_CONSTRAINTS, maxFileSizeForMime } from '@open-ocr/engine/constants';
 import { CliExitError, type OcrErrorCode } from './errors';
@@ -35,6 +35,8 @@ const DEFAULT_EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set([
   'target',
 ]);
 
+type DiscoveryPath = Parameters<NonNullable<IgnoreLike['ignored']>>[0];
+
 /**
  * The `--exclude` patterns of one discovery, each tracked for whether it matched
  * anything so an exclude that silently excluded nothing (and therefore let
@@ -47,24 +49,47 @@ const DEFAULT_EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set([
  * whether the input was `docs` or a `docs/**` glob.
  */
 export class ExcludeMatcher {
-  private readonly patterns: Array<{ pattern: string; ignore: Ignore; matched: boolean }>;
+  private readonly patterns: Array<{ pattern: string; root: Ignore; fromCwd?: Ignore; matched: boolean }>;
+  private readonly ambient: ReadonlySet<string>;
+  private walked = false;
 
-  constructor(patterns: readonly string[], cwd: string) {
-    const cwdPattern = escapeGlob(cwd.split(path.sep).join('/'));
+  /**
+   * @param ambientPatterns patterns that came from configuration files rather
+   *   than the command line or request; they are applied but never reported
+   *   by {@link unmatched}.
+   */
+  constructor(patterns: readonly string[], private readonly cwd: string, ambientPatterns: readonly string[] = []) {
+    this.ambient = new Set(ambientPatterns);
+    // The working-directory reading matches the pattern against each entry's
+    // path relative to the working directory, never against an absolute
+    // pattern built from it: glob re-parses an Ignore pattern's literal
+    // segments, so even an escaped cwd such as /work/scans{a,b} brace-expanded
+    // into paths that never exist and the exclude silently matched nothing
+    // (billing every file it was meant to drop).
     this.patterns = patterns.map((pattern) => {
-      const variants = [pattern];
       const posixPattern = pattern.replaceAll('\\', '/');
-      if (!path.isAbsolute(pattern) && !posixPattern.startsWith('**')) {
-        variants.push(`${cwdPattern}/${posixPattern.replace(/^\.\//u, '')}`);
-      }
-      return { pattern, ignore: new Ignore(variants, {}), matched: false };
+      const fromCwd = !path.isAbsolute(pattern) && !posixPattern.startsWith('**')
+        ? new Ignore([posixPattern.replace(/^\.\//u, '')], {})
+        : undefined;
+      return { pattern, root: new Ignore([pattern], {}), ...(fromCwd ? { fromCwd } : {}), matched: false };
     });
   }
 
-  ignored(entry: Parameters<NonNullable<IgnoreLike['ignored']>>[0]): boolean {
+  /** The entry as seen from the working directory, for the cwd-relative reading. */
+  private fromCwdView(entry: DiscoveryPath): DiscoveryPath {
+    const fullpath = entry.fullpath();
+    const relative = path.relative(this.cwd, fullpath).split(path.sep).join('/');
+    // Ignore reads only these two accessors.
+    return { relative: () => relative, fullpath: () => fullpath } as unknown as DiscoveryPath;
+  }
+
+  private test(entry: DiscoveryPath, check: (ignore: Ignore, candidate: DiscoveryPath) => boolean): boolean {
     let ignored = false;
+    let view: DiscoveryPath | undefined;
     for (const candidate of this.patterns) {
-      if (candidate.ignore.ignored(entry)) {
+      const hit = check(candidate.root, entry)
+        || (candidate.fromCwd !== undefined && check(candidate.fromCwd, view ??= this.fromCwdView(entry)));
+      if (hit) {
         candidate.matched = true;
         ignored = true;
       }
@@ -72,19 +97,29 @@ export class ExcludeMatcher {
     return ignored;
   }
 
-  childrenIgnored(entry: Parameters<NonNullable<IgnoreLike['ignored']>>[0]): boolean {
-    let ignored = false;
-    for (const candidate of this.patterns) {
-      if (candidate.ignore.childrenIgnored(entry)) {
-        candidate.matched = true;
-        ignored = true;
-      }
-    }
-    return ignored;
+  ignored(entry: DiscoveryPath): boolean {
+    return this.test(entry, (ignore, candidate) => ignore.ignored(candidate));
   }
 
+  childrenIgnored(entry: DiscoveryPath): boolean {
+    return this.test(entry, (ignore, candidate) => ignore.childrenIgnored(candidate));
+  }
+
+  /** Record that a directory scan or glob walk consulted these patterns. */
+  markWalked(): void {
+    this.walked = true;
+  }
+
+  /**
+   * Command-line/request patterns that excluded nothing. Empty unless a walk
+   * ran: a run naming only files never consults excludes, so reporting them
+   * there would warn on every run.
+   */
   unmatched(): string[] {
-    return this.patterns.filter((candidate) => !candidate.matched).map((candidate) => candidate.pattern);
+    if (!this.walked) return [];
+    return [...new Set(this.patterns
+      .filter((candidate) => !candidate.matched && !this.ambient.has(candidate.pattern))
+      .map((candidate) => candidate.pattern))];
   }
 }
 
@@ -298,6 +333,7 @@ async function scanDirectory(
   signal?: AbortSignal,
 ): Promise<ExpandedInput> {
   const applyDefaults = options.defaultExcludes;
+  excludes.markWalked();
   const entries = globIterate('**/*', {
     cwd: absolute,
     withFileTypes: true,
@@ -360,6 +396,7 @@ async function expandInput(
   // the set and fail loudly by MIME detection rather than disappearing here, and
   // the default directory excludes never apply — `dist/**/*.pdf` means `dist`.
   const files: string[] = [];
+  excludes.markWalked();
   for await (const match of globIterate(value, {
     cwd: options.cwd,
     withFileTypes: true,
@@ -528,7 +565,7 @@ export async function discoverInputSet(
     };
   }
 
-  const excludes = new ExcludeMatcher(options.excludes, options.cwd);
+  const excludes = new ExcludeMatcher(options.excludes, options.cwd, options.configExcludes);
   const expanded = await Promise.all([...new Set(rawInputs)].map((input) => (
     expandInput(input, options, excludes, signal)
   )));

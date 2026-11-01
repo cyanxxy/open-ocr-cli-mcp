@@ -656,6 +656,19 @@ describe('CLI configuration', () => {
     )).toThrow('xhigh is supported by Muse and model-dependent OpenRouter routes');
   });
 
+  it('applies a config-file maxTokens to simple and agentic runs but never caps template mode', () => {
+    const config = { maxTokens: 4096 };
+    const resolve = (flags: Partial<ExtractCommandFlags>) => resolveCliOptions({ dryRun: true, ...flags }, config, '/workspace');
+    expect(resolve({}).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'agentic' }).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'template', preset: 'invoice' }).maxTokens).toBe(16_384);
+    expect(resolveCliOptions({ dryRun: true, mode: 'template', preset: 'invoice' }, { ...config, mode: 'template' }, '/workspace').maxTokens)
+      .toBe(16_384);
+    // An explicit flag still sets it.
+    expect(resolve({ mode: 'template', preset: 'invoice', maxTokens: '4096' }).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'template', preset: 'invoice', maxTokens: '32768' }).maxTokens).toBe(32_768);
+  });
+
   it('uses a lower default max-tokens budget for agentic Kimi K3', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     expect(resolveCliOptions(

@@ -776,7 +776,10 @@ export function resolveCliOptions(
   if (hasSchema && effectiveMode !== 'simple') throw configurationError(`${name('schema')} is only available in simple mode`);
   if (hasSchema && format !== 'json') throw configurationError(`${name('schema')} requires ${name('format')} json`);
   // A preset answer is one bounded JSON record, so template mode keeps its
-  // historical 16,384-token default; --max-tokens now raises it explicitly.
+  // historical 16,384-token default. Only an explicit --max-tokens (or a run
+  // request's extraction.maxTokens) changes it: a config-file maxTokens was
+  // written for simple/agentic runs, and before 5.0 template mode ignored it,
+  // so honouring it here would silently cap template runs (4096, say).
   const defaultMaxTokens = effectiveMode === 'template'
     ? DEFAULT_TEMPLATE_MAX_TOKENS
     : isKimiK3
@@ -785,7 +788,7 @@ export function resolveCliOptions(
       ? (effectiveMode === 'agentic' ? 32_768 : 131_072)
       : DEFAULT_CONFIG.maxTokens;
   const maxTokens = integer(
-    flags.maxTokens ?? (modelContextMatches ? fileConfig.maxTokens : undefined),
+    flags.maxTokens ?? (modelContextMatches && effectiveMode !== 'template' ? fileConfig.maxTokens : undefined),
     defaultMaxTokens,
     name('maxTokens'),
     OCR_REQUEST_LIMITS.maxTokens.min,
@@ -935,6 +938,7 @@ export function resolveCliOptions(
       OCR_REQUEST_LIMITS.maxTotalMb.max,
     ),
     excludes: [...(fileConfig.exclude ?? []), ...(flags.exclude ?? [])],
+    configExcludes: (fileConfig.exclude ?? []).filter((pattern) => !(flags.exclude ?? []).includes(pattern)),
     instructions: [...(fileConfig.instructions ?? []), ...(flags.instruction ?? [])],
     hidden: flags.hidden ?? fileConfig.hidden ?? DEFAULT_CONFIG.hidden,
     defaultExcludes: flags.defaultExcludes ?? fileConfig.defaultExcludes ?? DEFAULT_CONFIG.defaultExcludes,

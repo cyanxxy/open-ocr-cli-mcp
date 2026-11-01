@@ -156,6 +156,17 @@ describe('shared tolerant JSON extraction', () => {
     expect(() => parseJsonPayload('{"outer": {"inner": 1}, oops}', 'X')).toThrow(/X returned invalid JSON/);
   });
 
+  it('does not return a nested object from an outer object that never closes', () => {
+    const truncated = 'Answer: {"result": {"name": "a"}, "items": [1, 2';
+    expect(extractJsonPayload(truncated, 'X')).not.toBe('{"name": "a"}');
+    expect(() => parseJsonPayload(truncated, 'X')).toThrow(/X returned invalid JSON/);
+    expect(() => parseJsonPayload('{"a": {"b": {"c": 1}}, "d": "x}', 'X')).toThrow(/X returned invalid JSON/);
+  });
+
+  it('still finds a complete top-level object after a closed prose brace', () => {
+    expect(parseJsonPayload('Note {x} first. {"a":1}', 'X')).toEqual({ a: 1 });
+  });
+
   it('types every failure as OUTPUT_INVALID', () => {
     for (const text of ['', 'no json here', '{"a":']) {
       let thrown: unknown;

@@ -43,19 +43,49 @@ export interface BatchLockAcquireOptions {
 }
 
 /**
+ * The starttime field (22) of a `/proc/<pid>/stat` line. The command name
+ * (field 2) is parenthesised and may itself contain spaces, parentheses, or
+ * newlines, so fields are counted from the last ")" in the line.
+ */
+export function procStatStartTicks(stat: string): string | undefined {
+  const close = stat.lastIndexOf(')');
+  if (close < 0 || stat[close + 1] !== ' ') return undefined;
+  // fields[0] is field 3 (state), so field 22 is fields[19].
+  const startTicks = stat.slice(close + 2).split(' ')[19];
+  return startTicks && /^\d+$/u.test(startTicks) ? startTicks : undefined;
+}
+
+const PS_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * Epoch seconds of a `ps -o lstart=` value printed in the C locale and UTC
+ * ("Sun Nov  1 19:20:43 2026"). Undefined for anything else, so an output
+ * this code cannot read with certainty never yields an identity.
+ */
+export function parsePsLstartUtc(text: string): number | undefined {
+  const match = /^[A-Z][a-z]{2} +([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/u.exec(text.trim());
+  if (!match) return undefined;
+  const month = PS_MONTHS.indexOf(match[1]);
+  if (month < 0) return undefined;
+  const millis = Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
+  return Number.isFinite(millis) ? Math.floor(millis / 1000) : undefined;
+}
+
+/**
  * A stable identity for one process lifetime, so a lock whose PID has since
  * been reused by an unrelated process is recognised as stale instead of
- * looking in use forever. Undefined where the platform gives no way to read it.
+ * looking in use forever. Undefined where the platform gives no reliable way
+ * to read it, which callers treat as "cannot tell" (never as stale).
+ *
+ * The identity must not depend on who asks: `ps -o lstart=` prints in the
+ * caller's locale and time zone, so it runs with LC_ALL=C and TZ=UTC and the
+ * result is reduced to epoch seconds.
  */
 export function processStartIdentity(pid: number): string | undefined {
   try {
     if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      // Field 22 (starttime) counted after the parenthesised command name,
-      // which may itself contain spaces or parentheses.
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      const startTicks = fields[19];
-      if (!startTicks || !/^\d+$/u.test(startTicks)) return undefined;
+      const startTicks = procStatStartTicks(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+      if (!startTicks) return undefined;
       let bootId = '';
       try {
         bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
@@ -69,11 +99,44 @@ export function processStartIdentity(pid: number): string | undefined {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2_000,
-    }).trim();
-    return started ? `ps:${started}` : undefined;
+      env: {
+        ...(process.env.PATH !== undefined ? { PATH: process.env.PATH } : {}),
+        LC_ALL: 'C',
+        LANG: 'C',
+        TZ: 'UTC',
+      },
+    });
+    const epochSeconds = parsePsLstartUtc(started);
+    return epochSeconds === undefined ? undefined : `ps-utc:${epochSeconds}`;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether two start identities name the same process lifetime: true, false,
+ * or undefined when they cannot be compared reliably (different schemes, such
+ * as a record written by an older build, or unreadable values). Only `false`
+ * proves a PID was reused.
+ */
+export function sameProcessStart(recorded: string, current: string): boolean | undefined {
+  const linux = /^linux:([^:]*):(\d+)$/u;
+  const recordedLinux = linux.exec(recorded);
+  const currentLinux = linux.exec(current);
+  if (recordedLinux && currentLinux) {
+    if (recordedLinux[2] !== currentLinux[2]) return false;
+    // Same ticks: only two readable, different boot ids prove a reboot.
+    if (recordedLinux[1] && currentLinux[1] && recordedLinux[1] !== currentLinux[1]) return false;
+    return true;
+  }
+  const ps = /^ps-utc:(\d+)$/u;
+  const recordedPs = ps.exec(recorded);
+  const currentPs = ps.exec(current);
+  if (recordedPs && currentPs) {
+    // lstart has one-second resolution; allow for a rounding difference.
+    return Math.abs(Number(recordedPs[1]) - Number(currentPs[1])) <= 1;
+  }
+  return undefined;
 }
 
 let ownProcessStart: string | undefined | null = null;
@@ -95,7 +158,9 @@ export function batchLockOwnerState(owner: BatchLockOwner): BatchLockState {
   if (!processIsAlive(owner.pid)) return 'stale';
   if (owner.processStart !== undefined) {
     const current = processStartIdentity(owner.pid);
-    if (current !== undefined && current !== owner.processStart) return 'stale';
+    // An identity that cannot be read or compared keeps the lock live: a
+    // running batch's lock is never stolen on a guess.
+    if (current !== undefined && sameProcessStart(owner.processStart, current) === false) return 'stale';
   }
   return 'live';
 }
@@ -443,25 +508,75 @@ export async function findStaleTransactionFiles(
   return found.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-/** Any staging/backup file name, for a directory-wide status scan. */
-export function isTransactionFileName(name: string): boolean {
-  return TRANSACTION_SUFFIX.test(name);
+/** The target base name a staging/backup file name stands in for, or undefined for any other name. */
+export function transactionFileTarget(name: string): string | undefined {
+  const match = TRANSACTION_SUFFIX.exec(name);
+  return match ? name.slice(0, match.index) : undefined;
+}
+
+const ARTIFACT_FILE_EXTENSION = /\.(?:md|json|csv)$/iu;
+
+/**
+ * A recorded artifact path with every artifact extension (`a.md` -> `a.md`,
+ * `a.json`, `a.csv`): the paths a format switch of the same document writes.
+ * A path without an artifact extension is returned as is.
+ */
+export function artifactPathVariants(file: string): string[] {
+  const resolved = path.resolve(file);
+  const extension = ARTIFACT_FILE_EXTENSION.exec(resolved)?.[0];
+  if (!extension) return [resolved];
+  const stem = resolved.slice(0, -extension.length);
+  return ['.md', '.json', '.csv'].map((candidate) => `${stem}${candidate}`);
+}
+
+export interface TransactionRecoveryOptions {
+  /**
+   * When the caller's batch lock was taken (the lock file's mtime, so the same
+   * filesystem clock stamps both). See {@link recoverStaleTransactionFiles}.
+   */
+  lockAcquiredAtMs?: number;
+}
+
+/** The later of a file's mtime and ctime (a rename moves ctime), or undefined if it is gone. */
+async function lastTouchedMs(filePath: string): Promise<number | undefined> {
+  try {
+    const stats = await fs.lstat(filePath);
+    return Math.max(stats.mtimeMs, stats.ctimeMs);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
 }
 
 /**
  * Remove leftovers of a killed artifact or manifest transaction. Must run only
- * while holding the batch lock, so no live writer of this directory can own
- * them. A `.bak` is the previous artifact moved aside mid-commit: it is put
- * back when its target is missing, otherwise discarded. Files whose embedded
- * PID belongs to another live process are left alone.
+ * while holding the batch lock. A `.bak` is the previous artifact moved aside
+ * mid-commit: it is put back when its target is missing, otherwise discarded.
+ *
+ * A leftover whose embedded PID is dead is always stale. A transaction file
+ * cannot record its writer's start time, so a live PID alone does not prove
+ * the writer is still running (the PID may have been reused). With
+ * `lockAcquiredAtMs`, the rule is: every writer of these targets holds the
+ * batch lock, so a file last touched (mtime or ctime) strictly before this
+ * lock was taken belongs to no live transaction and is stale whatever its
+ * PID; files touched since are kept (another process's in-flight lock
+ * staging). Without it, files of other live PIDs are left alone.
  */
 export async function recoverStaleTransactionFiles(
   targets: Iterable<string>,
+  options: TransactionRecoveryOptions = {},
 ): Promise<{ removed: string[]; restored: string[] }> {
   const removed: string[] = [];
   const restored: string[] = [];
   for (const file of await findStaleTransactionFiles(targets)) {
-    if (file.pid !== process.pid && processIsAlive(file.pid)) continue;
+    if (processIsAlive(file.pid)) {
+      if (options.lockAcquiredAtMs === undefined) {
+        if (file.pid !== process.pid) continue;
+      } else {
+        const touched = await lastTouchedMs(file.path);
+        if (touched === undefined || touched >= options.lockAcquiredAtMs) continue;
+      }
+    }
     if (file.kind === 'bak' && !(await pathExists(file.target))) {
       await fs.rename(file.path, file.target);
       restored.push(file.target);
@@ -767,10 +882,21 @@ export interface ManifestFingerprints {
   legacy?: string;
 }
 
+/**
+ * Longest a deferred manifest update waits for a write. It bounds the work a
+ * crash can cost: documents finished within this window keep their pending
+ * claim on disk and are re-extracted by the resume.
+ */
+export const MANIFEST_FLUSH_INTERVAL_MS = 1_000;
+
 export class ManifestStore {
   private readonly manifestPath: string;
   private manifest: CliManifest = { ...EMPTY_MANIFEST, entries: {} };
   private pendingWrite: Promise<void> = Promise.resolve();
+  private queuedWrite: Promise<void> | undefined;
+  private deferredTimer: NodeJS.Timeout | undefined;
+  private deferredFailure: unknown;
+  private completedWrites = 0;
   private usageSource: (() => ProviderUsageSnapshot | undefined) | undefined;
 
   constructor(outputDirectory: string) {
@@ -871,8 +997,61 @@ export class ManifestStore {
    * Replace one entry and persist the whole manifest atomically (staged file,
    * then rename). Ownership only grows: paths the entry recorded before stay
    * in `ownedFiles`, so a later format switch still recognises them.
+   *
+   * By default the returned promise settles once a write containing this
+   * change is durable; updates made while a write is in flight share the next
+   * write (group commit). With `defer`, the change is only guaranteed to reach
+   * disk within {@link MANIFEST_FLUSH_INTERVAL_MS} (or at the next durable
+   * write or {@link flush}); use it only where losing the change to a crash is
+   * safe, such as recording a finished document whose pending claim is
+   * already durable (a resume then re-extracts it).
    */
-  update(key: string, entry: ManifestEntry): Promise<void> {
+  update(key: string, entry: ManifestEntry, options: { defer?: boolean } = {}): Promise<void> {
+    this.apply(key, entry);
+    if (options.defer) {
+      this.scheduleDeferredWrite();
+      return Promise.resolve();
+    }
+    return this.write();
+  }
+
+  /**
+   * Record several entries with one durable write, e.g. the pending claims of
+   * every document a batch may extract, before any of their artifacts exist.
+   */
+  updateMany(entries: Iterable<readonly [string, ManifestEntry]>): Promise<void> {
+    for (const [key, entry] of entries) this.apply(key, entry);
+    return this.write();
+  }
+
+  /**
+   * Put an entry back exactly as it was (or remove it), without the ownership
+   * merge of {@link update}: used to withdraw a pending claim for a document
+   * that was never started. Persisted with the next write or flush.
+   */
+  restore(key: string, entry: ManifestEntry | undefined): void {
+    if (entry) this.manifest.entries[key] = { ...entry, outputFiles: [...entry.outputFiles] };
+    else delete this.manifest.entries[key];
+  }
+
+  /**
+   * Persist the manifest (and the current cumulative usage) without changing
+   * entries, including every deferred update. Rejects if a deferred write
+   * failed since the last flush.
+   */
+  async flush(): Promise<void> {
+    await this.write();
+    const failure = this.deferredFailure;
+    this.deferredFailure = undefined;
+    if (failure !== undefined) throw failure instanceof Error ? failure : new Error(errorMessage(failure));
+  }
+
+  /** Number of manifest writes this store has completed. */
+  get writeCount(): number {
+    return this.completedWrites;
+  }
+
+  private apply(key: string, entry: ManifestEntry): void {
     const previous = this.manifest.entries[key];
     const owned = [...new Set([
       ...(previous?.ownedFiles ?? []),
@@ -884,16 +1063,34 @@ export class ManifestStore {
       ...entry,
       ...(owned.length > 0 ? { ownedFiles: owned } : {}),
     };
-    return this.write();
   }
 
-  /** Persist the manifest (and the current cumulative usage) without changing entries. */
-  flush(): Promise<void> {
-    return this.write();
+  private scheduleDeferredWrite(): void {
+    // Not reset by later updates, so a steady stream still reaches disk
+    // within the interval.
+    if (this.deferredTimer) return;
+    this.deferredTimer = setTimeout(() => {
+      this.deferredTimer = undefined;
+      this.write().catch((error: unknown) => {
+        this.deferredFailure ??= error;
+      });
+    }, MANIFEST_FLUSH_INTERVAL_MS);
+    this.deferredTimer.unref?.();
   }
 
+  /**
+   * Group commit: at most one write is queued behind the one in flight, and
+   * it serialises the manifest when it starts, so it carries every change
+   * made until then.
+   */
   private write(): Promise<void> {
-    this.pendingWrite = this.pendingWrite.then(async () => {
+    if (this.queuedWrite) return this.queuedWrite;
+    const queued = this.pendingWrite.catch(() => undefined).then(async () => {
+      this.queuedWrite = undefined;
+      if (this.deferredTimer) {
+        clearTimeout(this.deferredTimer);
+        this.deferredTimer = undefined;
+      }
       const usage = this.usageSource?.();
       if (usage) this.manifest.usage = usage;
       await writeTextFileAtomically(
@@ -901,8 +1098,11 @@ export class ManifestStore {
         `${JSON.stringify(this.manifest, null, 2)}\n`,
         true,
       );
+      this.completedWrites += 1;
     });
-    return this.pendingWrite;
+    this.queuedWrite = queued;
+    this.pendingWrite = queued;
+    return queued;
   }
 }
 
@@ -917,6 +1117,12 @@ export class BatchOutputLock {
   private constructor(
     readonly lockPath: string,
     private readonly owner: BatchLockOwner,
+    /**
+     * The lock file's mtime when it was taken. Leftover transaction files last
+     * touched before it cannot belong to a live writer (see
+     * {@link recoverStaleTransactionFiles}).
+     */
+    readonly acquiredAtMs: number | undefined,
   ) {}
 
   static async acquire(
@@ -939,7 +1145,13 @@ export class BatchOutputLock {
     for (let attempt = 0; attempt < MAX_LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
       try {
         await writeTextFileAtomically(lockPath, `${JSON.stringify(owner, null, 2)}\n`, false);
-        return new BatchOutputLock(lockPath, owner);
+        let acquiredAtMs: number | undefined;
+        try {
+          acquiredAtMs = (await fs.stat(lockPath)).mtimeMs;
+        } catch {
+          // Without a timestamp, recovery falls back to keeping live PIDs' files.
+        }
+        return new BatchOutputLock(lockPath, owner, acquiredAtMs);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         lastError = error;

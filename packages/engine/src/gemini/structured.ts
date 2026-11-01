@@ -50,9 +50,11 @@ function balancedObjectEnd(text: string, start: number): number {
 }
 
 /**
- * The first complete top-level JSON object embedded in prose. A balanced span
- * that does not parse is skipped as a whole, so an object nested inside a
- * malformed outer object is never mistaken for the answer.
+ * The first complete top-level JSON object embedded in prose. Only top-level
+ * candidates are tried, so an object nested inside a malformed outer object is
+ * never mistaken for the answer: a balanced span that does not parse is
+ * skipped as a whole, and an opening brace that never closes ends the search,
+ * because every later brace lies inside that unclosed region.
  */
 function firstEmbeddedObject(text: string): string | undefined {
   let from = 0;
@@ -60,10 +62,7 @@ function firstEmbeddedObject(text: string): string | undefined {
     const start = text.indexOf('{', from);
     if (start < 0) return undefined;
     const end = balancedObjectEnd(text, start);
-    if (end < 0) {
-      from = start + 1;
-      continue;
-    }
+    if (end < 0) return undefined;
     const candidate = text.slice(start, end + 1);
     if (isPlainObjectJson(candidate)) return candidate;
     from = end + 1;
