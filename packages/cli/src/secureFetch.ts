@@ -27,6 +27,17 @@ function urlInputError(message: string, hint: string, retryable = false): CliExi
 const MAX_REDIRECTS = 5;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const NETWORK_IDLE_TIMEOUT_MS = 30_000;
+/**
+ * Wall-clock ceiling for one URL fetch: every redirect hop, DNS lookup, and the
+ * whole body read. The idle timeout alone resets on every byte, so a server
+ * trickling one byte every few seconds could hold a fetch open indefinitely.
+ */
+export const NETWORK_TOTAL_TIMEOUT_MS = 120_000;
+
+export interface SecureFetchOptions {
+  /** Override the wall-clock ceiling (tests, or a tighter caller budget). */
+  totalTimeoutMs?: number;
+}
 
 export interface SecureFetchResult {
   url: string;
@@ -77,6 +88,7 @@ function readBounded(stream: Readable, signal?: AbortSignal): Promise<Uint8Array
         : new DOMException('Operation aborted', 'AbortError'));
     };
     signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     stream.on('data', (chunk: Buffer | Uint8Array | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buffer.length;
@@ -97,6 +109,8 @@ function readBounded(stream: Readable, signal?: AbortSignal): Promise<Uint8Array
 async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMessage> {
   const host = unbracketHost(url.hostname);
   const addresses = await resolvedPublicAddresses(host);
+  // DNS cannot be cancelled; honour a deadline that fired while it ran.
+  signal?.throwIfAborted();
   const selected = addresses[0];
   return new Promise<IncomingMessage>((resolve, reject) => {
     const options: RequestOptions = {
@@ -134,11 +148,44 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
   });
 }
 
+/**
+ * Fetch a public URL with DNS pinning, bounded redirects, a bounded body, an
+ * idle timeout, and a total wall-clock deadline.
+ */
 export async function secureFetchPublicUrl(
   value: string,
   signal?: AbortSignal,
-  redirectCount = 0,
+  options: SecureFetchOptions = {},
 ): Promise<SecureFetchResult> {
+  const totalTimeoutMs = options.totalTimeoutMs ?? NETWORK_TOTAL_TIMEOUT_MS;
+  const deadline = new AbortController();
+  const timer = setTimeout(() => {
+    deadline.abort(urlInputError(
+      `URL fetch exceeded the ${totalTimeoutMs / 1000}-second total time limit: ${value}`,
+      'The source site is responding too slowly; retry later or use a different URL.',
+      true,
+    ));
+  }, totalTimeoutMs);
+  timer.unref?.();
+  const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+  try {
+    return await fetchFollowingRedirects(value, combined, 0);
+  } catch (error) {
+    // A deadline abort surfaces as whatever the aborted socket or stream
+    // reported; restate it as the typed deadline error.
+    if (deadline.signal.aborted && !signal?.aborted) throw deadline.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchFollowingRedirects(
+  value: string,
+  signal: AbortSignal,
+  redirectCount: number,
+): Promise<SecureFetchResult> {
+  signal.throwIfAborted();
   const url = parseSupportedHttpUrl(value);
   if (!url) {
     throw urlInputError(
@@ -163,7 +210,7 @@ export async function secureFetchPublicUrl(
         'Request the final URL directly.',
       );
     }
-    return secureFetchPublicUrl(new URL(location, url).toString(), signal, redirectCount + 1);
+    return fetchFollowingRedirects(new URL(location, url).toString(), signal, redirectCount + 1);
   }
   if (status < 200 || status >= 300) {
     response.resume();
