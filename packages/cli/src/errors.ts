@@ -28,6 +28,7 @@ export const OCR_ERROR_CODES = [
   'PERMISSION_DENIED',
   'SCHEMA_INVALID',
   'OUTPUT_CONFLICT',
+  'OUTPUT_INVALID',
   'RATE_LIMITED',
   'TIMEOUT',
   'COST_LIMIT',
@@ -86,6 +87,7 @@ const DEFAULT_ERROR_HINTS: Record<OcrErrorCode, string> = {
   PERMISSION_DENIED: 'Verify that the credential and project are allowed to use this model or operation.',
   SCHEMA_INVALID: 'Validate the JSON Schema against the supported structured-output subset.',
   OUTPUT_CONFLICT: 'Choose a new output path or resume a matching job.',
+  OUTPUT_INVALID: 'The model answered, but not in the requested shape; retry (--retries), simplify the schema or instructions, or use a more capable model.',
   RATE_LIMITED: 'Retry later or lower request concurrency/rate.',
   TIMEOUT: 'Retry with a longer timeout or a smaller document.',
   COST_LIMIT: 'Review partial output or explicitly raise the cost ceiling.',
@@ -145,11 +147,16 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
     || normalized.startsWith('schema path is not a file')
     || normalized.startsWith('schema exceeds')
     || normalized.startsWith('schema nesting exceeds')
-    || normalized.startsWith('schema output validation failed')
     || normalized.includes('json schema keyword')
     || normalized.includes('"$ref" must reference this schema document')
   ) {
     return { code: 'SCHEMA_INVALID', category: 'schema', retryable: false, hint: 'Validate the JSON Schema against the supported structured-output subset.' };
+  }
+  // Output-token truncation, as the Gemini client words it. The request was
+  // valid and the provider did not fail: it ran out of the token budget, so the
+  // fix is a larger budget, never an identical retry.
+  if (normalized.includes('reached the output token limit')) {
+    return OUTPUT_TRUNCATED_DETAILS;
   }
   if (normalized.includes('input does not exist')) {
     return { code: 'INPUT_NOT_FOUND', category: 'input', retryable: false, hint: 'Check the input path and working directory.' };
@@ -186,6 +193,28 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
   }
   return undefined;
 }
+
+const OUTPUT_TRUNCATED_DETAILS: OcrErrorDetails = {
+  code: 'PROVIDER_FAILURE',
+  category: 'provider',
+  retryable: false,
+  hint: 'The response hit the output-token limit and is incomplete; rerun with a higher --max-tokens '
+    + '(maxTokens in a run request), a lower --thinking level, or a smaller document.',
+};
+
+/**
+ * The model answered, but its answer broke the requested contract: not JSON,
+ * the wrong shape, or a value the caller's JSON Schema rejects. Distinct from
+ * SCHEMA_INVALID, which means the caller's schema itself is unusable — telling
+ * a caller with a valid schema to "validate the JSON Schema" sends them to fix
+ * the one thing that is not broken. Retryable: sampling again often conforms.
+ */
+const OUTPUT_INVALID_DETAILS: OcrErrorDetails = {
+  code: 'OUTPUT_INVALID',
+  category: 'output',
+  retryable: true,
+  hint: DEFAULT_ERROR_HINTS.OUTPUT_INVALID,
+};
 
 function recordValue(value: unknown, key: string): unknown {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : undefined;
@@ -315,6 +344,17 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     if (name === 'OcrError' && ocrType === 'SCHEMA_INVALID') {
       return classifyProviderSubject('response-schema');
     }
+    if (name === 'OcrError' && ocrType === 'OUTPUT_INVALID') {
+      return OUTPUT_INVALID_DETAILS;
+    }
+    if (structuredCode === 'MODEL_REFUSAL') {
+      return {
+        code: 'PROVIDER_FAILURE',
+        category: 'provider',
+        retryable: false,
+        hint: 'The model declined to process this document; review its refusal message, then adjust the instructions or use a different model.',
+      };
+    }
     if (
       structuredCode === 'API_KEY_INVALID'
       || structuredCode === 'UNAUTHENTICATED'
@@ -395,6 +435,10 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       const payload = providerPayloadOf(current);
       const subject = payload ? providerErrorSubject(payload) : undefined;
       if (subject) return classifyProviderSubject(subject);
+      if (providerError && recordValue(current, 'message') !== undefined
+        && String(recordValue(current, 'message')).includes('reached the output token limit')) {
+        return OUTPUT_TRUNCATED_DETAILS;
+      }
       if (providerError) {
         return {
           code: 'PROVIDER_FAILURE',

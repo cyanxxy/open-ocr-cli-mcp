@@ -21,7 +21,7 @@ import {
   type GatewayId,
   type ProviderId,
 } from '@open-ocr/engine/providers';
-import { getExtractionPreset, listExtractionPresets } from '@open-ocr/engine/templates';
+import { DEFAULT_TEMPLATE_MAX_TOKENS, getExtractionPreset, listExtractionPresets } from '@open-ocr/engine/templates';
 import { CliExitError } from './errors';
 import { asRecord } from './jsonValidation';
 import { OCR_REQUEST_LIMITS, PRICE_PER_MILLION_LIMIT } from './limits';
@@ -601,11 +601,15 @@ export function resolveCliOptions(
   }
   if (hasSchema && effectiveMode !== 'simple') throw configurationError(`${name('schema')} is only available in simple mode`);
   if (hasSchema && format !== 'json') throw configurationError(`${name('schema')} requires ${name('format')} json`);
-  const defaultMaxTokens = isKimiK3
+  // A preset answer is one bounded JSON record, so template mode keeps its
+  // historical 16,384-token default; --max-tokens now raises it explicitly.
+  const defaultMaxTokens = effectiveMode === 'template'
+    ? DEFAULT_TEMPLATE_MAX_TOKENS
+    : isKimiK3
     // Agentic K3 can issue many continuations; keep a safer default budget
     // unless the operator opts into the full protocol ceiling.
-    ? (effectiveMode === 'agentic' ? 32_768 : 131_072)
-    : DEFAULT_CONFIG.maxTokens;
+      ? (effectiveMode === 'agentic' ? 32_768 : 131_072)
+      : DEFAULT_CONFIG.maxTokens;
   const maxTokens = integer(
     flags.maxTokens ?? (modelContextMatches ? fileConfig.maxTokens : undefined),
     defaultMaxTokens,
@@ -846,7 +850,7 @@ const MODE_SCOPED_OPTIONS = {
   detectImages: { flag: '--detect-images', field: 'extraction.detectImages', modes: ['simple'] },
   detectMath: { flag: '--detect-math', field: 'extraction.detectMath', modes: ['simple'] },
   instructions: { flag: '--instruction', field: 'extraction.instructions', modes: ['simple'] },
-  maxTokens: { flag: '--max-tokens', field: 'extraction.maxTokens', modes: ['simple', 'agentic'] },
+  maxTokens: { flag: '--max-tokens', field: 'extraction.maxTokens', modes: ['simple', 'template', 'agentic'] },
   maxIterations: { flag: '--max-iterations', field: 'extraction.maxIterations', modes: ['agentic'] },
   confidenceThreshold: {
     flag: '--confidence-threshold',

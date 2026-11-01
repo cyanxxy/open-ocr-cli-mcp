@@ -51,7 +51,18 @@ describe('CLI output', () => {
     expect(primaryArtifact(artifacts, 'markdown')).toBe('# Invoice\n');
     expect(primaryArtifact(artifacts, 'json')).toContain('"title": "Invoice"');
     expect(primaryArtifact(artifacts, 'csv')).toBe('name,total\nAcme,12.00\n');
-    expect(() => primaryArtifact({ markdown: '# Only' }, 'csv')).toThrow('tabular CSV');
+    expect(() => primaryArtifact({ markdown: '# Only' }, 'csv')).toThrow('no CSV could be produced');
+  });
+
+  it('types a missing CSV as an output-contract failure, not a provider failure', () => {
+    let thrown: unknown;
+    try {
+      primaryArtifact({ markdown: '# Only' }, 'csv');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ code: 'OUTPUT_INVALID', category: 'output', retryable: false, exitCode: 1 });
+    expect((thrown as { hint: string }).hint).toMatch(/--format json/);
   });
 
   it('writes all artifacts while preserving input directories', async () => {

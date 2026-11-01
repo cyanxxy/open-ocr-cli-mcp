@@ -56,13 +56,28 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * A CSV was requested but this extraction has no table to render: a table
+ * preset without declared columns whose model returned no rows. It is the
+ * output contract that could not be met, not a provider failure, and the
+ * extracted fields are still in the JSON and Markdown artifacts.
+ */
+function csvUnavailable(): CliExitError {
+  return new CliExitError('This extraction returned no table rows and the preset declares no columns, so no CSV could be produced', 1, {
+    code: 'OUTPUT_INVALID',
+    category: 'output',
+    retryable: false,
+    hint: 'Request --format json or markdown (or all) to keep the extracted fields, or check that the document contains a table.',
+  });
+}
+
 export function primaryArtifact(artifacts: OcrArtifacts, format: ResolvedCliOptions['format']): string {
   if (format === 'json') {
     if (artifacts.json === undefined) throw new Error('This extraction did not produce JSON output');
     return `${JSON.stringify(artifacts.json, null, 2)}\n`;
   }
   if (format === 'csv') {
-    if (!artifacts.csv) throw new Error('This extraction did not produce tabular CSV output');
+    if (!artifacts.csv) throw csvUnavailable();
     return `${artifacts.csv.replace(/\n?$/, '\n')}`;
   }
   if (!artifacts.markdown) throw new Error('This extraction did not produce Markdown output');
@@ -86,7 +101,7 @@ function artifactEntries(
   if (format === 'all' && artifacts.agentSteps) {
     entries.push(['steps.json', `${JSON.stringify(artifacts.agentSteps, null, 2)}\n`]);
   }
-  if (format === 'csv' && !artifacts.csv) throw new Error('This extraction did not produce tabular CSV output');
+  if (format === 'csv' && !artifacts.csv) throw csvUnavailable();
   if (entries.length === 0) throw new Error(`No artifact is available for format ${format}`);
   return entries;
 }
