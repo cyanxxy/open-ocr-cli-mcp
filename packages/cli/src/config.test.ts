@@ -142,7 +142,7 @@ describe('CLI configuration', () => {
 
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       thinking: 'MAX',
     });
     // The same provider keeps them, whether named by flag or left ambient.
@@ -177,7 +177,7 @@ describe('CLI configuration', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',
@@ -319,7 +319,7 @@ describe('CLI configuration', () => {
     }, '/workspace');
     expect(options).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',
@@ -445,6 +445,34 @@ describe('CLI configuration', () => {
       cloudflareByok: true,
     }, {}, '/workspace');
     expect(kimi.baseUrl).toBe('https://gateway.ai.cloudflare.com/v1/account/gateway/custom-moonshot/v1');
+  });
+
+  it('never reads the provider key under Cloudflare BYOK, so the stored key is used', () => {
+    // Cloudflare substitutes the stored key only when the provider auth header
+    // is absent; a key read from GEMINI_API_KEY would be forwarded instead.
+    process.env.CLOUDFLARE_AI_GATEWAY_TOKEN = 'gateway-token';
+    process.env.GEMINI_API_KEY = 'users-own-gemini-key';
+    try {
+      const byok = resolveCliOptions({
+        provider: 'gemini',
+        gateway: 'cloudflare',
+        cloudflareAccountId: 'account',
+        cloudflareGatewayId: 'gateway',
+        cloudflareByok: true,
+      }, {}, '/workspace');
+      expect(byok.apiKey).toBe('');
+      expect(byok.gatewayToken).toBe('gateway-token');
+      expect(() => assertCredentialsAvailable(byok)).not.toThrow();
+      const keyed = resolveCliOptions({
+        provider: 'gemini',
+        gateway: 'cloudflare',
+        cloudflareAccountId: 'account',
+        cloudflareGatewayId: 'gateway',
+      }, {}, '/workspace');
+      expect(keyed.apiKey).toBe('users-own-gemini-key');
+    } finally {
+      delete process.env.GEMINI_API_KEY;
+    }
   });
 
   it('rejects Cloudflare stored-key flags outside a Cloudflare BYOK route', () => {

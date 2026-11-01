@@ -271,7 +271,7 @@ Agent quickstart:
 Examples:
   $ ${commandName}                       # print help; never prompts
   $ ${commandName} extract invoice.pdf
-  $ ${commandName} extract invoice.pdf --provider kimi --model kimi-k3
+  $ ${commandName} extract invoice.pdf --provider kimi --model kimi-k3.1-pro
   $ ${commandName} extract invoice.pdf --provider openrouter --model anthropic/claude-sonnet-5.5
   $ ${commandName} extract invoice.pdf --provider gemini --gateway cloudflare
   $ ${commandName} extract invoice.pdf --schema invoice.schema.json

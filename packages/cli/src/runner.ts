@@ -10,6 +10,7 @@ import {
   extractTextWithProvider,
   providerAgentLoop,
   providerDefaultBaseUrl,
+  geminiRequestApiKey,
   providerRequestHeaders,
   type ProviderExecutionContext,
 } from '@open-ocr/engine/providers';
@@ -152,7 +153,7 @@ async function runAgentic(
     { name: input.name, type: input.mimeType },
     dataUrl,
     {
-      apiKey: options.apiKey || (options.cloudflareByok ? options.gatewayToken || 'cloudflare-byok' : ''),
+      apiKey: geminiRequestApiKey(options),
       model: options.model,
       thinkingConfig: { level: options.thinking, includeThoughts: options.includeThoughts },
       progress: options.progress,

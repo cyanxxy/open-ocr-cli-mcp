@@ -7,9 +7,11 @@ import {
   knownModelThinkingLevels,
   providerDefaultThinkingLevel,
   providerProfile,
+  providerRequestHeaders,
   providerTokenPrice,
   resolveProviderBaseUrl,
 } from './registry';
+import type { ProviderRuntimeConfig } from './types';
 
 describe('provider registry routing', () => {
   it('keeps current OCR defaults and model-specific reasoning contracts aligned across routes', () => {
@@ -83,7 +85,7 @@ describe('provider registry routing', () => {
       'image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif',
     ]);
     expect(providerProfile('kimi').inputImageMimeTypes).toEqual([
-      'image/png', 'image/jpeg', 'image/webp', 'image/gif',
+      'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/heic', 'image/heif',
     ]);
     expect(providerProfile('muse').inputImageMimeTypes).toEqual([
       'image/png', 'image/jpeg', 'image/webp', 'image/gif',
@@ -173,5 +175,57 @@ describe('provider registry routing', () => {
     expect(providerTokenPrice({ provider: 'openrouter', model: 'openai/gpt-6.1-sol' }, 272_000)).toEqual({
       inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 15,
     });
+  });
+});
+
+describe('provider catalog facts (re-verified 2026-11-01)', () => {
+  it('defaults Kimi to the K3.1 Pro flagship and keeps K3 selectable', () => {
+    // platform.kimi.ai/docs/models.md: K3.1 Pro is the flagship, K3 the
+    // "previous-generation flagship"; K3.1 Pro is also cheaper.
+    const kimi = providerProfile('kimi');
+    expect(kimi.defaultModel).toBe('kimi-k3.1-pro');
+    expect(kimi.models[0]).toBe('kimi-k3.1-pro');
+    expect(kimi.models).toContain('kimi-k3');
+    expect(providerTokenPrice({ provider: 'kimi', model: 'kimi-k3.1-pro' }, 0)).toEqual({
+      inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 10,
+    });
+    // platform.kimi.ai/docs/guide/use-kimi-vision-model.md lists HEIC/HEIF.
+    expect(kimi.inputImageMimeTypes).toEqual(expect.arrayContaining(['image/heic', 'image/heif']));
+  });
+
+  it('prices OpenRouter google/gemini-3.8-flash at the OpenRouter catalog rate, not Google\'s', () => {
+    const now = Date.UTC(2026, 10, 1);
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'google/gemini-3.8-flash' }, 0, now)).toEqual({
+      inputPerMillionUsd: 0.825, cachedInputPerMillionUsd: 0.0825, outputPerMillionUsd: 4.125,
+    });
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'google/gemini-3.8-flash' }, 0, Date.UTC(2027, 0, 1)))
+      .toEqual({ inputPerMillionUsd: 1.65, cachedInputPerMillionUsd: 0.165, outputPerMillionUsd: 8.25 });
+    // Google direct keeps Google's list price.
+    expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-3.8-flash' }, 0, now)).toEqual({
+      inputPerMillionUsd: 0.75, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 3.75,
+    });
+    // Routes whose catalog headline already matches the upstream list price.
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'google/gemini-4-argon' }, 0, now)).toEqual({
+      inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10,
+    });
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'meta/muse-spark-1.3' }, 0, now)).toEqual({
+      inputPerMillionUsd: 1.25, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 4.25,
+    });
+  });
+
+  it('sends OpenRouter app attribution with X-OpenRouter-Title and HTTP-Referer', () => {
+    const headers = providerRequestHeaders({
+      provider: 'openrouter',
+      gateway: 'direct',
+      apiKey: 'k',
+      apiKeyEnv: 'OPENROUTER_API_KEY',
+      model: 'google/gemini-3.8-flash',
+      baseUrl: 'https://openrouter.ai/api/v1',
+    } satisfies ProviderRuntimeConfig);
+    expect(headers).toMatchObject({
+      'HTTP-Referer': 'https://github.com/cyanxxy/open-ocr-cli-mcp',
+      'X-OpenRouter-Title': 'Open OCR CLI & MCP',
+    });
+    expect(headers).not.toHaveProperty('X-Title');
   });
 });

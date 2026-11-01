@@ -77,26 +77,82 @@ export interface ChatCompletionResult {
   raw: Record<string, unknown>;
 }
 
+export interface ProviderApiErrorDetails {
+  /**
+   * `error.type` when the body also carried a distinct `error.code`. OpenAI
+   * sends billing 429s as `code: credit_balance_exhausted` (or a spend-limit
+   * code) with `type: insufficient_quota`; either one is enough to know the
+   * account, not the request rate, is the problem.
+   */
+  type?: string;
+  /** OpenRouter `error.metadata.limit_source`, e.g. `openrouter_in_flight_budget`. */
+  limitSource?: string;
+}
+
 export class ProviderApiError extends Error {
   /**
    * Delay the provider asked for (`Retry-After` / `retry-after-ms`) on a 429 or
-   * 503, in milliseconds. Undefined when it gave none.
+   * 503 (or an OpenRouter in-flight-budget 402), in milliseconds. Undefined
+   * when it gave none.
    */
   retryAfterMs?: number;
+  readonly type?: string;
+  readonly limitSource?: string;
 
   constructor(
     message: string,
     readonly status?: number,
     readonly code?: string,
+    details: ProviderApiErrorDetails = {},
   ) {
     super(message);
     this.name = 'ProviderApiError';
+    if (details.type !== undefined) this.type = details.type;
+    if (details.limitSource !== undefined) this.limitSource = details.limitSource;
   }
 }
 
-/** Read a server-requested retry delay from a throttling response. */
-export function responseRetryAfterMs(headers: Pick<Headers, 'get'>, status: number): number | undefined {
-  if (status !== 429 && status !== 503) return undefined;
+/**
+ * OpenRouter's in-flight budget: "transient and can occur with no request
+ * still running, while recent costs are settling", answered as HTTP 402 with
+ * `metadata.limit_source: "openrouter_in_flight_budget"` and a Retry-After
+ * header (openrouter.ai/docs/api_reference/limits). Every other 402 needs
+ * credits or a raised limit.
+ */
+export const OPENROUTER_IN_FLIGHT_BUDGET = 'openrouter_in_flight_budget';
+
+function isInFlightBudgetRejection(status: number | undefined, limitSource: string | undefined): boolean {
+  return status === 402 && limitSource === OPENROUTER_IN_FLIGHT_BUDGET;
+}
+
+/**
+ * True for an OpenRouter in-flight-budget 402 that carried Retry-After: the
+ * only 402 OpenRouter documents as retryable. Walks the cause chain.
+ */
+export function isTransientBudgetProviderError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (current instanceof ProviderApiError) {
+      return isInFlightBudgetRejection(current.status, current.limitSource) && current.retryAfterMs !== undefined;
+    }
+    current = isRecord(current) ? current.cause : undefined;
+  }
+  return false;
+}
+
+/**
+ * Read a server-requested retry delay from a throttling response: a 429/503,
+ * or a 402 whose body names OpenRouter's in-flight budget.
+ */
+export function responseRetryAfterMs(
+  headers: Pick<Headers, 'get'>,
+  status: number,
+  limitSource?: string,
+): number | undefined {
+  if (status !== 429 && status !== 503 && !isInFlightBudgetRejection(status, limitSource)) return undefined;
   const milliseconds = headers.get('retry-after-ms');
   if (milliseconds !== null && /^\d+(?:\.\d+)?$/u.test(milliseconds.trim())) {
     return Math.max(0, Math.round(Number(milliseconds.trim())));
@@ -135,7 +191,7 @@ async function responseError(response: Response): Promise<ProviderApiError> {
     `Provider request failed with HTTP ${response.status}`,
     response.status,
   );
-  const retryAfterMs = responseRetryAfterMs(response.headers, response.status);
+  const retryAfterMs = responseRetryAfterMs(response.headers, response.status, providerError.limitSource);
   if (retryAfterMs !== undefined) providerError.retryAfterMs = retryAfterMs;
   return providerError;
 }
@@ -157,12 +213,17 @@ function providerErrorFromRecord(
   const message = typeof error?.message === 'string'
     ? error.message
     : fallbackMessage;
+  const type = typeof error?.type === 'string' && error.type ? error.type : undefined;
   const code = typeof error?.code === 'string' && !/^\d{3}$/u.test(error.code)
     ? error.code
-    : typeof error?.type === 'string'
-      ? error.type
-      : typeof metadata?.error_type === 'string' ? metadata.error_type : undefined;
-  return new ProviderApiError(message, status, code);
+    : type ?? (typeof metadata?.error_type === 'string' ? metadata.error_type : undefined);
+  const limitSource = typeof metadata?.limit_source === 'string' && metadata.limit_source
+    ? metadata.limit_source
+    : undefined;
+  return new ProviderApiError(message, status, code, {
+    ...(type !== undefined && type !== code ? { type } : {}),
+    ...(limitSource !== undefined ? { limitSource } : {}),
+  });
 }
 
 function nestedSystemErrorCode(error: unknown): string | undefined {
@@ -199,13 +260,19 @@ function isRetryableNetworkError(error: unknown): boolean {
 
 /**
  * Error codes/types an OpenAI-compatible provider uses when the *account* is out
- * of quota, credit, or billing — not a per-minute throttle. OpenAI sends
- * `insufficient_quota` with HTTP 429, which every rate-limit rule would
- * otherwise retry; Moonshot uses `exceeded_current_quota_error`; OpenRouter and
- * DeepSeek answer HTTP 402 for an empty balance.
+ * of quota, credit, or billing — not a per-minute throttle. OpenAI sends these
+ * with HTTP 429, which every rate-limit rule would otherwise retry
+ * (developers.openai.com/api/docs/guides/error-codes: credit balance, org and
+ * project spend limits, org usage limit; `error.type` may still be
+ * `insufficient_quota`); Moonshot uses `exceeded_current_quota_error`;
+ * OpenRouter and DeepSeek answer HTTP 402 for an empty balance.
  */
 const QUOTA_EXHAUSTED_CODES: ReadonlySet<string> = new Set([
   'INSUFFICIENT_QUOTA',
+  'CREDIT_BALANCE_EXHAUSTED',
+  'ORGANIZATION_SPEND_LIMIT_EXCEEDED',
+  'PROJECT_SPEND_LIMIT_EXCEEDED',
+  'ORGANIZATION_USAGE_LIMIT_EXCEEDED',
   'EXCEEDED_CURRENT_QUOTA_ERROR',
   'BILLING_HARD_LIMIT_REACHED',
   'BILLING_NOT_ACTIVE',
@@ -238,6 +305,10 @@ export function isQuotaExhaustedProviderError(error: unknown): boolean {
   for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
     if (seen.has(current)) break;
     seen.add(current);
+    if (current instanceof ProviderApiError && isInFlightBudgetRejection(current.status, current.limitSource)) {
+      // Transient only when OpenRouter also said when to come back.
+      return current.retryAfterMs === undefined;
+    }
     if (quotaCodeOf(current)) return true;
     if (current instanceof ProviderApiError && current.status === 402) return true;
     current = isRecord(current) ? current.cause : undefined;
@@ -248,6 +319,7 @@ export function isQuotaExhaustedProviderError(error: unknown): boolean {
 export function isRetryableProviderError(error: unknown): boolean {
   if (error instanceof ProviderApiError) {
     const code = error.code?.toUpperCase();
+    if (isTransientBudgetProviderError(error)) return true;
     if (isQuotaExhaustedProviderError(error)) return false;
     return error.status === 408
       || error.status === 409
@@ -310,51 +382,152 @@ function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
   return {};
 }
 
-function isOpenAIStrictSchema(schema: Record<string, unknown>): boolean {
-  const visit = (value: unknown, seen: Set<object>): boolean => {
-    if (Array.isArray(value)) return value.every((entry) => visit(entry, seen));
+/**
+ * Strict structured-output subsets, as each provider documents them. A schema
+ * outside the subset is rejected with HTTP 400 when `strict: true` is sent, so
+ * `strict` is only claimed for schemas inside it; every returned value is still
+ * validated locally either way.
+ *
+ * - OpenAI (developers.openai.com/api/docs/guides/structured-outputs, "Supported
+ *   schemas"): the root must be an object and not `anyOf`; `allOf`, `not`,
+ *   `dependentRequired`, `dependentSchemas`, `if`/`then`/`else` are unsupported;
+ *   `oneOf` is not among the supported types (only `anyOf` is); `$defs`/`$ref`
+ *   and recursion are supported.
+ * - Meta (dev.meta.ai/docs/structured-output, "Enforce strict mode"): the root
+ *   must be a plain object with no top-level `anyOf`/`oneOf`/`allOf`/`enum`/
+ *   `not`; `allOf` and `oneOf` are unsupported anywhere; recursive (`$ref`-cycle)
+ *   schemas are rejected; the subset is validated inside `$defs` too.
+ * - Both: every object sets `additionalProperties: false` and lists every
+ *   property in `required`.
+ *
+ * `conservative` is the union of both rule sets, for OpenRouter routes whose
+ * upstream family publishes no strict subset of its own.
+ */
+type StrictSchemaDialect = 'openai' | 'meta' | 'conservative';
+
+interface StrictSchemaRules {
+  /** Keywords rejected anywhere in the schema. */
+  forbidden: readonly string[];
+  /** Keywords additionally rejected on the root schema. */
+  rootForbidden: readonly string[];
+  allowRecursion: boolean;
+}
+
+const OPENAI_FORBIDDEN = ['allOf', 'oneOf', 'not', 'dependentRequired', 'dependentSchemas', 'if', 'then', 'else'];
+const META_FORBIDDEN = ['allOf', 'oneOf'];
+
+const STRICT_SCHEMA_RULES: Record<StrictSchemaDialect, StrictSchemaRules> = {
+  openai: { forbidden: OPENAI_FORBIDDEN, rootForbidden: ['anyOf', 'enum', '$ref'], allowRecursion: true },
+  meta: { forbidden: META_FORBIDDEN, rootForbidden: ['anyOf', 'enum', 'not', '$ref'], allowRecursion: false },
+  conservative: {
+    forbidden: [...new Set([...OPENAI_FORBIDDEN, ...META_FORBIDDEN])],
+    rootForbidden: ['anyOf', 'enum', 'not', '$ref'],
+    allowRecursion: false,
+  },
+};
+
+const SUBSCHEMA_RECORD_KEYS = ['items', 'additionalProperties', 'not', 'if', 'then', 'else', 'contains'];
+const SUBSCHEMA_ARRAY_KEYS = ['anyOf', 'oneOf', 'allOf', 'prefixItems', 'items'];
+const SUBSCHEMA_MAP_KEYS = ['properties', '$defs', 'definitions', 'dependentSchemas', 'patternProperties'];
+
+function isObjectSchema(value: Record<string, unknown>): boolean {
+  return value.type === 'object'
+    || (Array.isArray(value.type) && value.type.includes('object'))
+    || isRecord(value.properties);
+}
+
+/** Resolve a local JSON-pointer `$ref` ("#", "#/$defs/x", "#/definitions/x/..."). */
+function resolveLocalRef(root: Record<string, unknown>, ref: string): unknown {
+  if (ref === '#') return root;
+  if (!ref.startsWith('#/')) return undefined;
+  let current: unknown = root;
+  for (const raw of ref.slice(2).split('/')) {
+    const segment = decodeURIComponent(raw).replace(/~1/gu, '/').replace(/~0/gu, '~');
+    if (!isRecord(current) && !Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function subschemasOf(value: Record<string, unknown>): unknown[] {
+  const children: unknown[] = [];
+  for (const key of SUBSCHEMA_RECORD_KEYS) if (isRecord(value[key])) children.push(value[key]);
+  for (const key of SUBSCHEMA_ARRAY_KEYS) if (Array.isArray(value[key])) children.push(...(value[key] as unknown[]));
+  for (const key of SUBSCHEMA_MAP_KEYS) {
+    if (isRecord(value[key])) children.push(...Object.values(value[key]));
+  }
+  return children;
+}
+
+function hasRecursiveRef(root: Record<string, unknown>): boolean {
+  const onPath = new Set<unknown>();
+  const done = new Set<unknown>();
+  const visit = (value: unknown): boolean => {
+    if (!isRecord(value)) return false;
+    if (onPath.has(value)) return true;
+    if (done.has(value)) return false;
+    onPath.add(value);
+    const target = typeof value.$ref === 'string' ? resolveLocalRef(root, value.$ref) : undefined;
+    const recursive = (target !== undefined && visit(target)) || subschemasOf(value).some(visit);
+    onPath.delete(value);
+    done.add(value);
+    return recursive;
+  };
+  return visit(root);
+}
+
+function isStrictSchema(schema: Record<string, unknown>, dialect: StrictSchemaDialect): boolean {
+  const rules = STRICT_SCHEMA_RULES[dialect];
+  if (!isObjectSchema(schema) || rules.rootForbidden.some((key) => key in schema)) return false;
+  const seen = new Set<object>();
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.every(visit);
     if (!isRecord(value)) return true;
     if (seen.has(value)) return true;
     seen.add(value);
-    if ('$ref' in value) return false;
-
-    const properties = isRecord(value.properties) ? value.properties : undefined;
-    if (value.type === 'object' || properties) {
-      if (!properties || value.additionalProperties !== false) return false;
+    if (rules.forbidden.some((key) => key in value)) return false;
+    // Only local references can be validated (and resolved by the provider).
+    if (typeof value.$ref === 'string' && resolveLocalRef(schema, value.$ref) === undefined) return false;
+    if (isObjectSchema(value)) {
+      const properties = isRecord(value.properties) ? value.properties : {};
+      if (value.additionalProperties !== false) return false;
       const required = Array.isArray(value.required)
         ? new Set(value.required.filter((entry): entry is string => typeof entry === 'string'))
         : new Set<string>();
       if (Object.keys(properties).some((key) => !required.has(key))) return false;
-      if (!Object.values(properties).every((property) => visit(property, seen))) return false;
     }
-
-    for (const key of ['items', 'not', 'if', 'then', 'else', 'additionalProperties']) {
-      if (isRecord(value[key]) && !visit(value[key], seen)) return false;
-    }
-    for (const key of ['anyOf', 'oneOf', 'allOf', 'prefixItems']) {
-      if (Array.isArray(value[key]) && !visit(value[key], seen)) return false;
-    }
-    if (isRecord(value.$defs) && !Object.values(value.$defs).every((entry) => visit(entry, seen))) {
-      return false;
-    }
-    return true;
+    return subschemasOf(value).every(visit);
   };
-  return visit(schema, new Set<object>());
+  if (!visit(schema)) return false;
+  return rules.allowRecursion || !hasRecursiveRef(schema);
+}
+
+function strictSchemaDialect(config: ProviderRuntimeConfig): StrictSchemaDialect | undefined {
+  if (config.provider === 'muse') return 'meta';
+  if (config.provider === 'openrouter') {
+    const routedModel = config.model.split(':')[0] ?? config.model;
+    if (routedModel.startsWith('openai/')) return 'openai';
+    if (routedModel.startsWith('meta/')) return 'meta';
+    return 'conservative';
+  }
+  return undefined;
 }
 
 /**
- * Kimi's MFJS dialect permits optional properties in strict mode. Other named
- * compatible routes receive `strict: true` only when the supplied schema meets
- * the narrower all-properties-required dialect. Generic endpoints get no
- * unverified strict-mode claim; every returned value is still validated locally.
+ * Kimi's MFJS dialect permits optional properties in strict mode. Muse and
+ * OpenRouter routes receive `strict: true` only when the supplied schema is
+ * inside the documented strict subset for that provider family. Generic
+ * endpoints get no unverified strict-mode claim; every returned value is still
+ * validated locally.
  */
 function strictSchemaSupport(
   config: ProviderRuntimeConfig,
   schema: Record<string, unknown>,
 ): true | undefined {
   if (config.provider === 'kimi') return true;
-  if (config.provider === 'openai-compatible') return undefined;
-  return isOpenAIStrictSchema(schema) ? true : undefined;
+  const dialect = strictSchemaDialect(config);
+  if (!dialect) return undefined;
+  return isStrictSchema(schema, dialect) ? true : undefined;
 }
 
 function compatibleTools(config: ProviderRuntimeConfig, tools: OpenAITool[]): OpenAITool[] {
@@ -477,6 +650,22 @@ function messageForWire(message: OpenAIMessage): Record<string, unknown> {
   };
 }
 
+/**
+ * Prefer sequential tool execution where the provider accepts the flag; the
+ * agent runtime still handles parallel batches safely when it does not.
+ *
+ * - Meta's Chat Completions schema lists `parallel_tool_calls` (boolean).
+ * - Kimi's Chat Completions schema has no such field.
+ * - OpenRouter: almost no endpoint lists it in `supported_parameters` (none for
+ *   any Gemini, Claude, GPT, Grok, Mistral, Muse, or Kimi K3.1 route in
+ *   GET /api/v1/models/<id>/endpoints, 2026-11-01), and tool requests set
+ *   `provider.require_parameters`, so sending it left no endpoint to route to.
+ * - Generic OpenAI-compatible servers follow OpenAI's spelling.
+ */
+function sendsParallelToolCalls(config: ProviderRuntimeConfig): boolean {
+  return config.provider === 'muse' || config.provider === 'openai-compatible';
+}
+
 function completionRequestBody(
   config: ProviderRuntimeConfig,
   request: ChatCompletionRequest,
@@ -495,13 +684,15 @@ function completionRequestBody(
     ...extraBody,
     model: config.model,
     messages: request.messages.map(messageForWire),
-    // Kimi's Chat API has deprecated `max_tokens` in favour of the OpenAI
-    // spelling. OpenRouter keeps `max_tokens`: it is the only token cap every
-    // Gemini, Muse, and Kimi endpoint lists in `supported_parameters`, and
-    // structured/tool requests set `require_parameters`, which would otherwise
-    // filter those endpoints out. Generic endpoints keep `max_tokens` because a
-    // local server built against the older spec is the common case.
-    ...(config.provider === 'kimi'
+    // Kimi's and Meta's Chat APIs both mark `max_tokens` deprecated in favour
+    // of `max_completion_tokens` (platform.kimi.ai/docs/api/chat.md,
+    // dev.meta.ai/docs/api-reference/chat-completions/schemas). OpenRouter
+    // keeps `max_tokens`: it is the only token cap every Gemini, Muse, and Kimi
+    // endpoint lists in `supported_parameters`, and structured/tool requests set
+    // `require_parameters`, which would otherwise filter those endpoints out.
+    // Generic endpoints keep `max_tokens` because a local server built against
+    // the older spec is the common case.
+    ...(config.provider === 'kimi' || config.provider === 'muse'
       ? { max_completion_tokens: request.maxTokens }
       : { max_tokens: request.maxTokens }),
     stream,
@@ -525,9 +716,7 @@ function completionRequestBody(
     ...(request.tools?.length ? {
       tools: compatibleTools(config, request.tools),
       tool_choice: request.toolChoice ?? 'auto',
-      // Prefer sequential tool execution; the agent runtime still handles
-      // parallel batches safely, but disables them when the provider honors this.
-      parallel_tool_calls: false,
+      ...(sendsParallelToolCalls(config) ? { parallel_tool_calls: false } : {}),
     } : {}),
   };
 }
@@ -597,8 +786,9 @@ async function streamedChatCompletion(
     }
     const choice = Array.isArray(parsed.choices) ? parsed.choices.find(isRecord) : undefined;
     if (!choice) return;
-    // Kimi reports streaming usage on choices[0], while OpenRouter/OpenAI put
-    // it at the chunk root. Support both current wire shapes.
+    // Kimi, OpenRouter, and OpenAI report final streaming usage at the chunk
+    // root, on a last chunk whose `choices` is empty (handled above). Older
+    // Kimi releases put it on choices[0]; keep reading that shape too.
     if (choice.usage !== undefined) usage = choice.usage;
     if (isRecord(choice.error)) {
       throw providerErrorFromRecord(choice.error, 'Provider reported a streaming completion error');
@@ -875,11 +1065,12 @@ export async function documentContentParts(
       type: 'image_url',
       image_url: {
         url: dataUrl,
-        // OpenRouter documents this optional quality hint. Kimi's current
-        // multimodal contract allows only `url`, and generic/Muse routes do
-        // not get optional OpenAI fields that their public contract does not
-        // explicitly advertise.
-        ...(config.provider === 'openrouter' ? { detail: 'high' as const } : {}),
+        // OpenRouter and Meta document this optional quality hint (Meta:
+        // `image_url.detail`, enum auto/low/high, default auto); OCR wants
+        // `high` for fine print. Kimi's current multimodal contract allows only
+        // `url`, and generic routes do not get optional OpenAI fields that their
+        // public contract does not explicitly advertise.
+        ...(config.provider === 'openrouter' || config.provider === 'muse' ? { detail: 'high' as const } : {}),
       },
     }];
   }

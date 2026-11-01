@@ -512,3 +512,98 @@ describe('CLI exit errors', () => {
     });
   });
 });
+
+describe('Gemini quota verdicts (gemini-cli googleQuotaErrors rule)', () => {
+  const sentence = 'You exceeded your current quota, please check your plan and billing details. '
+    + 'For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.';
+  const body = (quotaIds: string[], retryDelay: string) => JSON.stringify({
+    error: {
+      code: 429,
+      message: sentence,
+      status: 'RESOURCE_EXHAUSTED',
+      details: [
+        {
+          '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+          violations: quotaIds.map((quotaId) => ({
+            quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests',
+            quotaId,
+            quotaDimensions: { location: 'global', model: 'gemini-2.5-flash-preview-image' },
+          })),
+        },
+        { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay },
+      ],
+    },
+  });
+
+  it('reports a per-minute 429 as a retryable rate limit, not a balance problem', () => {
+    const perMinute = Object.assign(
+      new Error(body(['GenerateRequestsPerMinutePerProjectPerModel-FreeTier'], '55s')),
+      { name: 'ApiError', status: 429 },
+    );
+    expect(ocrErrorPayload(perMinute, 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: true,
+      hint: 'Retry later or lower request concurrency/rate.',
+    });
+    expect(ocrErrorPayload(Object.assign(new Error(sentence), { status: 429 }), 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: true,
+    });
+  });
+
+  it('reports a daily quota or Interactions quota_exceeded as non-retryable', () => {
+    const perDay = Object.assign(
+      new Error(body(['GenerateRequestsPerDayPerProjectPerModel-FreeTier'], '55s')),
+      { name: 'ApiError', status: 429 },
+    );
+    expect(ocrErrorPayload(perDay, 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+      hint: 'Check the provider account balance and quota before retrying.',
+    });
+    expect(ocrErrorPayload(Object.assign(new Error('Daily quota exceeded.'), { code: 'quota_exceeded' }), 1))
+      .toMatchObject({ code: 'RATE_LIMITED', retryable: false });
+    expect(ocrErrorPayload(Object.assign(new Error('Too many requests.'), { code: 'too_many_requests' }), 1))
+      .toMatchObject({ code: 'RATE_LIMITED', retryable: true });
+  });
+});
+
+describe('OpenAI-compatible provider error bodies', () => {
+  it('reports an OpenAI spend-limit 429 as a non-retryable balance problem', () => {
+    expect(ocrErrorPayload(new ProviderApiError(
+      'You exceeded your current quota.',
+      429,
+      'project_spend_limit_exceeded',
+      { type: 'insufficient_quota' },
+    ), 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+      hint: 'Check the provider account balance and quota before retrying.',
+    });
+  });
+
+  it('reports an OpenRouter in-flight-budget 402 with Retry-After as retryable', () => {
+    const inFlight = new ProviderApiError(
+      'This request would exceed your available credits given your current in-flight requests.',
+      402,
+      undefined,
+      { limitSource: 'openrouter_in_flight_budget' },
+    );
+    inFlight.retryAfterMs = 4_000;
+    expect(ocrErrorPayload(inFlight, 1)).toMatchObject({ code: 'RATE_LIMITED', retryable: true });
+    const credits = new ProviderApiError('Insufficient credits', 402, undefined, { limitSource: 'openrouter_credits' });
+    expect(ocrErrorPayload(credits, 1)).toMatchObject({ code: 'RATE_LIMITED', retryable: false });
+  });
+
+  it('reports an OpenRouter 403 refusal or content-policy block as a refusal, not a credential problem', () => {
+    for (const errorType of ['refusal', 'content_policy_violation']) {
+      // providerErrorFromRecord keeps metadata.error_type as the code when error.code is numeric.
+      const payload = ocrErrorPayload(new ProviderApiError('The model declined this request.', 403, errorType), 1);
+      expect(payload).toMatchObject({ code: 'PROVIDER_FAILURE', retryable: false });
+      expect(payload.hint).toContain('declined');
+      expect(payload.hint).not.toContain('credential');
+    }
+    expect(ocrErrorPayload(new ProviderApiError('Forbidden', 403, 'permission_denied'), 1))
+      .toMatchObject({ code: 'PERMISSION_DENIED' });
+  });
+});

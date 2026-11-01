@@ -608,7 +608,8 @@ describe('OcrJobService', () => {
   });
 
   it.each([
-    { provider: 'kimi' as const, model: 'kimi-k3' },
+    // Kimi direct accepts HEIC/HEIF (platform.kimi.ai vision guide); Muse does not.
+    { provider: 'muse' as const, model: 'muse-spark-1.3' },
     { provider: 'openrouter' as const, model: 'moonshotai/kimi-k3' },
   ])('rejects HEIC early for $provider image transports', async ({ provider, model }) => {
     const documentPath = path.join(directory, 'document.heic');

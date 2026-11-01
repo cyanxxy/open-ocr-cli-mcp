@@ -32,7 +32,7 @@ export function assertProviderMediaTypeSupported(
       .map((supportedMimeType) => supportedMimeType.slice('image/'.length).toUpperCase())
       .join(', ');
     const heicHint = mimeType === 'image/heic' || mimeType === 'image/heif'
-      ? ' Use Gemini for native HEIC/HEIF input.'
+      ? ' Use Gemini or Kimi for native HEIC/HEIF input.'
       : '';
     throw new CliExitError(
       `${options.provider}/${options.model} accepts ${formats} image input through this CLI, not ${mimeType}`,

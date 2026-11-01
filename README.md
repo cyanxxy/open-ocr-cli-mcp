@@ -145,7 +145,7 @@ or cost-limited, `2` invalid command or config. Request examples are in the
 | `--provider` | Key variable | Suggested models (default first) |
 | --- | --- | --- |
 | `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.5-flash-lite` |
-| `kimi` | `MOONSHOT_API_KEY` | `kimi-k3`, `kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed` |
+| `kimi` | `MOONSHOT_API_KEY` | `kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed`, `kimi-k3` |
 | `muse` | `META_API_KEY` | `muse-spark-1.3`, `muse-wonder-1.0` |
 | `openrouter` | `OPENROUTER_API_KEY` | Gemini, GPT-6.x, Claude 5.x, Muse, Grok 4.7, Mistral Medium 3.5 |
 | `openai-compatible` | `OPEN_OCR_API_KEY` | Any vision model, for example a local Ollama server |
