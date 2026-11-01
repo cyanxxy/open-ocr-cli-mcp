@@ -609,12 +609,61 @@ async function commitStagedNoClobber(
   }
 }
 
+/**
+ * Create `directory` below `containRoot` one level at a time, refusing any
+ * component that is not a directory or that resolves outside the output
+ * directory's real path (`realRoot`) before anything is created beneath it.
+ *
+ * A recursive `mkdir` followed by a containment check would already have
+ * created the missing tail wherever a swapped symbolic link pointed, so the
+ * refusal came after directories appeared outside the output root. A symbolic
+ * link that stays inside the output directory is still followed.
+ */
+async function mkdirInsideRoot(containRoot: string, realRoot: string, directory: string): Promise<void> {
+  const outside = (): CliExitError => outputConflict(
+    `Output artifact directory resolves outside the output directory: ${directory}`,
+  );
+  const relative = path.relative(containRoot, directory);
+  if (escapesRoot(relative)) throw outside();
+  let current = containRoot;
+  for (const segment of relative.split(path.sep).filter((part) => part.length > 0)) {
+    current = path.join(current, segment);
+    let metadata = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (metadata === undefined) {
+      try {
+        await fs.mkdir(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      metadata = await fs.lstat(current);
+    }
+    if (metadata.isSymbolicLink()) {
+      let real: string;
+      try {
+        real = await fs.realpath(current);
+      } catch {
+        throw outside();
+      }
+      if (escapesRoot(path.relative(realRoot, real))) throw outside();
+      metadata = await fs.stat(current);
+    }
+    if (!metadata.isDirectory()) {
+      throw outputConflict(`Output artifact path component is not a directory: ${current}`);
+    }
+  }
+}
+
 async function commitArtifacts(
   targets: ReadonlyArray<readonly [string, string]>,
   overwrite: boolean,
   reclaimable: ReadonlySet<string> = new Set(),
   /**
-   * The job's output directory. Every artifact's parent directory is resolved
+   * The job's output directory. Missing parent directories are created one
+   * level at a time from here, each existing level checked first (see
+   * {@link mkdirInsideRoot}), and every artifact's parent directory is resolved
    * again right before it is staged and must still lie inside this directory's
    * real path, so a directory swapped for a symbolic link after planning cannot
    * redirect the write elsewhere. (Node has no openat/O_NOFOLLOW per component,
@@ -639,7 +688,11 @@ async function commitArtifacts(
   }> = [];
   try {
     for (const [target, content] of targets) {
-      await fs.mkdir(path.dirname(target), { recursive: true });
+      if (containRoot !== undefined && realRoot !== undefined) {
+        await mkdirInsideRoot(containRoot, realRoot, path.dirname(target));
+      } else {
+        await fs.mkdir(path.dirname(target), { recursive: true });
+      }
       if (realRoot !== undefined) {
         const realDirectory = await fs.realpath(path.dirname(target));
         if (escapesRoot(path.relative(realRoot, realDirectory))) {

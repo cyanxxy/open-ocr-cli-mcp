@@ -681,6 +681,40 @@ describe('artifact write containment', () => {
     }
   });
 
+  it('creates nothing outside the output directory through a symlinked intermediate directory', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'open-ocr-outside-'));
+    try {
+      const { symlink } = await import('node:fs/promises');
+      await symlink(outside, path.join(directory, 'nested'));
+      const deep: ResolvedInput = {
+        ...input,
+        absolutePath: '/workspace/nested/deeper/still/invoice.pdf',
+        relativePath: 'nested/deeper/still/invoice.pdf',
+        displayPath: 'nested/deeper/still/invoice.pdf',
+      };
+      const failure = await writeArtifacts(deep, artifacts, options, 2).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: 'OUTPUT_CONFLICT' });
+      expect((failure as Error).message).toContain('resolves outside the output directory');
+      // A recursive mkdir would have created outside/deeper/still before refusing.
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a path component that is a file, and follows a symlink that stays inside', async () => {
+    const { symlink } = await import('node:fs/promises');
+    await writeFile(path.join(directory, 'nested'), 'not a directory');
+    const failure = await writeArtifacts(input, artifacts, options, 2).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: 'OUTPUT_CONFLICT' });
+    expect((failure as Error).message).toContain('is not a directory');
+    await rm(path.join(directory, 'nested'));
+    await fs.mkdir(path.join(directory, 'real'));
+    await symlink(path.join(directory, 'real'), path.join(directory, 'nested'));
+    await writeArtifacts(input, artifacts, options, 2);
+    expect((await fs.readdir(path.join(directory, 'real'))).sort()).toEqual(['invoice.csv', 'invoice.json', 'invoice.md']);
+  });
+
   it('writes an input named CLAUDE.png as CLAUDE.ocr.md', async () => {
     const claude = { ...input, absolutePath: '/workspace/CLAUDE.png', relativePath: 'CLAUDE.png', displayPath: 'CLAUDE.png', name: 'CLAUDE.png' };
     const written = await writeArtifacts(claude, artifacts, options, 2);
