@@ -88,7 +88,10 @@ routing in the user config, an explicit `--config` file, or flags. `--no-config`
 explicit config path. `OPEN_OCR_NO_CONFIG=1` skips ambient config and `.env`,
 but still allows an explicit `--config` or protocol `configPath` to load that
 one file. Ambient environment overrides still apply; set explicit options and
-forward a controlled environment for reproducible runs.
+forward a controlled environment for reproducible runs. Over MCP the caller's
+`configPath` follows the project rules for routing keys and must sit inside
+the server working directory; see
+[agent integrations](agent-integrations.md#trust-boundary).
 
 `init` writes project config by default, using the provider's default endpoint
 and key variable; `--global` writes user config and is required for a custom
