@@ -274,7 +274,8 @@ async function extractWithRetries(
   const result = await runWithProviderRetries(
     options,
     signal,
-    () => extractOnce(input, options, signal, onStep, runtime, budgetDeadline),
+    (attemptSignal) => extractOnce(input, options, attemptSignal, onStep, runtime, budgetDeadline),
+    { deadlineMs: budgetDeadline },
   );
   return { artifacts: result.value, attempts: result.attempts };
 }

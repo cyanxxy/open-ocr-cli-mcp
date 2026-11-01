@@ -86,11 +86,11 @@ export async function runWebJob(
       const extraction = await runWithProviderRetries(
         resolvedOptions,
         signal,
-        () => runWebExtraction(
+        (attemptSignal) => runWebExtraction(
           urls,
           analysis,
           resolvedOptions,
-          signal,
+          attemptSignal,
           providerRuntime,
         ),
       );

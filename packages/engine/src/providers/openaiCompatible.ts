@@ -1,6 +1,7 @@
 import type { ReadableStream } from 'node:stream/web';
 import { isKimiK3Route, knownModelThinkingLevels, providerDefaultThinkingLevel, providerRequestHeaders } from './registry';
 import { waitForProviderRequestSlot } from './requestPolicy';
+import { parseRetryAfterHeader } from './retryAfter';
 import type { ProviderRuntimeConfig } from './types';
 import { recordProviderUsage } from './usage';
 
@@ -77,6 +78,12 @@ export interface ChatCompletionResult {
 }
 
 export class ProviderApiError extends Error {
+  /**
+   * Delay the provider asked for (`Retry-After` / `retry-after-ms`) on a 429 or
+   * 503, in milliseconds. Undefined when it gave none.
+   */
+  retryAfterMs?: number;
+
   constructor(
     message: string,
     readonly status?: number,
@@ -85,6 +92,16 @@ export class ProviderApiError extends Error {
     super(message);
     this.name = 'ProviderApiError';
   }
+}
+
+/** Read a server-requested retry delay from a throttling response. */
+export function responseRetryAfterMs(headers: Pick<Headers, 'get'>, status: number): number | undefined {
+  if (status !== 429 && status !== 503) return undefined;
+  const milliseconds = headers.get('retry-after-ms');
+  if (milliseconds !== null && /^\d+(?:\.\d+)?$/u.test(milliseconds.trim())) {
+    return Math.max(0, Math.round(Number(milliseconds.trim())));
+  }
+  return parseRetryAfterHeader(headers.get('retry-after'));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -113,11 +130,14 @@ async function responseError(response: Response): Promise<ProviderApiError> {
     body = undefined;
   }
   const error = isRecord(body) && isRecord(body.error) ? body.error : undefined;
-  return providerErrorFromRecord(
+  const providerError = providerErrorFromRecord(
     error,
     `Provider request failed with HTTP ${response.status}`,
     response.status,
   );
+  const retryAfterMs = responseRetryAfterMs(response.headers, response.status);
+  if (retryAfterMs !== undefined) providerError.retryAfterMs = retryAfterMs;
+  return providerError;
 }
 
 function providerErrorFromRecord(
@@ -177,10 +197,58 @@ function isRetryableNetworkError(error: unknown): boolean {
     .test(error.message);
 }
 
+/**
+ * Error codes/types an OpenAI-compatible provider uses when the *account* is out
+ * of quota, credit, or billing — not a per-minute throttle. OpenAI sends
+ * `insufficient_quota` with HTTP 429, which every rate-limit rule would
+ * otherwise retry; Moonshot uses `exceeded_current_quota_error`; OpenRouter and
+ * DeepSeek answer HTTP 402 for an empty balance.
+ */
+const QUOTA_EXHAUSTED_CODES: ReadonlySet<string> = new Set([
+  'INSUFFICIENT_QUOTA',
+  'EXCEEDED_CURRENT_QUOTA_ERROR',
+  'BILLING_HARD_LIMIT_REACHED',
+  'BILLING_NOT_ACTIVE',
+  'INSUFFICIENT_BALANCE',
+  'INSUFFICIENT_CREDITS',
+  'INSUFFICIENT_FUNDS',
+  'PAYMENT_REQUIRED',
+  'CREDIT_LIMIT_EXCEEDED',
+  'ACCOUNT_DEACTIVATED',
+]);
+
+function quotaCodeOf(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  for (const key of ['code', 'type']) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && QUOTA_EXHAUSTED_CODES.has(candidate.trim().toUpperCase())) {
+      return candidate.trim().toUpperCase();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when a provider rejected the request because the account is out of
+ * quota or credit. Walks the cause chain so a retry-layer wrapper still reads.
+ */
+export function isQuotaExhaustedProviderError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (quotaCodeOf(current)) return true;
+    if (current instanceof ProviderApiError && current.status === 402) return true;
+    current = isRecord(current) ? current.cause : undefined;
+  }
+  return false;
+}
+
 export function isRetryableProviderError(error: unknown): boolean {
   if (error instanceof ProviderApiError) {
     const code = error.code?.toUpperCase();
-    if (code === 'EXCEEDED_CURRENT_QUOTA_ERROR') return false;
+    if (isQuotaExhaustedProviderError(error)) return false;
     return error.status === 408
       || error.status === 409
       || error.status === 429

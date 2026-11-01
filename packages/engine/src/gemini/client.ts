@@ -226,8 +226,24 @@ export function isFatalGeminiError(error: unknown): boolean {
  * loop retries these a few times before giving up rather than treating the
  * first 429/5xx as permanently fatal (audit H-17).
  */
+/**
+ * Gemini quota failures that no retry inside one batch can fix: a per-day quota
+ * (`...PerDay...` quota IDs), a model with `limit: 0` on this tier, or a project
+ * without billing. A per-minute RESOURCE_EXHAUSTED stays retryable.
+ */
+export function isGeminiQuotaExhaustedError(error: unknown): boolean {
+  const { status, code } = structuredErrorMetadata(error);
+  const message = error instanceof Error ? error.message : String(error);
+  const throttled = status === 429 || code === 'RESOURCE_EXHAUSTED' || /RESOURCE_EXHAUSTED/u.test(message);
+  if (!throttled) return false;
+  return /PerDay|per[ _-]?day/u.test(message)
+    || /\blimit:\s*0\b/u.test(message)
+    || /billing (?:account|details|is not enabled|has not been enabled)/iu.test(message);
+}
+
 export function isRetryableGeminiError(error: unknown): boolean {
   if (isFatalGeminiError(error)) return false;
+  if (isGeminiQuotaExhaustedError(error)) return false;
   const { status, code } = structuredErrorMetadata(error);
   if (status !== undefined) {
     return status === 408 || status === 409 || status === 429 || status >= 500;

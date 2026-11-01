@@ -70,6 +70,7 @@ export interface ProviderProfile {
 }
 
 export interface ProviderUsageSnapshot {
+  /** Every provider HTTP attempt, including failed and retried ones. */
   requests: number;
   inputTokens: number;
   outputTokens: number;
@@ -78,4 +79,9 @@ export interface ProviderUsageSnapshot {
   cachedTokens: number;
   totalTokens: number;
   estimatedCostUsd: number;
+  /**
+   * Completed provider responses that carried no usage telemetry. Present only
+   * when non-zero: token and cost totals then undercount the real spend.
+   */
+  unreportedUsageRequests?: number;
 }
