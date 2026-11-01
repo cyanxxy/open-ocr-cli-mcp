@@ -45,17 +45,30 @@ claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
 Start Claude with the provider key in its environment, then check with `/mcp`.
+Claude Code aborts a stdio tool call that sends no response or progress for 30
+minutes (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`); a single document may run up to
+`timeoutSeconds` (at most 3600), so keep that under 1800 or raise the window.
 
 **Codex** (`~/.codex/config.toml`)
 
 ```toml
+[features]
+mcp_2026_07_28 = true   # under development, off by default (from Codex source)
+
 [mcp_servers.open-ocr]
 command = "open-ocr-cli"
 args = ["mcp"]
+# Without this Codex uses the legacy handshake for stdio servers (from Codex source).
+env = { CODEX_MCP_PROTOCOL_VERSION = "2026-07-28" }
 env_vars = ["GEMINI_API_KEY"]
 cwd = "/absolute/path/to/documents"
 tool_timeout_sec = 600
 ```
+
+Codex's official guide does not document this opt-in yet; the two settings come
+from its source. If either client cannot connect, use the CLI protocol or the
+portable skill (see [agent integrations](docs/agent-integrations.md)), which
+need no MCP support.
 
 | Tool | What it does |
 | --- | --- |
@@ -70,7 +83,8 @@ The server's working directory (Claude Code's launch directory, or Codex's
 `outputDirectory` must resolve inside it. Endpoint, credential variable, and
 limits such as `maxCostUsd` belong to whoever starts the server, through
 `~/.config/open-ocr-cli/config.json` or its environment; tool arguments can
-lower those limits but not raise them or reroute requests.
+lower those limits but not raise them, reroute requests, or change the token
+prices the cost ceiling is computed from.
 
 Set `OPEN_OCR_MCP_CONFIRM=1` in the server environment to approve each paid
 run, with the real document count, cost ceiling, destination host, and
@@ -168,7 +182,7 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
 **GitHub Actions**
 
 ```yaml
-- uses: cyanxxy/open-ocr-cli-mcp@v4
+- uses: cyanxxy/open-ocr-cli-mcp@v5
   env:
     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
   with:

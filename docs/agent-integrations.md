@@ -36,18 +36,43 @@ claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 Start Claude with the provider key already in its environment, from the
 directory that holds the documents: the server's working directory is where
 Claude Code launches it, and every MCP path must stay inside it (see
-[Trust boundary](#trust-boundary)). Claude Code
-uses its v2 MCP runtime, which asks stdio servers for revision 2026-07-28, from
-**2.1.232** in sessions that fetch feature flags and from **2.1.274** in the
-others (Bedrock, Vertex, Foundry, telemetry off); nothing needs to be set.
+[Trust boundary](#trust-boundary)).
+
+Claude Code's v2 MCP runtime asks stdio servers whether they support revision
+2026-07-28 and uses it with those that do. It is the default from **2.1.232** in
+sessions that fetch feature flags, and from **2.1.274** in the others: Amazon
+Bedrock, Claude Platform on AWS, Google Cloud's Agent Platform, and Microsoft
+Foundry (unless a host platform that embeds Claude Code sets
+`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`), sessions signed in through a Claude
+apps gateway, and sessions with telemetry or feature-flag fetching turned off.
+Usually nothing needs to be set, but Anthropic can keep a specific server on
+the earlier protocol with a feature flag Claude Code fetches, and
 `MCP_SDK_GENERATION=v1` or `MCP_PROTOCOL_NEGOTIATION=legacy` keeps a session on
-the earlier handshake, which this server rejects. Use `/mcp` to verify
-connection and discovery. Set a per-server
-`timeout` in milliseconds if batches exceed the client's call deadline;
-progress does not extend that deadline. Claude may background a long call,
-but that host feature does not turn it into an MCP Tasks operation.
-These settings come from [Claude Code's MCP documentation](https://code.claude.com/docs/en/mcp#mcp-client-runtimes),
-checked **2026-10-28**; an actual Claude OCR session was not run in this audit.
+the earlier handshake. This server rejects that handshake; if `/mcp` shows it
+failing to connect, use the [CLI protocol](#portable-cli-integration) or the
+[portable skill](#portable-skill) instead. Use `/mcp` to verify connection and
+discovery.
+
+Two client limits bound a tool call:
+
+- The per-server `timeout` (milliseconds) is a hard wall-clock limit per call;
+  progress notifications do not extend it. Without one, `MCP_TOOL_TIMEOUT`
+  applies (about 28 hours when unset). Set it longer than the whole batch.
+- A call that sends no response and no progress notification for the idle
+  window aborts with an error. For stdio servers the window is **30 minutes**;
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (milliseconds, `0` disables the check)
+  changes it, and a per-server `timeout` of at least 1000 is a floor on it.
+  This server reports progress only at document lifecycle events, and only
+  when the call carries a progress token, while `timeoutSeconds` allows a
+  single document up to **3600 s**. Keep `timeoutSeconds` under 1800, or raise
+  the idle window or the per-server `timeout`, for documents that can run
+  longer.
+
+Claude may background a long call, but that host feature does not turn it into
+an MCP Tasks operation. These settings come from
+[Claude Code's MCP documentation](https://code.claude.com/docs/en/mcp#mcp-client-runtimes)
+([time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls)),
+checked **2026-11-01**; an actual Claude OCR session was not run in this audit.
 
 Claude Code saves a successful text result over 50,000 characters to a file and
 keeps only the first and last 5,000 characters of error text over about 11,000.
@@ -59,27 +84,50 @@ already produced, with the full envelope in `structuredContent`.
 
 ## Codex
 
-The CLI protocol above works wherever Codex can execute processes. For an MCP
-host with **2026-07-28** support, configure `~/.codex/config.toml`:
+The CLI protocol above works wherever Codex can execute processes. Codex
+connects to stdio MCP servers with the legacy `initialize` handshake by default,
+which this server rejects. Codex's source, not its official documentation,
+shows how a stdio server opts in to **2026-07-28**: enable the
+`mcp_2026_07_28` feature and set `CODEX_MCP_PROTOCOL_VERSION` in the server's
+`env`. In `~/.codex/config.toml`:
 
 ```toml
+[features]
+# Under development and off by default in Codex (from Codex source).
+mcp_2026_07_28 = true
+
 [mcp_servers.open-ocr]
 command = "open-ocr-cli"
 args = ["mcp"]
+# Without this, Codex uses the legacy handshake for a stdio server (from Codex source).
+env = { CODEX_MCP_PROTOCOL_VERSION = "2026-07-28" }
 env_vars = ["GEMINI_API_KEY"]
 cwd = "/absolute/path/to/documents"
 tool_timeout_sec = 600
 ```
+
+Both are needed. [openai/codex#35724](https://github.com/openai/codex/pull/35724)
+(merged 2026-07-28) added the opt-in: with the feature off every stdio server
+stays legacy; with it on, a missing variable keeps that server legacy and any value other
+than `2026-07-28` fails its launch. [openai/codex#57210](https://github.com/openai/codex/pull/57210),
+released in Codex 0.166.0, restates it: "Stdio servers without
+`CODEX_MCP_PROTOCOL_VERSION` use the legacy handshake, even when they support
+MCP `2026-07-28`." (It also adds an under-development `mcp_connection_sharing`
+feature that probes eligible local stdio servers without the variable.)
+`codex --enable mcp_2026_07_28` enables the feature for one run. These names
+come from source code checked **2026-11-01** and may change; if Codex still
+cannot connect, use the [CLI protocol](#portable-cli-integration) or the
+[portable skill](#portable-skill), which need no MCP support.
 
 Forward the chosen provider's credential variable instead when appropriate.
 `cwd` is the server's working directory and therefore its boundary: inputs,
 `configPath`, `schemaPath`, and `outputDirectory` must all resolve inside it,
 so point it at the folder that holds the documents rather than at `/` or your
 home directory. `codex mcp list` checks configuration. The [official MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
-documents these launch, environment, directory, and timeout fields but does not
-establish this exact protocol revision for every Codex client. Revision support
-remains unverified here; use the CLI protocol if the host cannot connect. The
-server deliberately supports one current MCP contract.
+documents the launch, `env`, `env_vars`, directory, and timeout fields, and
+[Codex configuration](https://learn.chatgpt.com/docs/config-file/config-basic)
+the `[features]` table, but neither names this protocol opt-in. The server
+deliberately supports one current MCP contract.
 
 ## Portable skill
 
@@ -115,7 +163,11 @@ configuration name `open-ocr` in the examples is a host-chosen label. Call
 `ocr_capabilities` first: its result is `{ workingDirectory, capabilities }`.
 Use `capabilities` for providers and model limits, and prefer absolute paths
 inside `workingDirectory`.
-The installed [TypeScript SDK is 2.3.0](https://github.com/modelcontextprotocol/typescript-sdk/releases/tag/v2.3.0).
+The installed [TypeScript SDK is 2.4.0](https://github.com/modelcontextprotocol/typescript-sdk/releases/tag/v2.4.0).
+Every request must declare `io.modelcontextprotocol/protocolVersion`
+`2026-07-28`; any other or missing version is answered with
+`UnsupportedProtocolVersionError` (-32022, `data: { supported, requested }`) on
+each request, not only the first.
 
 | Tool | Purpose |
 | --- | --- |
@@ -158,10 +210,20 @@ whose value is sent as the credential; a request that would send nothing is
 answered without a prompt. If the plan changes before the confirmed retry
 (documents, route, credential variable, or any other resolved option, for
 example an edited configuration file) the server asks again. The client must support form
-elicitation through the current protocol's continuation mechanism; Claude Code
-answers it only in interactive sessions, so `claude -p` and Agent SDK runs
-cannot confirm. Dry runs need none. Only the server's own environment enables
-it; a project `.env` cannot. Never put this switch under model control.
+elicitation through the current protocol's continuation mechanism. An answer
+that is present but is not the requested `ElicitResult` (a wrapped
+`{ method, result }` envelope, an unknown `action`) is a JSON-RPC error
+(-32602), not a tool result; a missing answer is asked for again.
+
+Claude Code shows the confirmation as a dialog only in interactive sessions.
+Elsewhere, in `claude -p` runs and Agent SDK sessions, the request is declined
+or cancelled unless an [`Elicitation` hook](https://code.claude.com/docs/en/hooks#elicitation)
+or the Agent SDK's `onElicitation` callback answers it (the SDK declines an
+unhandled request automatically). A hook or callback that accepts on its own
+removes the human approval this switch exists to provide, so only answer it
+from something that actually asks a person. Dry runs need none. Only the
+server's own environment enables it; a project `.env` cannot. Never put this
+switch under model control.
 
 ## Trust boundary
 
@@ -180,13 +242,31 @@ the server does not let tool arguments override the operator:
   default key variable; the `gateway: "cloudflare"` argument uses only the
   operator's `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_AI_GATEWAY_ID` (or user
   configuration) and token variable.
+- **Prices.** `inputPricePerMillionUsd` and `outputPricePerMillionUsd` decide
+  whether the operator's `maxCostUsd` ceiling and the fail-closed check for a
+  paid response without usage can trip, so a `configPath` file or project
+  `.open-ocr-cli.json` that sets them is refused with `CONFIG_INVALID`. Prices
+  come from the operator's user configuration or the verified price table, and
+  the operator's prices are dropped if the caller's configuration switches the
+  provider or model they were set for.
 - **Paths.** Inputs (paths and globs), `configPath`, `schemaPath`, and
   `outputDirectory` must resolve inside the server working directory, with
-  symbolic links followed; a link that points outside is refused, globs may not
-  be absolute or contain `..`, and every matched file is checked again after
-  expansion. `outputDirectory` (and a `configPath` `output`) may not be inside a
-  hidden directory such as `.git` or `.claude`, except the default
+  symbolic links followed; a link that points outside is refused. An input that
+  exists as a file or directory is read as that path even when its name has
+  glob characters (`Scan (1).pdf`, `inv[2].pdf`); only a path that does not
+  exist is expanded as a glob. A glob may not contain `..`, and an absolute glob
+  must start with the working directory or have a literal prefix that resolves
+  inside it; every matched file is checked again after expansion.
+  `outputDirectory` (and a `configPath` `output`) may not be inside a hidden
+  directory such as `.git` or `.claude`, except the default
   `.open-ocr-results`. Configuration and schema files must be regular files.
+- **Artifact names.** No directory or file an extraction writes starts with a
+  dot (`.mcp.png` becomes `_mcp.json`, `.devcontainer/x.png` becomes
+  `_devcontainer/x.json`), and agent instruction names gain `.ocr`
+  (`CLAUDE.ocr.md`), so `outputDirectory: "."` cannot write a project
+  `.mcp.json` or agent configuration. Missing directories are created one level
+  at a time, and a component that is a symbolic link out of the output
+  directory is refused before anything is created beneath it.
 - **Limits.** `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`, and
   `concurrency` in the operator's user configuration are ceilings. A caller
   argument, `configPath`, or project file may lower them; a larger value (or an
