@@ -47,6 +47,56 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe('Gemini through Cloudflare BYOK', () => {
+  it('sends the gateway token, never the user key, as the Gemini key (Cloudflare @google/genai BYOK example)', async () => {
+    const seen: Headers[] = [];
+    vi.stubGlobal('fetch', vi.fn((_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      seen.push(new Headers(init?.headers));
+      return Promise.resolve(Response.json(
+        { error: { code: 400, message: 'stop here', status: 'INVALID_ARGUMENT' } },
+        { status: 400 },
+      ));
+    }));
+    await expect(extractTextWithProvider('data:image/png;base64,AA==', 'image/png', 'invoice.png', config({
+      provider: 'gemini',
+      gateway: 'cloudflare',
+      apiKey: 'users-own-gemini-key',
+      apiKeyEnv: 'GEMINI_API_KEY',
+      model: 'gemini-3.8-flash',
+      baseUrl: 'https://gateway.ai.cloudflare.com/v1/account/gateway/google-ai-studio',
+      cloudflareByok: true,
+      gatewayToken: 'cf-gateway-token',
+    }))).rejects.toThrow();
+    expect(seen.length).toBeGreaterThan(0);
+    for (const headers of seen) {
+      expect(headers.get('x-goog-api-key')).toBe('cf-gateway-token');
+      expect([...headers.values()].join('\n')).not.toContain('users-own-gemini-key');
+    }
+  });
+
+  it('keeps sending the configured key outside BYOK', async () => {
+    const seen: Headers[] = [];
+    vi.stubGlobal('fetch', vi.fn((_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      seen.push(new Headers(init?.headers));
+      return Promise.resolve(Response.json(
+        { error: { code: 400, message: 'stop here', status: 'INVALID_ARGUMENT' } },
+        { status: 400 },
+      ));
+    }));
+    await expect(extractTextWithProvider('data:image/png;base64,AA==', 'image/png', 'invoice.png', config({
+      provider: 'gemini',
+      gateway: 'cloudflare',
+      apiKey: 'users-own-gemini-key',
+      apiKeyEnv: 'GEMINI_API_KEY',
+      model: 'gemini-3.8-flash',
+      baseUrl: 'https://gateway.ai.cloudflare.com/v1/account/gateway/google-ai-studio',
+      gatewayToken: 'cf-gateway-token',
+    }))).rejects.toThrow();
+    expect(seen[0]?.get('x-goog-api-key')).toBe('users-own-gemini-key');
+    expect(seen[0]?.get('cf-aig-authorization')).toBe('Bearer cf-gateway-token');
+  });
+});
+
 describe('provider extraction facade', () => {
   it('sends image media and returns Markdown through the compatible transport', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(completion('# Invoice\n\nTotal: 42.00')));

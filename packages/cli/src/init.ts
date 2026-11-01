@@ -17,6 +17,7 @@ import {
   providerDefaultApiKeyEnv,
   providerDefaultBaseUrl,
   providerDefaultModel,
+  geminiRequestApiKey,
   providerRequestHeaders,
   providerTokenPrice,
   resolveProviderBaseUrl,
@@ -195,7 +196,7 @@ export async function validateProviderCredentials(config: ProviderRuntimeConfig)
     ?? defaultCliThinkingLevel(config.provider, config.model);
   if (config.provider === 'gemini') {
     const client = getGenAIClient(
-      config.apiKey || (config.cloudflareByok ? 'cloudflare-byok' : ''),
+      geminiRequestApiKey(config),
       {
         baseUrl: config.gateway === 'cloudflare' ? config.baseUrl : undefined,
         headers: config.gateway === 'cloudflare' ? providerRequestHeaders(config) : undefined,

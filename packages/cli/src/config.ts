@@ -812,10 +812,12 @@ export function resolveCliOptions(
   const apiKeyEnv = flags.apiKeyEnv
     ?? (providerContextMatches ? fileConfig.apiKeyEnv : undefined)
     ?? providerDefaultApiKeyEnv(provider);
-  const apiKey = env[apiKeyEnv]?.trim() || '';
   const cloudflareByok = flags.cloudflareByok
     ?? (providerContextMatches && gatewayContextMatches ? fileConfig.cloudflareByok : undefined)
     ?? false;
+  // Under BYOK the gateway supplies the stored provider key, and only when the
+  // request carries no provider key of its own: never read or send ours.
+  const apiKey = cloudflareByok ? '' : env[apiKeyEnv]?.trim() || '';
   const cloudflareByokAlias = flags.cloudflareByokAlias
     ?? (providerContextMatches && gatewayContextMatches ? fileConfig.cloudflareByokAlias : undefined);
   if (cloudflareByok && gateway !== 'cloudflare') {

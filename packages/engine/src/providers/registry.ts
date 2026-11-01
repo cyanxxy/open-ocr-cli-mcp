@@ -232,6 +232,24 @@ export function resolveProviderBaseUrl(input: {
   return `${root}/custom-${encodeURIComponent(input.cloudflareProvider)}/v1`;
 }
 
+/**
+ * The key a Gemini client sends as `x-goog-api-key`.
+ *
+ * Under Cloudflare BYOK the gateway substitutes the stored provider key "only
+ * when the provider authorization header is absent"; a real key in that header
+ * is forwarded instead and a placeholder causes a provider authentication error
+ * (developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys).
+ * Cloudflare's @google/genai BYOK example therefore passes the gateway token as
+ * `apiKey` (developers.cloudflare.com/ai-gateway/usage/providers/google-ai-studio).
+ * The user's own Gemini key is never sent in BYOK mode — the same rule as the
+ * omitted `Authorization` header on OpenAI-compatible routes.
+ */
+export function geminiRequestApiKey(
+  config: Pick<ProviderRuntimeConfig, 'apiKey' | 'cloudflareByok' | 'gatewayToken'>,
+): string {
+  return config.cloudflareByok ? config.gatewayToken ?? '' : config.apiKey;
+}
+
 export function providerRequestHeaders(config: ProviderRuntimeConfig): Record<string, string> {
   const headers: Record<string, string> = {};
   if (config.gatewayToken) headers['cf-aig-authorization'] = `Bearer ${config.gatewayToken}`;

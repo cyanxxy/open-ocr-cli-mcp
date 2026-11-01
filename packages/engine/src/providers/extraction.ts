@@ -30,13 +30,13 @@ import {
   documentContentParts,
   type OpenAIMessage,
 } from './openaiCompatible';
-import { providerDefaultBaseUrl, providerRequestHeaders } from './registry';
+import { geminiRequestApiKey, providerDefaultBaseUrl, providerRequestHeaders } from './registry';
 
 function geminiConfig(config: ProviderRuntimeConfig): GeminiClientConfig {
   const usesCustomTransport = config.gateway === 'cloudflare'
     || config.baseUrl !== providerDefaultBaseUrl('gemini');
   return {
-    apiKey: config.apiKey || (config.cloudflareByok ? config.gatewayToken || 'cloudflare-byok' : ''),
+    apiKey: geminiRequestApiKey(config),
     model: config.model as GeminiModel,
     thinkingConfig: config.thinkingConfig,
     baseUrl: usesCustomTransport ? config.baseUrl : undefined,
