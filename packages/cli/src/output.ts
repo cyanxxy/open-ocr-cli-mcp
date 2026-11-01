@@ -43,19 +43,49 @@ export interface BatchLockAcquireOptions {
 }
 
 /**
+ * The starttime field (22) of a `/proc/<pid>/stat` line. The command name
+ * (field 2) is parenthesised and may itself contain spaces, parentheses, or
+ * newlines, so fields are counted from the last ")" in the line.
+ */
+export function procStatStartTicks(stat: string): string | undefined {
+  const close = stat.lastIndexOf(')');
+  if (close < 0 || stat[close + 1] !== ' ') return undefined;
+  // fields[0] is field 3 (state), so field 22 is fields[19].
+  const startTicks = stat.slice(close + 2).split(' ')[19];
+  return startTicks && /^\d+$/u.test(startTicks) ? startTicks : undefined;
+}
+
+const PS_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * Epoch seconds of a `ps -o lstart=` value printed in the C locale and UTC
+ * ("Sun Nov  1 19:20:43 2026"). Undefined for anything else, so an output
+ * this code cannot read with certainty never yields an identity.
+ */
+export function parsePsLstartUtc(text: string): number | undefined {
+  const match = /^[A-Z][a-z]{2} +([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/u.exec(text.trim());
+  if (!match) return undefined;
+  const month = PS_MONTHS.indexOf(match[1]);
+  if (month < 0) return undefined;
+  const millis = Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
+  return Number.isFinite(millis) ? Math.floor(millis / 1000) : undefined;
+}
+
+/**
  * A stable identity for one process lifetime, so a lock whose PID has since
  * been reused by an unrelated process is recognised as stale instead of
- * looking in use forever. Undefined where the platform gives no way to read it.
+ * looking in use forever. Undefined where the platform gives no reliable way
+ * to read it, which callers treat as "cannot tell" (never as stale).
+ *
+ * The identity must not depend on who asks: `ps -o lstart=` prints in the
+ * caller's locale and time zone, so it runs with LC_ALL=C and TZ=UTC and the
+ * result is reduced to epoch seconds.
  */
 export function processStartIdentity(pid: number): string | undefined {
   try {
     if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      // Field 22 (starttime) counted after the parenthesised command name,
-      // which may itself contain spaces or parentheses.
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      const startTicks = fields[19];
-      if (!startTicks || !/^\d+$/u.test(startTicks)) return undefined;
+      const startTicks = procStatStartTicks(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+      if (!startTicks) return undefined;
       let bootId = '';
       try {
         bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
@@ -69,11 +99,44 @@ export function processStartIdentity(pid: number): string | undefined {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2_000,
-    }).trim();
-    return started ? `ps:${started}` : undefined;
+      env: {
+        ...(process.env.PATH !== undefined ? { PATH: process.env.PATH } : {}),
+        LC_ALL: 'C',
+        LANG: 'C',
+        TZ: 'UTC',
+      },
+    });
+    const epochSeconds = parsePsLstartUtc(started);
+    return epochSeconds === undefined ? undefined : `ps-utc:${epochSeconds}`;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether two start identities name the same process lifetime: true, false,
+ * or undefined when they cannot be compared reliably (different schemes, such
+ * as a record written by an older build, or unreadable values). Only `false`
+ * proves a PID was reused.
+ */
+export function sameProcessStart(recorded: string, current: string): boolean | undefined {
+  const linux = /^linux:([^:]*):(\d+)$/u;
+  const recordedLinux = linux.exec(recorded);
+  const currentLinux = linux.exec(current);
+  if (recordedLinux && currentLinux) {
+    if (recordedLinux[2] !== currentLinux[2]) return false;
+    // Same ticks: only two readable, different boot ids prove a reboot.
+    if (recordedLinux[1] && currentLinux[1] && recordedLinux[1] !== currentLinux[1]) return false;
+    return true;
+  }
+  const ps = /^ps-utc:(\d+)$/u;
+  const recordedPs = ps.exec(recorded);
+  const currentPs = ps.exec(current);
+  if (recordedPs && currentPs) {
+    // lstart has one-second resolution; allow for a rounding difference.
+    return Math.abs(Number(recordedPs[1]) - Number(currentPs[1])) <= 1;
+  }
+  return undefined;
 }
 
 let ownProcessStart: string | undefined | null = null;
@@ -95,7 +158,9 @@ export function batchLockOwnerState(owner: BatchLockOwner): BatchLockState {
   if (!processIsAlive(owner.pid)) return 'stale';
   if (owner.processStart !== undefined) {
     const current = processStartIdentity(owner.pid);
-    if (current !== undefined && current !== owner.processStart) return 'stale';
+    // An identity that cannot be read or compared keeps the lock live: a
+    // running batch's lock is never stolen on a guess.
+    if (current !== undefined && sameProcessStart(owner.processStart, current) === false) return 'stale';
   }
   return 'live';
 }
