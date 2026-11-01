@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { clearRegisteredSecretsForRedaction } from '@open-ocr/engine/gemini/errorPayload';
 import { listExtractionPresets } from '@open-ocr/engine/templates';
 import {
   assertCredentialsAvailable,
@@ -15,7 +16,7 @@ import {
   resolveCliOptions,
   suppliedModeScopedFlags,
 } from './config';
-import { ocrErrorPayload } from './errors';
+import { ocrErrorPayload, redactSensitiveErrorText } from './errors';
 import { modeFingerprint } from './ocrJobService';
 import { ocrExtractionSemanticError } from './protocol';
 import type { ExtractCommandFlags } from './types';
@@ -38,6 +39,22 @@ afterEach(() => {
 });
 
 describe('CLI configuration', () => {
+  it('registers the credential values a run resolves so errors echoing them are scrubbed', () => {
+    const secret = 'customOpaqueKey-5f3a9c';
+    const gatewaySecret = 'gatewayOpaqueToken-77aa';
+    try {
+      resolveCliOptions({
+        provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', model: 'm', apiKeyEnv: 'CUSTOM_KEY_ENV',
+      }, {}, '/workspace', 'flag', { CUSTOM_KEY_ENV: secret, CLOUDFLARE_AI_GATEWAY_TOKEN: gatewaySecret });
+      const payload = ocrErrorPayload(new Error(`provider said: bad key ${secret}; gateway ${gatewaySecret}`));
+      expect(payload.message).not.toContain(secret);
+      expect(payload.message).not.toContain(gatewaySecret);
+      expect(redactSensitiveErrorText(secret)).toBe('[REDACTED_KEY]');
+    } finally {
+      clearRegisteredSecretsForRedaction();
+    }
+  });
+
   it('uses safe defaults and environment credentials', () => {
     process.env.GEMINI_API_KEY = 'test-key';
     const options = resolveCliOptions({}, {}, '/workspace');

@@ -27,7 +27,13 @@ import { GATEWAY_IDS, PROVIDER_IDS } from '@open-ocr/engine/providers';
 import capabilitiesV2Schema from '../schemas/capabilities-v2.schema.json';
 import errorV2Schema from '../schemas/error-v2.schema.json';
 import resultV2Schema from '../schemas/result-v2.schema.json';
-import { CliExitError, cliExitCode, cliSignalExitCode, ocrErrorPayload } from './errors';
+import {
+  CliExitError,
+  cliExitCode,
+  cliSignalExitCode,
+  ocrErrorPayload,
+  redactSensitiveErrorText,
+} from './errors';
 import { OCR_REQUEST_LIMITS } from './limits';
 import { executeOcrJobRequest } from './machine';
 import { MCP_ARTIFACT_CHUNK_BYTES, MCP_ARTIFACT_REGISTRY_LIMIT, McpArtifactRegistry } from './mcpArtifacts';
@@ -834,6 +840,28 @@ function truncateText(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
 }
 
+/**
+ * Line breaks, other C0/C1 controls, and bidirectional overrides, which would
+ * let a document name or a provider message start a line of its own (forging a
+ * `Produced:` entry or a fake hint) or reorder what a terminal displays.
+ */
+// eslint-disable-next-line no-control-regex
+const LINE_FORGING_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+
+/**
+ * Render untrusted text (a source name, a provider message) as part of one
+ * line of {@link errorText}: control characters are escaped visibly rather
+ * than dropped, so the reader can still tell two names apart.
+ */
+function oneLine(text: string): string {
+  return text.replace(LINE_FORGING_CHARACTERS, (character) => {
+    if (character === '\n') return '\\n';
+    if (character === '\r') return '\\r';
+    if (character === '\t') return '\\t';
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`;
+  });
+}
+
 function runCounts(result: OcrRunResult): string {
   return `${result.succeeded} succeeded, ${result.partial} partial, ${result.failed} failed, `
     + `${result.skipped} skipped of ${result.total}`;
@@ -849,9 +877,9 @@ function runCounts(result: OcrRunResult): string {
 function errorText(result: OcrMachineResult): string {
   if (!('documents' in result)) {
     const { error } = result;
-    const lines = [`Run ${result.runId} failed: [${error.code}] ${error.message}`];
-    if (error.hint) lines.push(`Hint: ${error.hint}`);
-    for (const warning of result.warnings ?? []) lines.push(`Warning: ${warning}`);
+    const lines = [`Run ${result.runId} failed: [${error.code}] ${oneLine(error.message)}`];
+    if (error.hint) lines.push(`Hint: ${oneLine(error.hint)}`);
+    for (const warning of result.warnings ?? []) lines.push(`Warning: ${oneLine(warning)}`);
     return truncateText(lines.join('\n'), MCP_ERROR_TEXT_MAX_CHARS);
   }
   const lines = [
@@ -879,12 +907,12 @@ function errorText(result: OcrMachineResult): string {
   };
   addSection('Failed:', result.documents.flatMap((document) => (
     document.error
-      ? [`- ${document.source}: [${document.error.code}] ${document.error.message}${document.error.hint ? ` Hint: ${document.error.hint}` : ''}`]
+      ? [`- ${oneLine(document.source)}: [${document.error.code}] ${oneLine(document.error.message)}${document.error.hint ? ` Hint: ${oneLine(document.error.hint)}` : ''}`]
       : []
   )), 'failed document(s)');
   addSection('Produced (keep these; do not re-run them):', result.documents.flatMap((document) => (
     document.artifacts.length > 0
-      ? [`- ${document.source} (${document.status}${document.partialReason ? `: ${document.partialReason}` : ''}): ${document.artifacts.map((artifact) => artifact.path).join(', ')}`]
+      ? [`- ${oneLine(document.source)} (${document.status}${document.partialReason ? `: ${oneLine(document.partialReason)}` : ''}): ${document.artifacts.map((artifact) => oneLine(artifact.path)).join(', ')}`]
       : []
   )), 'document(s) with artifacts');
   return lines.join('\n');
@@ -926,11 +954,36 @@ function resultTextBlock(result: OcrMachineResult): McpTextBlock {
   return { type: 'text', text: `${result.status} run ${result.runId}: ${runCounts(result)}. ${where}` };
 }
 
+/**
+ * Last-line credential scrub at the MCP boundary.
+ *
+ * Every error is redacted where it is typed, but this is the one place all of
+ * them leave the process for a possibly prompt-injected caller, so the error
+ * texts and warnings are passed through the redactor (which also removes the
+ * credential values registered for this process) once more here. In place:
+ * the envelope is this module's own, and callers rely on its identity.
+ */
+function scrubCredentials(result: OcrMachineResult): void {
+  const scrubError = (error: { message: string; hint?: string }): void => {
+    error.message = redactSensitiveErrorText(error.message);
+    if (error.hint !== undefined) error.hint = redactSensitiveErrorText(error.hint);
+  };
+  if (result.warnings) result.warnings = result.warnings.map(redactSensitiveErrorText);
+  if (!('documents' in result)) {
+    scrubError(result.error);
+    return;
+  }
+  for (const document of result.documents) {
+    if (document.error) scrubError(document.error);
+  }
+}
+
 export function mcpResult(result: OcrMachineResult): {
   content: Array<McpTextBlock | McpResourceLinkBlock>;
   structuredContent: Record<string, unknown>;
   isError?: boolean;
 } {
+  scrubCredentials(result);
   return {
     content: [
       resultTextBlock(result),

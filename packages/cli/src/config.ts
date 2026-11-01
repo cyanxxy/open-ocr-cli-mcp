@@ -6,6 +6,7 @@ import process from 'node:process';
 import { parseEnv } from 'node:util';
 
 import type { ThinkingLevel } from '@open-ocr/engine/gemini';
+import { registerSecretForRedaction } from '@open-ocr/engine/gemini/errorPayload';
 import {
   GATEWAY_IDS,
   GEMINI_MODELS,
@@ -650,6 +651,12 @@ export function resolveCliOptions(
     ?? fileConfig.cloudflareTokenEnv
     ?? 'CLOUDFLARE_AI_GATEWAY_TOKEN';
   const gatewayToken = gateway === 'cloudflare' ? env[gatewayTokenEnv]?.trim() : undefined;
+  // Error text that echoes a credential verbatim is scrubbed by value, not only
+  // by shape: register the values this run may send, plus every well-known
+  // credential variable, before anything can fail and render a message.
+  for (const name of new Set([apiKeyEnv, gatewayTokenEnv, ...PROJECT_ENV_CREDENTIALS])) {
+    registerSecretForRedaction(env[name]);
+  }
   const hasFlagPrice = flags.inputPrice !== undefined || flags.outputPrice !== undefined;
   const inputPricePerMillionUsd = optionalNumberInRange(
     hasFlagPrice
