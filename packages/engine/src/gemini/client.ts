@@ -220,42 +220,216 @@ export function isFatalGeminiError(error: unknown): boolean {
   return credentialFailure;
 }
 
+const GOOGLE_RPC_QUOTA_FAILURE = 'type.googleapis.com/google.rpc.QuotaFailure';
+const GOOGLE_RPC_RETRY_INFO = 'type.googleapis.com/google.rpc.RetryInfo';
+
+/**
+ * Longest server-requested wait that still counts as a transient throttle.
+ * Same threshold as Google's gemini-cli (`MAX_RETRYABLE_DELAY_SECONDS`): a
+ * longer `retryDelay` means the caller is effectively locked out.
+ */
+const MAX_RETRYABLE_QUOTA_DELAY_SECONDS = 300;
+
+/** Everything a thrown Gemini error (or its cause chain) says about a quota. */
+interface GoogleQuotaEvidence {
+  status?: number;
+  /** Upper-cased status tokens and string codes, e.g. RESOURCE_EXHAUSTED, QUOTA_EXCEEDED. */
+  codes: Set<string>;
+  texts: string[];
+  /** `google.rpc.*` detail objects recovered from any JSON body in the chain. */
+  details: Array<Record<string, unknown>>;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseErrorBodyText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed.includes('{')) return undefined;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    const start = trimmed.indexOf('{');
+    const end = trimmed.lastIndexOf('}');
+    if (start < 0 || end <= start) return undefined;
+    try {
+      return JSON.parse(trimmed.slice(start, end + 1)) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function absorbErrorBody(body: unknown, evidence: GoogleQuotaEvidence, depth = 0): void {
+  if (depth > 3) return;
+  if (Array.isArray(body)) {
+    for (const entry of body) absorbErrorBody(entry, evidence, depth + 1);
+    return;
+  }
+  if (!isPlainRecord(body)) return;
+  const error = isPlainRecord(body.error) ? body.error : body;
+  if (typeof error.code === 'number') evidence.status ??= error.code;
+  if (typeof error.code === 'string' && error.code) evidence.codes.add(error.code.toUpperCase());
+  if (typeof error.status === 'string' && error.status) evidence.codes.add(error.status.toUpperCase());
+  if (typeof error.message === 'string' && error.message) evidence.texts.push(error.message);
+  if (Array.isArray(error.details)) {
+    for (const detail of error.details) {
+      if (isPlainRecord(detail)) evidence.details.push(detail);
+    }
+  }
+}
+
+function collectGoogleQuotaEvidence(error: unknown): GoogleQuotaEvidence {
+  const evidence: GoogleQuotaEvidence = { codes: new Set(), texts: [], details: [] };
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; current !== null && current !== undefined && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (typeof current === 'string') {
+      evidence.texts.push(current);
+      absorbErrorBody(parseErrorBodyText(current), evidence);
+      break;
+    }
+    if (typeof current !== 'object') break;
+    const record = current as Record<string, unknown>;
+    const status = record.status ?? record.statusCode;
+    if (typeof status === 'number') evidence.status ??= status;
+    if (typeof record.code === 'number') evidence.status ??= record.code;
+    if (typeof record.code === 'string' && record.code) {
+      if (/^\d{3}$/u.test(record.code)) evidence.status ??= Number(record.code);
+      else evidence.codes.add(record.code.toUpperCase());
+    }
+    for (const key of ['message', 'body'] as const) {
+      const value = record[key];
+      if (typeof value !== 'string' || !value) continue;
+      evidence.texts.push(value);
+      absorbErrorBody(parseErrorBodyText(value), evidence);
+    }
+    // The Interactions SDK keeps the parsed body on `error`.
+    if (isPlainRecord(record.error)) absorbErrorBody(record.error, evidence);
+    current = record.cause;
+  }
+  return evidence;
+}
+
+/** "34.07s", "60s", "900ms" -> seconds (google.protobuf.Duration JSON form). */
+function parseDurationSeconds(duration: string): number | undefined {
+  const match = /^\s*(\d+(?:\.\d+)?)(ms|s)\s*$/u.exec(duration);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return undefined;
+  return match[2] === 'ms' ? value / 1000 : value;
+}
+
+/** Phrases Google uses for a project without billing (400 FAILED_PRECONDITION / 403). */
+const BILLING_NOT_ENABLED_PATTERN =
+  /\bbilling (?:is not enabled|has not been enabled|is disabled|to be enabled)\b|\benable billing\b|\bBILLING_DISABLED\b/iu;
+const SPENDING_CAP_PATTERN = /\b(?:spending|spend)\s+cap\b/iu;
+/** A quota ID or limit name such as `GenerateRequestsPerDayPerProjectPerModel-FreeTier`. */
+const DAILY_QUOTA_ID_PATTERN = /\w(?:PerDay|Daily)\w*/u;
+
+export type GeminiQuotaVerdict = 'terminal' | 'retryable';
+
+/**
+ * Classify a Gemini quota/throttle failure the way Google's own gemini-cli does
+ * (`packages/core/src/utils/googleQuotaErrors.ts`, `classifyGoogleError`).
+ *
+ * Terminal — no retry inside one run can fix it:
+ * - a `google.rpc.QuotaFailure` violation whose `quotaId` contains `PerDay` or
+ *   `Daily` (or, when the body carried no violations, such a quota ID quoted in
+ *   the message);
+ * - `limit: 0` (the model has no quota on this tier);
+ * - a project spending cap;
+ * - a `RetryInfo.retryDelay` (or "Please retry in Xs") longer than 300s;
+ * - the Interactions API's `quota_exceeded` (daily quota) or
+ *   `payment_required` (prepaid credit depleted) codes, or HTTP 402;
+ * - outside a 429 only, a project without billing enabled.
+ *
+ * Every other 429 / RESOURCE_EXHAUSTED is retryable: per-minute quota IDs, a
+ * short `retryDelay`, or no structured detail at all. In particular the
+ * standard 429 sentence "You exceeded your current quota, please check your
+ * plan and billing details" is sent for per-minute limits too, so it is not a
+ * billing signal.
+ *
+ * Returns undefined when the error is not a quota or throttle failure.
+ */
+export function classifyGeminiQuotaError(error: unknown): GeminiQuotaVerdict | undefined {
+  const evidence = collectGoogleQuotaEvidence(error);
+  const text = evidence.texts.join('\n');
+  const { codes, status } = evidence;
+  if (codes.has('QUOTA_EXCEEDED') || codes.has('PAYMENT_REQUIRED') || status === 402) return 'terminal';
+  const throttled = status === 429
+    || codes.has('RESOURCE_EXHAUSTED')
+    || codes.has('RATE_LIMIT_EXCEEDED')
+    || codes.has('TOO_MANY_REQUESTS')
+    || /\bRESOURCE_EXHAUSTED\b/u.test(text);
+  if ((throttled || status === 400) && SPENDING_CAP_PATTERN.test(text)) return 'terminal';
+  if (!throttled) {
+    return BILLING_NOT_ENABLED_PATTERN.test(text) ? 'terminal' : undefined;
+  }
+  if (/limit:\s*0(?!\d|\.\d)/u.test(text.toLowerCase())) return 'terminal';
+
+  const violations = evidence.details
+    .filter((detail) => detail['@type'] === GOOGLE_RPC_QUOTA_FAILURE)
+    .flatMap((detail) => (Array.isArray(detail.violations) ? detail.violations as unknown[] : []))
+    .filter(isPlainRecord);
+  if (violations.some((violation) => typeof violation.quotaId === 'string'
+    && (violation.quotaId.includes('PerDay') || violation.quotaId.includes('Daily')))) {
+    return 'terminal';
+  }
+  if (violations.length === 0 && DAILY_QUOTA_ID_PATTERN.test(text)) return 'terminal';
+
+  const retryInfo = evidence.details.find((detail) => detail['@type'] === GOOGLE_RPC_RETRY_INFO);
+  let retryDelaySeconds = typeof retryInfo?.retryDelay === 'string'
+    ? parseDurationSeconds(retryInfo.retryDelay)
+    : undefined;
+  if (retryDelaySeconds === undefined) {
+    const match = /Please retry in ([0-9.]+(?:ms|s))/u.exec(text);
+    if (match?.[1]) retryDelaySeconds = parseDurationSeconds(match[1]);
+  }
+  if (retryDelaySeconds !== undefined && retryDelaySeconds > MAX_RETRYABLE_QUOTA_DELAY_SECONDS) {
+    return 'terminal';
+  }
+  return 'retryable';
+}
+
+/**
+ * Gemini quota failures that no retry inside one batch can fix. See
+ * {@link classifyGeminiQuotaError} for the rule; a per-minute
+ * RESOURCE_EXHAUSTED stays retryable.
+ */
+export function isGeminiQuotaExhaustedError(error: unknown): boolean {
+  return classifyGeminiQuotaError(error) === 'terminal';
+}
+
 /**
  * Detect transient Gemini API failures (rate-limit, quota, 5xx, overload,
  * network/timeout) that may succeed if retried with bounded backoff. The agent
  * loop retries these a few times before giving up rather than treating the
  * first 429/5xx as permanently fatal (audit H-17).
  */
-/**
- * Gemini quota failures that no retry inside one batch can fix: a per-day quota
- * (`...PerDay...` quota IDs), a model with `limit: 0` on this tier, or a project
- * without billing. A per-minute RESOURCE_EXHAUSTED stays retryable.
- */
-export function isGeminiQuotaExhaustedError(error: unknown): boolean {
-  const { status, code } = structuredErrorMetadata(error);
-  const message = error instanceof Error ? error.message : String(error);
-  const throttled = status === 429 || code === 'RESOURCE_EXHAUSTED' || /RESOURCE_EXHAUSTED/u.test(message);
-  if (!throttled) return false;
-  return /PerDay|per[ _-]?day/u.test(message)
-    || /\blimit:\s*0\b/u.test(message)
-    || /billing (?:account|details|is not enabled|has not been enabled)/iu.test(message);
-}
-
 export function isRetryableGeminiError(error: unknown): boolean {
   if (isFatalGeminiError(error)) return false;
-  if (isGeminiQuotaExhaustedError(error)) return false;
+  const quota = classifyGeminiQuotaError(error);
+  if (quota) return quota === 'retryable';
   const { status, code } = structuredErrorMetadata(error);
   if (status !== undefined) {
     return status === 408 || status === 409 || status === 429 || status >= 500;
   }
   if (code && [
     'ABORTED',
+    'API_ERROR',
     'DEADLINE_EXCEEDED',
     'EAI_AGAIN',
     'ECONNRESET',
     'ETIMEDOUT',
     'INTERNAL',
+    'RATE_LIMIT_EXCEEDED',
     'RESOURCE_EXHAUSTED',
+    'SERVICE_UNAVAILABLE',
+    'TOO_MANY_REQUESTS',
     'UNAVAILABLE',
   ].includes(code)) {
     return true;

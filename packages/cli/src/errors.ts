@@ -368,8 +368,11 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       return { code: 'PERMISSION_DENIED', category: 'authorization', retryable: false, hint: 'Verify that the credential and project are allowed to use this model or operation.' };
     }
     // Account-level quota/credit exhaustion (OpenAI `insufficient_quota`, HTTP
-    // 402, a Gemini per-day quota) arrives as a 429 or RESOURCE_EXHAUSTED, but
-    // no retry can clear it: say so instead of "retry later".
+    // 402, a Gemini per-day / `limit: 0` / spending-cap quota) arrives as a 429
+    // or RESOURCE_EXHAUSTED, but no retry can clear it: say so instead of
+    // "retry later". This is the same verdict the engine's retry loop uses, so
+    // `retryable` here never contradicts what the CLI actually did. A Gemini
+    // per-minute 429 falls through to the retryable branches below.
     if (isQuotaExhaustedError(current)) {
       return {
         code: 'RATE_LIMITED',
@@ -385,6 +388,7 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       || structuredCode === 'ENGINE_OVERLOADED_ERROR'
       || structuredCode === 'RATE_LIMIT_REACHED_ERROR'
       || structuredCode === 'PROVIDER_OVERLOADED'
+      || structuredCode === 'TOO_MANY_REQUESTS'
     ) {
       return { code: 'RATE_LIMITED', category: 'provider', retryable: true, hint: 'Retry later or lower request concurrency/rate.' };
     }
@@ -404,6 +408,8 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       || structuredCode === 'SERVER_ERROR'
       || structuredCode === 'SERVER'
       || structuredCode === 'SERVER_UNAVAILABLE'
+      || structuredCode === 'SERVICE_UNAVAILABLE'
+      || structuredCode === 'API_ERROR'
       || structuredCode === 'UNEXPECTED_OUTPUT'
       || structuredCode === 'CLIENT_CLOSED_REQUEST'
       || structuredCode === 'UNMAPPED'

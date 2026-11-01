@@ -512,3 +512,58 @@ describe('CLI exit errors', () => {
     });
   });
 });
+
+describe('Gemini quota verdicts (gemini-cli googleQuotaErrors rule)', () => {
+  const sentence = 'You exceeded your current quota, please check your plan and billing details. '
+    + 'For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.';
+  const body = (quotaIds: string[], retryDelay: string) => JSON.stringify({
+    error: {
+      code: 429,
+      message: sentence,
+      status: 'RESOURCE_EXHAUSTED',
+      details: [
+        {
+          '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+          violations: quotaIds.map((quotaId) => ({
+            quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests',
+            quotaId,
+            quotaDimensions: { location: 'global', model: 'gemini-2.5-flash-preview-image' },
+          })),
+        },
+        { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay },
+      ],
+    },
+  });
+
+  it('reports a per-minute 429 as a retryable rate limit, not a balance problem', () => {
+    const perMinute = Object.assign(
+      new Error(body(['GenerateRequestsPerMinutePerProjectPerModel-FreeTier'], '55s')),
+      { name: 'ApiError', status: 429 },
+    );
+    expect(ocrErrorPayload(perMinute, 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: true,
+      hint: 'Retry later or lower request concurrency/rate.',
+    });
+    expect(ocrErrorPayload(Object.assign(new Error(sentence), { status: 429 }), 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: true,
+    });
+  });
+
+  it('reports a daily quota or Interactions quota_exceeded as non-retryable', () => {
+    const perDay = Object.assign(
+      new Error(body(['GenerateRequestsPerDayPerProjectPerModel-FreeTier'], '55s')),
+      { name: 'ApiError', status: 429 },
+    );
+    expect(ocrErrorPayload(perDay, 1)).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+      hint: 'Check the provider account balance and quota before retrying.',
+    });
+    expect(ocrErrorPayload(Object.assign(new Error('Daily quota exceeded.'), { code: 'quota_exceeded' }), 1))
+      .toMatchObject({ code: 'RATE_LIMITED', retryable: false });
+    expect(ocrErrorPayload(Object.assign(new Error('Too many requests.'), { code: 'too_many_requests' }), 1))
+      .toMatchObject({ code: 'RATE_LIMITED', retryable: true });
+  });
+});
