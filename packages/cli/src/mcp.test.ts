@@ -906,6 +906,63 @@ describe('Open OCR MCP server', () => {
         expect(ok.result?.structuredContent).toMatchObject({ ok: true, total: 1 });
       });
 
+      it('reads file names with glob characters as the literal files they name', async () => {
+        const { cwd } = await workspace();
+        const names = ['Scan (1).jpg', 'inv[2].jpg', '{draft}.jpg', 'a!b.jpg', 'what?.jpg'];
+        for (const name of names) await writeFile(path.join(cwd, name), JPEG_BYTES);
+        for (const name of names) {
+          for (const input of [name, path.join(cwd, name)]) {
+            const reply = await extract(cwd, { inputs: [{ type: 'path', path: input }], dryRun: true, delivery: 'inline' });
+            expect(reply.result?.structuredContent, input).toMatchObject({ ok: true, status: 'validated', total: 1 });
+          }
+        }
+        // Still a glob when nothing has that exact name, and still refused outside.
+        const missing = await extract(cwd, { inputs: [{ type: 'path', path: path.join(cwd, 'Missing (9).jpg') }], dryRun: true, delivery: 'inline' });
+        expect(errorOf(missing).code).toBe('INPUT_NOT_FOUND');
+        const glob = await extract(cwd, { inputs: [{ type: 'path', path: path.join(cwd, '*.jpg') }], dryRun: true, delivery: 'inline' });
+        expect(glob.result?.structuredContent).toMatchObject({ ok: true, total: names.length + 1 });
+        // An absolute glob through another spelling of the working directory is
+        // judged by where its literal prefix resolves.
+        const alias = path.join(path.dirname(cwd), 'alias');
+        await symlink(cwd, alias);
+        const viaAlias = await extract(cwd, { inputs: [{ type: 'path', path: path.join(alias, '*.jpg') }], dryRun: true, delivery: 'inline' });
+        expect(viaAlias.result?.structuredContent).toMatchObject({ ok: true, total: names.length + 1 });
+      });
+
+      it.each([
+        'Project (2024)',
+        'scans[old]',
+        'drafts {a,b}',
+        'mixed (1) [2] {3} !4',
+      ])('serves a working directory named %s, with absolute paths and globs', async (name) => {
+        const { cwd: base, outside } = await workspace();
+        const cwd = path.join(base, name);
+        await mkdir(cwd);
+        await writeFile(path.join(cwd, 'scan.jpg'), JPEG_BYTES);
+        await writeFile(path.join(cwd, 'Page (2).jpg'), JPEG_BYTES);
+        await mkdir(path.join(cwd, 'sub'));
+        await writeFile(path.join(cwd, 'sub', 'deep.jpg'), JPEG_BYTES);
+        const run = async (input: string): Promise<JsonRpcReply> => extract(cwd, {
+          inputs: [{ type: 'path', path: input }], dryRun: true, delivery: 'inline',
+        });
+        for (const [input, total] of [
+          [path.join(cwd, 'scan.jpg'), 1],
+          [path.join(cwd, 'Page (2).jpg'), 1],
+          ['scan.jpg', 1],
+          [path.join(cwd, '*.jpg'), 2],
+          [path.join(cwd, '**', '*.jpg'), 3],
+          [`${path.join(cwd, 'sub')}${path.sep}*.jpg`, 1],
+          ['*.jpg', 2],
+        ] as const) {
+          const reply = await run(input);
+          expect(reply.result?.structuredContent, input).toMatchObject({ ok: true, status: 'validated', total });
+        }
+        for (const input of [path.join(cwd, '..', '*.jpg'), `${outside}/*.jpg`, path.join(cwd, '{..,sub}', '*.jpg')]) {
+          const reply = await run(input);
+          expect(errorOf(reply).code, input).toBe('INPUT_INVALID');
+        }
+      });
+
       it('refuses an outputDirectory outside the working directory or inside a hidden directory', async () => {
         const { cwd, home, outside } = await workspace();
         await mkdir(path.join(cwd, '.git'));
