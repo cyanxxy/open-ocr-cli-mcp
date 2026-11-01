@@ -22,12 +22,15 @@ export class ExtractionAttemptsError extends Error {
 }
 
 /**
- * One attempt that produced nothing for this long is treated as a hung
- * connection and retried, provided the document still has time for another try.
- * Non-final attempts get at most two thirds of the remaining document budget
- * (never less than {@link MIN_ATTEMPT_TIMEOUT_MS}); the final attempt keeps
- * whatever is left, so a slow-but-healthy request on the last try is never cut
- * short by this rule.
+ * Optional per-attempt timeout (off by default). When enabled, non-final
+ * attempts get at most two thirds of the remaining document budget (never less
+ * than {@link MIN_ATTEMPT_TIMEOUT_MS}) and a timed-out attempt is retried.
+ *
+ * It is not enabled for CLI or MCP runs: a non-streaming provider request gives
+ * no signal that separates a hung connection from a slow but healthy one (large
+ * PDFs with thinking routinely take minutes), so cutting an attempt short would
+ * re-send, and re-bill, work the provider is still doing. Each attempt instead
+ * inherits the document's own --timeout, as in 4.3.0.
  */
 const MIN_ATTEMPT_TIMEOUT_MS = 30_000;
 const ATTEMPT_BUDGET_FRACTION = 2 / 3;
@@ -55,6 +58,8 @@ export interface ProviderRetryOptions {
    * slightly earlier.
    */
   deadlineMs?: number;
+  /** Enable the per-attempt timeout described above. Off by default. */
+  perAttemptTimeout?: boolean;
   /** Override the per-attempt timeout floor (tests). */
   minAttemptTimeoutMs?: number;
 }
@@ -77,10 +82,9 @@ export function attemptTimeoutMs(
 /**
  * Run one provider operation under the CLI's bounded retry contract.
  *
- * Each attempt receives its own signal. It aborts with the document signal,
- * and — for every attempt but the last — after a per-attempt timeout, so a
- * connection that hangs without answering is retried instead of consuming
- * the whole document `--timeout`. A provider `Retry-After` (seconds or
+ * Each attempt receives its own signal, which aborts with the document signal
+ * (and, only when `perAttemptTimeout` is set, after a per-attempt timeout).
+ * A provider `Retry-After` (seconds or
  * HTTP-date, capped at 60s) replaces the jittered backoff, and a retry that
  * could not start before the document deadline is not attempted.
  */
@@ -93,11 +97,13 @@ export async function runWithProviderRetries<T>(
   const allowedAttempts = options.mode === 'agentic' ? 1 : options.retries + 1;
   const deadlineMs = retryOptions.deadlineMs ?? Date.now() + options.timeoutSeconds * 1000;
   for (let attempt = 1; attempt <= allowedAttempts; attempt += 1) {
-    const timeoutMs = attemptTimeoutMs(
-      deadlineMs - Date.now(),
-      allowedAttempts - attempt + 1,
-      retryOptions.minAttemptTimeoutMs,
-    );
+    const timeoutMs = retryOptions.perAttemptTimeout
+      ? attemptTimeoutMs(
+          deadlineMs - Date.now(),
+          allowedAttempts - attempt + 1,
+          retryOptions.minAttemptTimeoutMs,
+        )
+      : undefined;
     const attemptController = new AbortController();
     const relay = (): void => attemptController.abort(signal.reason);
     signal.addEventListener('abort', relay, { once: true });

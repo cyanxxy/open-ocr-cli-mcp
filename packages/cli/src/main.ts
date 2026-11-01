@@ -220,7 +220,7 @@ function addExtractOptions(command: Command): Command {
     .addOption(new Option('--progress <level>', 'agent progress detail').choices(['off', 'standard', 'detailed']))
     .option('-c, --concurrency <count>', 'parallel documents (1-16)')
     .option('--retries <count>', 'transient retries per document (0-10)')
-    .option('--timeout <seconds>', 'per-document time limit (a hung attempt is retried after 2/3 of the remaining time)')
+    .option('--timeout <seconds>', 'per-document time limit, shared by all retry attempts')
     .option('--max-files <count>', 'safety limit for matched documents')
     .option('--max-total-mb <megabytes>', 'safety limit for total input size')
     .option('--max-cost <usd>', 'block new requests and documents once estimated paid-tier cost reaches this value (cumulative across resumed runs of the output directory)')

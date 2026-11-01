@@ -142,11 +142,10 @@ Retries (`--retries`, simple and template modes) wait for the provider's
 at 60 s, instead of the jittered backoff; a requested wait that does not fit in
 the remaining `--timeout` fails the document at once with the provider error.
 Out-of-quota and out-of-credit responses (OpenAI `insufficient_quota`, billing
-limits, HTTP 402, Gemini per-day or zero-limit quotas) are never retried. Every
-attempt but the last is limited to two thirds of the remaining document budget
-(at least 30 s), so a hung connection is retried instead of consuming the whole
-`--timeout`; the last attempt keeps whatever time remains. Raise `--timeout` for
-documents that legitimately take longer than that.
+limits, HTTP 402, Gemini per-day or zero-limit quotas) are never retried.
+`--timeout` is one budget for the document, shared by all of its attempts; an
+attempt is never cut short and re-sent while the provider may still be working
+on it, because that would bill the same work twice.
 
 ## Output and resume
 

@@ -78,7 +78,7 @@ describe('provider retry timing', () => {
       options,
       new AbortController().signal,
       operation,
-      { deadlineMs: Date.now() + 6_000, minAttemptTimeoutMs: 100 },
+      { deadlineMs: Date.now() + 6_000, perAttemptTimeout: true, minAttemptTimeoutMs: 100 },
     );
     expect(result).toEqual({ value: 'second attempt', attempts: 2 });
     // Two thirds of a 6s budget, not the full 6s.
