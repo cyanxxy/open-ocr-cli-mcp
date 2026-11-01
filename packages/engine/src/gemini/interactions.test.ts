@@ -215,6 +215,56 @@ describe('runModelInteraction', () => {
     );
   });
 
+  it('opts streamed calls out of @google/genai automatic continuation (one hop per assembled stream)', async () => {
+    async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
+      yield { event_type: 'interaction.created', interaction: { id: 'hop-1', status: 'in_progress' } };
+      yield { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } };
+      yield { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'Partial page' } };
+      yield { event_type: 'step.stop', index: 0 };
+      // The single hop stops at the per-request decode limit (2.32 status).
+      yield {
+        event_type: 'interaction.completed',
+        interaction: {
+          id: 'hop-1',
+          status: 'requires_continuation',
+          continuation_token: 'tok-1',
+          usage: { total_input_tokens: 10, total_output_tokens: 2, total_tokens: 12 },
+        },
+      };
+    }
+    mockInteractionCreate.mockResolvedValueOnce(events());
+    const runtime = createProviderExecutionContext();
+    await expect(runModelInteraction({
+      apiKey: 'test-key',
+      model: 'gemini-3.8-flash',
+      input: 'Extract text',
+      runtime,
+      onProgress: () => undefined,
+    })).rejects.toThrow('reached the output token limit');
+    expect(mockInteractionCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ stream: true, automatic_continuation: false }),
+      undefined,
+    );
+    // The billed hop is still accounted for.
+    expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
+  });
+
+  it('reports a unary interaction the SDK could not continue as truncated output', async () => {
+    mockInteractionCreate.mockResolvedValueOnce({
+      id: 'unary-hop',
+      status: 'requires_continuation',
+      continuation_token: 'tok-2',
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'Partial' }] }],
+    });
+    await expect(runModelInteraction({
+      apiKey: 'test-key',
+      model: 'gemini-3.8-flash',
+      input: 'Extract text',
+    })).rejects.toThrow('reached the output token limit');
+    expect(mockInteractionCreate.mock.calls[0]?.[0]).not.toHaveProperty('automatic_continuation');
+  });
+
   it('preserves output_text supplied only by the terminal streaming event', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
       await Promise.resolve();

@@ -72,6 +72,11 @@ describe('assertCompleteGeminiResponse', () => {
       .not.toThrow();
   });
 
+  it('reports an uncontinued CONTINUATION stop (@google/genai >= 2.26) as truncated output', () => {
+    expect(() => assertCompleteGeminiResponse({ candidates: [{ finishReason: 'CONTINUATION' }] }))
+      .toThrow(/reached the output token limit/i);
+  });
+
   it('rejects a candidate without a terminal finish reason', () => {
     expect(() => assertCompleteGeminiResponse({ candidates: [{}] }))
       .toThrow(/without a terminal finish reason/i);

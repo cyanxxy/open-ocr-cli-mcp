@@ -71,7 +71,10 @@ interface GeminiResponseStatus {
 
 function assertNotFailedFinishReason(finishReason: string | undefined, operation: string): void {
   if (!finishReason || finishReason === 'STOP') return;
-  if (finishReason === 'MAX_TOKENS') {
+  // CONTINUATION (@google/genai >= 2.26): the per-request decode limit was hit.
+  // The SDK resumes such responses automatically; one that still surfaces here
+  // could not be continued and is just as incomplete as MAX_TOKENS.
+  if (finishReason === 'MAX_TOKENS' || finishReason === 'CONTINUATION') {
     throw new Error(
       `${operation} reached the output token limit and returned incomplete output. `
       + 'Increase the output-token limit or lower the thinking level and retry.',

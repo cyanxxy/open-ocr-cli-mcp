@@ -1,4 +1,4 @@
-import type { Content, FunctionDeclaration, Interactions } from '@google/genai';
+import type { AutomaticContinuationOption, Content, FunctionDeclaration, Interactions } from '@google/genai';
 import { getGenAIClient, normalizeThinkingLevel } from './client';
 import type { GeminiModel, ThinkingConfig } from './types';
 import {
@@ -395,6 +395,21 @@ export function summarizeUrlContextResults(steps?: InteractionStep[]): UrlContex
   }, { hasToolError: false, results: [] });
 }
 
+/**
+ * `requires_continuation` (added to the Interactions API with @google/genai
+ * 2.29) means the decode stopped at the per-request token limit with a
+ * `continuation_token`: the output is incomplete. Report it the way a
+ * MAX_TOKENS stop is reported, never as a finished interaction.
+ */
+function assertInteractionNotTruncated(status: string | undefined): void {
+  if (status === 'requires_continuation') {
+    throw new Error(
+      'Gemini interaction reached the output token limit for a single request (status requires_continuation) '
+      + 'and returned incomplete output. Lower the thinking level or split the document and retry.',
+    );
+  }
+}
+
 function buildResponseFormat(
   responseSchema?: Record<string, unknown>,
   responseMimeType?: 'application/json' | 'text/plain',
@@ -461,6 +476,10 @@ export async function runModelInteraction({
       model,
       runtime,
     );
+    // Unary calls keep the SDK's default automatic continuation: it merges the
+    // hops into one Interaction (steps concatenated, usage summed), so only a
+    // continuation it could not finish reaches this check.
+    assertInteractionNotTruncated(interaction.status);
     return {
       id: interaction.id,
       status: interaction.status,
@@ -469,9 +488,16 @@ export async function runModelInteraction({
     };
   }
 
-  const params: Interactions.CreateModelInteractionParamsStreaming = {
+  // Since @google/genai 2.32 a streamed create() auto-continues by default and
+  // yields every hop's events in order, including a fresh interaction.created,
+  // restarted step indexes, and an intermediate interaction.completed per hop.
+  // This consumer assembles one interaction, so it would keep only the last
+  // hop's steps and usage. Take the single server response instead and report
+  // a `requires_continuation` stop as truncated output.
+  const params: Interactions.CreateModelInteractionParamsStreaming & AutomaticContinuationOption = {
     ...common,
     stream: true,
+    automatic_continuation: false,
   };
   const stream = await withReadableProviderErrors(() => genAI.interactions.create(
     params,
@@ -660,6 +686,7 @@ export async function runModelInteraction({
     throw new Error('Gemini interaction stream ended without a terminal interaction.completed event');
   }
   if (!interactionId) throw new Error('Gemini interaction stream returned no interaction ID');
+  assertInteractionNotTruncated(status);
   const finalSteps = completedSteps
     ?? [...steps.entries()].sort(([left], [right]) => left - right).map(([, step]) => step);
   return {
