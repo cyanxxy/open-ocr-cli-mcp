@@ -938,6 +938,7 @@ export function resolveCliOptions(
       OCR_REQUEST_LIMITS.maxTotalMb.max,
     ),
     excludes: [...(fileConfig.exclude ?? []), ...(flags.exclude ?? [])],
+    configExcludes: (fileConfig.exclude ?? []).filter((pattern) => !(flags.exclude ?? []).includes(pattern)),
     instructions: [...(fileConfig.instructions ?? []), ...(flags.instruction ?? [])],
     hidden: flags.hidden ?? fileConfig.hidden ?? DEFAULT_CONFIG.hidden,
     defaultExcludes: flags.defaultExcludes ?? fileConfig.defaultExcludes ?? DEFAULT_CONFIG.defaultExcludes,

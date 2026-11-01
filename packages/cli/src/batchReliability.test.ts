@@ -295,6 +295,50 @@ describe('input discovery', () => {
     expect(glob.inputs.map((input) => input.name)).toEqual(['keep.jpg']);
   });
 
+  it.each(['scans{a,b}', 'scans[1]', 'scans(2)', 'a{b}[c](d)!+@'])(
+    'applies a cwd-relative exclude when the working directory has glob characters (%s)',
+    async (name) => {
+      const cwd = path.join(directory, name);
+      await mkdir(path.join(cwd, 'docs', 'drafts'), { recursive: true });
+      await writeFile(path.join(cwd, 'docs', 'keep.jpg'), JPEG_BYTES);
+      await writeFile(path.join(cwd, 'docs', 'drafts', 'skip.jpg'), JPEG_BYTES);
+      const options = {
+        ...resolveCliOptions({ output: path.join(cwd, 'out'), exclude: ['docs/drafts/**'] }, {}, cwd),
+        apiKey: 'test-key',
+      };
+      const scan = await discoverInputSet(['docs'], options);
+      expect(scan.inputs.map((input) => input.name)).toEqual(['keep.jpg']);
+      expect(scan.skipped.unmatchedExcludes).toBeUndefined();
+    },
+  );
+
+  it('reports only command-line excludes that matched nothing, and only after a walk', async () => {
+    const docs = await seedDocs(['keep.jpg']);
+    const resolve = (flags: Record<string, unknown>, config: Record<string, unknown>): ResolvedCliOptions => ({
+      ...resolveCliOptions({ output: path.join(directory, 'out'), ...flags }, config, directory),
+      apiKey: 'test-key',
+    });
+    // Config-file excludes are ambient: never reported, even after a walk.
+    const fromConfig = await discoverInputSet([docs], resolve({}, { exclude: ['nothing/**'] }));
+    expect(fromConfig.skipped.unmatchedExcludes).toBeUndefined();
+    // A single named file never consults excludes, so nothing is reported.
+    const singleFile = await discoverInputSet(
+      [path.join(docs, 'keep.jpg')],
+      resolve({ exclude: ['flagged/**'] }, { exclude: ['nothing/**'] }),
+    );
+    expect(singleFile.skipped.unmatchedExcludes).toBeUndefined();
+    expect(describeDiscoverySkips(singleFile.skipped)).toBeUndefined();
+    // A directory scan reports the command-line pattern, not the config one.
+    const scan = await discoverInputSet([docs], resolve({ exclude: ['flagged/**'] }, { exclude: ['nothing/**'] }));
+    expect(scan.skipped.unmatchedExcludes).toEqual(['flagged/**']);
+    // A pattern given both ways counts as given on the command line.
+    const both = await discoverInputSet([docs], resolve({ exclude: ['nothing/**'] }, { exclude: ['nothing/**'] }));
+    expect(both.skipped.unmatchedExcludes).toEqual(['nothing/**']);
+    // A glob walk counts as a walk.
+    const glob = await discoverInputSet(['docs/*.jpg'], resolve({ exclude: ['flagged/**'] }, {}));
+    expect(glob.skipped.unmatchedExcludes).toEqual(['flagged/**']);
+  });
+
   it('extracts a symlink and its target once', async () => {
     const docs = await seedDocs(['real.jpg']);
     await symlink(path.join(docs, 'real.jpg'), path.join(directory, 'link.jpg'));
