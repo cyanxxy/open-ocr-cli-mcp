@@ -84,7 +84,8 @@ open-ocr-cli extract invoice.pdf --schema examples/invoice.schema.json --format 
 # Iterative extraction for hard documents (several billed requests)
 open-ocr-cli extract contract.pdf --mode agentic --format json
 
-# A folder, with a spend cap; rerun the same command to resume
+# A folder, with a spend cap for the whole job; rerun the same command to
+# resume (finished documents are skipped, and the $2 cap counts every run)
 open-ocr-cli extract ./scans --output ./ocr --max-cost 2
 
 # Public web pages
@@ -93,6 +94,12 @@ open-ocr-cli web https://example.com/pricing
 # Check the plan without a key or any request
 open-ocr-cli extract ./scans --dry-run
 ```
+
+Batches are crash-safe: a run killed at any point resumes with the same
+command, re-extracting only documents whose content changed or that never
+finished. `--max-cost` is enforced on the directory's cumulative spend, and fails
+closed when a paid provider returns no usage. `status` shows last-run and
+cumulative usage, interrupted documents, untracked files, and stale locks.
 
 Other commands: `init` (guided config), `doctor` (environment check),
 `status` (inspect a batch), `models`, `providers`, `presets`. Run any command

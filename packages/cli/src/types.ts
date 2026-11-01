@@ -298,13 +298,33 @@ export interface BatchSummary {
   usage: ProviderUsageSnapshot;
   costLimitUsd?: number;
   costLimitReached: boolean;
+  /**
+   * Spend recorded for this output directory across every resumed run,
+   * including this one. `--max-cost` is enforced against this total.
+   */
+  cumulativeUsage?: ProviderUsageSnapshot;
   results: OcrJobResult[];
 }
 
 export interface ManifestEntry {
   fingerprint: string;
-  status: 'succeeded' | 'partial' | 'failed';
+  /**
+   * 2 = content-hash fingerprint (path, size, SHA-256, options). Absent on
+   * entries written by releases that fingerprinted path, size, and mtime.
+   */
+  fingerprintVersion?: 2;
+  /**
+   * `pending` is an in-progress claim written before artifacts are committed,
+   * so a process killed between the artifact commit and the final manifest
+   * update leaves files resume recognises as its own and re-extracts.
+   */
+  status: 'succeeded' | 'partial' | 'failed' | 'pending';
   outputFiles: string[];
+  /**
+   * Every artifact path this entry has written or claimed, across format
+   * changes and interrupted attempts. Resume may replace any of them.
+   */
+  ownedFiles?: string[];
   completedAt: string;
   error?: string;
 }
@@ -312,4 +332,6 @@ export interface ManifestEntry {
 export interface CliManifest {
   version: 1;
   entries: Record<string, ManifestEntry>;
+  /** Cumulative provider usage of every run recorded in this output directory. */
+  usage?: ProviderUsageSnapshot;
 }

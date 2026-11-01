@@ -1,12 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { CliExitError } from './errors';
 import { inspectBatchStatus, renderBatchStatus } from './status';
-import { BatchOutputLock } from './output';
+import { BatchOutputLock, processStartIdentity } from './output';
 
 let directory: string;
 
@@ -216,10 +216,75 @@ describe('CLI batch status', () => {
         healthy: false,
         activeLock: { ownerValid: true, pid: process.pid },
       });
-      expect(renderBatchStatus(report)).toContain('Status: batch in progress or stale lock');
+      expect(report.activeLock?.state).toBe('live');
+      expect(renderBatchStatus(report)).toContain('Status: batch in progress');
     } finally {
       await lock.release();
     }
+  });
+
+  it('tells a stale lock (dead or reused PID) apart from a live one', async () => {
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(batchSummary([
+      { status: 'succeeded' },
+    ])));
+    // PID 1 is always alive; a mismatched start identity marks it as reused.
+    await writeFile(path.join(directory, '.open-ocr.lock'), JSON.stringify({
+      version: 1,
+      token: 'stale',
+      pid: 1,
+      hostname: hostname(),
+      startedAt: '2026-07-15T00:00:00.000Z',
+      processStart: 'linux:not-this-boot:1',
+    }));
+    const report = await inspectBatchStatus('.', directory);
+    if (processStartIdentity(1) !== undefined) {
+      expect(report.activeLock?.state).toBe('stale');
+      expect(renderBatchStatus(report)).toContain('Status: interrupted (stale lock)');
+    }
+    expect(report.healthy).toBe(false);
+  });
+
+  it('reports interrupted claims, untracked artifacts, stray temp files, and cumulative usage', async () => {
+    const source = path.join(directory, 'a.png');
+    await writeFile(source, 'x');
+    const owned = path.join(directory, 'a.md');
+    const previous = path.join(directory, 'a.json');
+    await writeFile(owned, '# a');
+    await writeFile(previous, '{}');
+    await writeFile(path.join(directory, 'stray.md'), '# not ours');
+    await writeFile(path.join(directory, 'a.md.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'), 'partial');
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [source]: {
+          fingerprint: 'abc',
+          fingerprintVersion: 2,
+          status: 'pending',
+          outputFiles: [],
+          ownedFiles: [owned, previous],
+          completedAt: '2026-07-15T00:00:00.000Z',
+        },
+      },
+      usage: { ...usage, requests: 5, estimatedCostUsd: 0.25 },
+    }));
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(batchSummary([
+      { status: 'succeeded' },
+    ])));
+
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.untrackedArtifacts).toEqual([path.join(directory, 'stray.md')]);
+    expect(report.strayTempFiles).toEqual([
+      path.join(directory, 'a.md.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'),
+    ]);
+    expect(report.counts).toMatchObject({ interrupted: 1, untrackedArtifacts: 1, strayTempFiles: 1 });
+    expect(report.cumulativeUsage).toMatchObject({ requests: 5, estimatedCostUsd: 0.25 });
+    expect(report.healthy).toBe(false);
+    const rendered = renderBatchStatus(report);
+    expect(rendered).toContain('Interrupted: 1 document(s)');
+    expect(rendered).toContain('Untracked files: 1');
+    expect(rendered).toContain('Leftover temp files: 1');
+    expect(rendered).toContain('Usage (last run): 120 tokens, 2 requests');
+    expect(rendered).toContain('Usage (all runs): 120 tokens, 5 requests, estimated $0.250000');
   });
 
   it('rejects summaries missing health-critical fields', async () => {

@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import type { AgentStep } from '@open-ocr/engine/agentTypes';
 import {
   createProviderExecutionContext,
@@ -11,7 +13,8 @@ import {
   type CliExitCode,
   type OcrErrorPayload,
 } from './errors';
-import { inputFingerprint, readAndValidateInput } from './inputs';
+import { inputContentSha256, inputFingerprint, readAndValidateInput } from './inputs';
+import { addUsageSnapshots } from './manifest';
 import { assertProviderMediaTypeSupported } from './providerInputs';
 import {
   assertArtifactFormatAvailable,
@@ -20,8 +23,12 @@ import {
   artifactTargetFromPath,
   BatchOutputLock,
   defaultOutputDirectory,
+  findStaleTransactionFiles,
   ManifestStore,
   plannedArtifactTargets,
+  possibleArtifactTargets,
+  recoverStaleTransactionFiles,
+  type ManifestFingerprints,
   resolvesToSingleArtifactFile,
   STDIN_MANIFEST_KEY,
   writeArtifacts,
@@ -222,6 +229,22 @@ export function modeFingerprint(options: ResolvedCliOptions): string {
     confidenceThreshold: options.confidenceThreshold,
     customSchema: options.customSchema,
   });
+}
+
+/** Run `task` over `items` with at most `limit` in flight (bounded file handles). */
+async function forEachLimited<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await task(items[index], index);
+    }
+  }));
 }
 
 function errorMessage(error: unknown): string {
@@ -439,7 +462,7 @@ export class OcrJobService {
           throw asCliExitError(error, 2);
         }
       }
-      summary = await this.runBatchInternal(inputs, options, runtime, events, providerRuntime, plan);
+      summary = await this.runBatchInternal(inputs, options, runtime, events, providerRuntime, plan, warn);
     } catch (error) {
       failure = error;
     }
@@ -498,6 +521,7 @@ export class OcrJobService {
     events: EventDispatcher,
     providerRuntime: ProviderExecutionContext,
     plan: OutputPlan,
+    warn: (message: string) => void,
   ): Promise<BatchSummary> {
     const started = performance.now();
     const startedAt = new Date().toISOString();
@@ -520,9 +544,77 @@ export class OcrJobService {
       throw asCliExitError(error, 2);
     }
     const fingerprintMode = modeFingerprint(options);
-    const resumableEntries = new Map<number, ManifestEntry>();
+    const resumableEntries = new Map<number, ManifestEntry & { legacyFingerprint?: true }>();
     const staleArtifacts = new Map<number, ReadonlySet<string>>();
     const resumeActive = Boolean(options.resume) && manifest !== undefined;
+    const outputDirectory = defaultOutputDirectory(options);
+    // Resume compares content, so every input is hashed once up front. Only a
+    // run that keeps a manifest needs it; bounded so a large batch does not
+    // open every file at once.
+    const fingerprints = new Array<ManifestFingerprints>(inputs.length);
+    if (manifest) {
+      await forEachLimited(inputs, 8, async (input, index) => {
+        const contentSha256 = await inputContentSha256(input);
+        fingerprints[index] = {
+          current: inputFingerprint(input, fingerprintMode, contentSha256),
+          legacy: inputFingerprint(input, fingerprintMode),
+        };
+      });
+      // A process killed mid-commit leaves `<artifact>.<pid>-<uuid>.tmp|.bak`
+      // beside its targets (and the manifest/summary). This run holds the
+      // batch lock, so no live writer can own them: restore orphaned backups
+      // and remove staging files. A dry run only reports them.
+      const transactionTargets = new Set<string>([
+        manifest.path,
+        path.join(outputDirectory, 'batch-summary.json'),
+        path.join(outputDirectory, '.open-ocr.lock'),
+        ...manifest.allOwnedArtifactPaths(),
+      ]);
+      for (const input of inputs) {
+        for (const target of await possibleArtifactTargets(input, options, inputs.length)) {
+          transactionTargets.add(target.path);
+        }
+      }
+      try {
+        if (options.dryRun) {
+          const leftovers = await findStaleTransactionFiles(transactionTargets);
+          if (leftovers.length > 0) {
+            warn(
+              `${leftovers.length} leftover staging/backup file(s) from an interrupted run in ${outputDirectory} `
+              + 'would be cleaned up by a live run.',
+            );
+          }
+        } else {
+          const recovered = await recoverStaleTransactionFiles(transactionTargets);
+          if (recovered.removed.length > 0 || recovered.restored.length > 0) {
+            warn(
+              `Recovered an interrupted run in ${outputDirectory}: removed ${recovered.removed.length} stale `
+              + `staging file(s), restored ${recovered.restored.length} artifact backup(s).`,
+            );
+          }
+        }
+      } catch (error) {
+        throw asCliExitError(error, 2);
+      }
+    }
+    // `--max-cost` bounds the job, not each rerun: a resumed run starts from
+    // the spend the manifest already recorded for this output directory.
+    // `--overwrite` and `--no-resume` start a fresh job, and a fresh total.
+    const priorUsage = resumeActive && !options.overwrite ? manifest?.recordedUsage() : undefined;
+    if (priorUsage) providerRuntime.setPriorCostUsd(priorUsage.estimatedCostUsd);
+    const cumulativeUsage = (): ReturnType<typeof providerRuntime.getUsage> => (
+      addUsageSnapshots(priorUsage, providerRuntime.getUsage())
+    );
+    manifest?.setUsageSource(cumulativeUsage);
+    const priorCostReachedLimit = priorUsage !== undefined && options.maxCostUsd !== undefined
+      && priorUsage.estimatedCostUsd >= options.maxCostUsd;
+    if (priorCostReachedLimit) {
+      warn(
+        `Estimated spend already recorded for ${outputDirectory} ($${priorUsage.estimatedCostUsd.toFixed(6)} across earlier runs) `
+        + `reaches --max-cost $${options.maxCostUsd!.toFixed(6)}; no new documents will be extracted. `
+        + 'Raise --max-cost to continue this job.',
+      );
+    }
     // Runs regardless of --dry-run. An occupied destination is checkable without
     // a credential and without a provider call, so a dry run that stayed silent
     // about it would approve a job the live run rejects. Resolving resume state
@@ -531,9 +623,8 @@ export class OcrJobService {
     try {
       await Promise.all(inputs.map(async (input, index) => {
         const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
-        const fingerprint = inputFingerprint(input, fingerprintMode);
         const completedEntry = resumeActive && !options.overwrite
-          ? await manifest?.completedEntry(key, fingerprint)
+          ? await manifest?.completedEntry(key, fingerprints[index])
           : undefined;
         if (completedEntry) {
           resumableEntries.set(index, completedEntry);
@@ -552,6 +643,7 @@ export class OcrJobService {
           await assertArtifactTargetsAvailable(input, options, inputs.length, {
             reclaimable,
             resumeActive,
+            resumeDisabled: manifest !== undefined && !options.resume,
           });
         }
       }));
@@ -563,6 +655,37 @@ export class OcrJobService {
     let completed = 0;
     let failFastTriggered = false;
     let costLimitReached = false;
+    let usageGapReported = false;
+    // Usage telemetry gaps are reported once per run, on both surfaces.
+    const reportUsageGaps = (): void => {
+      if (usageGapReported) return;
+      const unreported = providerRuntime.getUsage().unreportedUsageRequests ?? 0;
+      if (unreported === 0) return;
+      usageGapReported = true;
+      if (providerRuntime.wasUsageUnknownUnderCostLimit()) {
+        costLimitReached = true;
+        warn(
+          `The provider returned no token usage for ${unreported} request(s), so spend cannot be checked against `
+          + `--max-cost $${options.maxCostUsd?.toFixed(6)}. No further paid documents will be started (fail closed).`,
+        );
+        return;
+      }
+      warn(
+        `The provider returned no token usage for ${unreported} request(s); token and estimated cost totals `
+        + 'undercount this run.',
+      );
+    };
+
+    const resumedResult = (index: number, startedAt: string, startMs: number): OcrJobResult => {
+      const entry = resumableEntries.get(index)!;
+      return {
+        status: 'skipped', input: inputs[index], provider: options.provider, gateway: options.gateway,
+        mode: options.mode, model: options.model, startedAt,
+        completedAt: new Date().toISOString(), durationMs: performance.now() - startMs,
+        attempts: 0, outputFiles: entry.outputFiles,
+        outputArtifacts: entry.outputFiles.map(artifactTargetFromPath), skipReason: 'resumed',
+      };
+    };
 
     const publishResult = async (index: number, result: OcrJobResult): Promise<void> => {
       completed += 1;
@@ -586,7 +709,11 @@ export class OcrJobService {
       while (!runtime.abortController.signal.aborted && !failFastTriggered && !costLimitReached) {
         const index = cursor;
         if (index >= inputs.length) return;
-        if (providerRuntime.hasReachedCostLimit()) {
+        // Only paid work is gated: an unchanged document a resume skips costs
+        // nothing, so a job whose recorded spend reached the cap still reports
+        // its finished documents as resumed.
+        const needsProvider = !options.dryRun && !resumableEntries.has(index);
+        if (needsProvider && providerRuntime.hasReachedCostLimit()) {
           costLimitReached = true;
           return;
         }
@@ -595,7 +722,7 @@ export class OcrJobService {
         const jobStart = performance.now();
         const jobStartedAt = new Date().toISOString();
         const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
-        const fingerprint = inputFingerprint(input, fingerprintMode);
+        const fingerprint = fingerprints[index]?.current ?? '';
         await events.emit({
           type: 'document.started',
           documentId: documentIds[index],
@@ -631,13 +758,13 @@ export class OcrJobService {
             if (options.failFast) failFastTriggered = true;
           }
         } else if (completedEntry) {
-          const outputArtifacts = completedEntry.outputFiles.map(artifactTargetFromPath);
-          result = {
-            status: 'skipped', input, provider: options.provider, gateway: options.gateway,
-            mode: options.mode, model: options.model, startedAt: jobStartedAt,
-            completedAt: new Date().toISOString(), durationMs: performance.now() - jobStart,
-            attempts: 0, outputFiles: completedEntry.outputFiles, outputArtifacts, skipReason: 'resumed',
-          };
+          result = resumedResult(index, jobStartedAt, jobStart);
+          if (completedEntry.legacyFingerprint) {
+            // Recorded by a release that fingerprinted size and mtime only.
+            // Trusted once, then upgraded so every later resume compares content.
+            const { legacyFingerprint: _legacy, ...entry } = completedEntry;
+            await manifest?.update(key, { ...entry, fingerprint, fingerprintVersion: 2 });
+          }
         } else {
           const timeoutController = new AbortController();
           const relayAbort = (): void => timeoutController.abort(runtime.abortController.signal.reason);
@@ -699,6 +826,21 @@ export class OcrJobService {
             if (deliveryMode === 'inline') {
               assertArtifactFormatAvailable(artifacts, options.format);
             }
+            if (manifest && shouldWriteFiles) {
+              // Claim every destination before committing any of them. A kill
+              // between the artifact commit and the final update below then
+              // leaves files a resume recognises as this input's own (and
+              // re-extracts) instead of untracked files that fail the batch.
+              const previous = manifest.entry(key);
+              await manifest.update(key, {
+                fingerprint,
+                fingerprintVersion: 2,
+                status: 'pending',
+                outputFiles: previous?.outputFiles ?? [],
+                ownedFiles: (await possibleArtifactTargets(input, options, inputs.length)).map((target) => target.path),
+                completedAt: new Date().toISOString(),
+              });
+            }
             const outputArtifacts = shouldWriteFiles
               ? await writeArtifacts(input, artifacts, options, inputs.length, staleArtifacts.get(index))
               : undefined;
@@ -721,6 +863,7 @@ export class OcrJobService {
             };
             await manifest?.update(key, {
               fingerprint,
+              fingerprintVersion: 2,
               status: jobStatus,
               outputFiles: outputFiles ?? [],
               completedAt: result.completedAt,
@@ -757,11 +900,12 @@ export class OcrJobService {
             // skipped/cancelled status through the machine and batch contracts.
             await manifest?.update(key, {
               fingerprint,
+              fingerprintVersion: 2,
               status: 'failed',
               // A failed replacement leaves the previous artifact transaction
-              // intact. Retain its ownership so the next resume can replace
-              // those stale files instead of rejecting them as untracked.
-              outputFiles: [...(manifest?.recordedArtifactPaths(key) ?? [])],
+              // intact. Its paths stay owned (the store merges every recorded
+              // path into ownedFiles), so the next resume can replace them.
+              outputFiles: manifest?.entry(key)?.outputFiles ?? [],
               completedAt: result.completedAt,
               error: failure.error,
             });
@@ -770,6 +914,7 @@ export class OcrJobService {
             clearTimeout(timeout);
             runtime.abortController.signal.removeEventListener('abort', relayAbort);
           }
+          reportUsageGaps();
         }
         await publishResult(index, result);
       }
@@ -792,23 +937,47 @@ export class OcrJobService {
     if (rejected?.status === 'rejected') {
       throw rejected.reason instanceof Error ? rejected.reason : new Error(errorMessage(rejected.reason));
     }
+    const costLimitReason = providerRuntime.wasUsageUnknownUnderCostLimit()
+      ? `Not started because the provider reported no token usage, so spend could not be checked against --max-cost $${options.maxCostUsd?.toFixed(4)}`
+      : (priorUsage?.estimatedCostUsd ?? 0) > 0
+        ? `Not started because the estimated cost recorded for this output directory across resumed runs reached --max-cost $${options.maxCostUsd?.toFixed(4)}`
+        : `Not started because the estimated cost reached --max-cost $${options.maxCostUsd?.toFixed(4)}`;
+    const costLimitHint = providerRuntime.wasUsageUnknownUnderCostLimit()
+      ? 'This route returns no token usage, so --max-cost cannot bound its spend. Use a provider or model that '
+        + 'reports usage, or rerun without --max-cost to accept unmetered spend.'
+      : (priorUsage?.estimatedCostUsd ?? 0) > 0
+        ? 'The cap covers every resumed run of this output directory (see `status`); rerun with a higher '
+          + '--max-cost to continue, or accept the partial batch.'
+        : 'Rerun the remaining documents with a higher --max-cost, or accept the partial batch.';
     const unscheduledReason = runtime.abortController.signal.aborted
       ? 'Not started because the batch was cancelled'
       : costLimitReached
-        ? `Not started because the estimated cost reached --max-cost $${options.maxCostUsd?.toFixed(4)}`
+        ? costLimitReason
         : 'Not started because --fail-fast stopped the batch';
     const unscheduledSkipReason: OcrJobResult['skipReason'] = runtime.abortController.signal.aborted
       ? 'cancelled'
       : costLimitReached ? 'cost-limit' : 'fail-fast';
     for (let index = 0; index < inputs.length; index += 1) {
       if (results[index]) continue;
+      if (unscheduledSkipReason === 'cost-limit' && resumableEntries.has(index)) {
+        // An unchanged, already-finished document needs no paid work.
+        await events.emit({
+          type: 'document.started',
+          documentId: documentIds[index],
+          index,
+          total: inputs.length,
+          source: inputs[index].displayPath,
+        });
+        await publishResult(index, resumedResult(index, new Date().toISOString(), performance.now()));
+        continue;
+      }
       const timestamp = new Date().toISOString();
       const failure = unscheduledSkipReason === 'cancelled'
         ? documentFailure(new CliExitError(unscheduledReason, 130))
         : unscheduledSkipReason === 'cost-limit'
           ? documentFailure(new CliExitError(unscheduledReason, 1, {
               code: 'COST_LIMIT', category: 'limit', retryable: false,
-              hint: 'Rerun the remaining documents with a higher --max-cost, or accept the partial batch.',
+              hint: costLimitHint,
             }))
           : documentFailure(new CliExitError(unscheduledReason, 1, {
               code: 'NOT_RUN', category: 'execution', retryable: true,
@@ -852,7 +1021,10 @@ export class OcrJobService {
       model: options.model,
       usage: providerRuntime.getUsage(),
       costLimitUsd: options.maxCostUsd,
-      costLimitReached: costLimitReached || providerRuntime.wasCostLimitDenied(),
+      costLimitReached: costLimitReached
+        || providerRuntime.wasCostLimitDenied()
+        || providerRuntime.wasUsageUnknownUnderCostLimit(),
+      ...(manifest ? { cumulativeUsage: cumulativeUsage() } : {}),
       results: finishedResults,
     };
     // Gated on the manifest, not the document count: `needsManifest` is exactly
@@ -862,6 +1034,8 @@ export class OcrJobService {
     // manifest and lock, and then wrote no summary — leaving `status` with
     // nothing to report for a run the docs say is auditable.
     if (needsManifest && !options.dryRun) {
+      // Persist the final cumulative usage even when every document resumed.
+      await manifest?.flush();
       await writeBatchSummary(
         { ...summary, results: summary.results.map(persistedJobResult) },
         defaultOutputDirectory(options),
