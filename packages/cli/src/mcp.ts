@@ -256,7 +256,7 @@ const limits = OCR_REQUEST_LIMITS;
 
 const sharedFields = {
   configPath: z.string().min(1).optional()
-    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys; routing and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys, or token prices; routing, prices, and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
   noConfig: z.boolean().optional()
     .describe('Ignore configuration files and the project .env. Cannot be combined with configPath. The operator\'s limits still apply, as do environment overrides; pass explicit provider/model/options for reproducibility.'),
   provider: z.enum(PROVIDER_IDS).optional()

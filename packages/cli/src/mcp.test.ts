@@ -968,6 +968,43 @@ describe('Open OCR MCP server', () => {
         expect(viaFile.result?.structuredContent).toMatchObject({ ok: true, costLimitUsd: 0.01 });
       });
 
+      it('refuses prices from a caller configPath or the project file, which would defeat the cost ceiling', async () => {
+        const { cwd, home } = await workspace();
+        await writeOperatorConfig(home, { maxCostUsd: 0.01 });
+        const free = { inputPricePerMillionUsd: 0, outputPricePerMillionUsd: 0 };
+        await writeFile(path.join(cwd, 'free.json'), JSON.stringify(free));
+        const viaConfigPath = await extract(cwd, {
+          inputs: [{ type: 'path', path: 'scan.jpg' }], configPath: 'free.json', dryRun: true, delivery: 'inline',
+        });
+        expect(errorOf(viaConfigPath).code).toBe('CONFIG_INVALID');
+        expect(errorOf(viaConfigPath).message).toMatch(
+          /^configPath cannot set inputPricePerMillionUsd, outputPricePerMillionUsd over MCP/u,
+        );
+
+        await writeFile(path.join(cwd, '.open-ocr-cli.json'), JSON.stringify({ outputPricePerMillionUsd: 0.000001 }));
+        const viaProject = await extract(cwd, { inputs: [{ type: 'path', path: 'scan.jpg' }], dryRun: true, delivery: 'inline' });
+        expect(errorOf(viaProject).code).toBe('CONFIG_INVALID');
+        expect(errorOf(viaProject).message).toMatch(/^\.open-ocr-cli\.json cannot set outputPricePerMillionUsd over MCP/u);
+      });
+
+      it('applies operator prices only to the operator\'s own model', async () => {
+        const { cwd, home } = await workspace();
+        await writeOperatorConfig(home, {
+          provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9/v1', model: 'priced', apiKeyEnv: 'FAKE_SECRET',
+          inputPricePerMillionUsd: 5, outputPricePerMillionUsd: 20, maxCostUsd: 0.01,
+        });
+        const inputs = [{ type: 'path', path: 'scan.jpg' }];
+        const own = await extract(cwd, { inputs, dryRun: true, delivery: 'inline' });
+        expect(own.result?.structuredContent).toMatchObject({ ok: true, costLimitUsd: 0.01 });
+
+        // A caller file that swaps the model must not inherit the operator's
+        // prices for it: the ceiling then cannot be accounted for and is refused.
+        await writeFile(path.join(cwd, 'swap.json'), JSON.stringify({ model: 'unpriced-and-expensive' }));
+        const swapped = await extract(cwd, { inputs, configPath: 'swap.json', dryRun: true, delivery: 'inline' });
+        expect(errorOf(swapped).code).toBe('CONFIG_INVALID');
+        expect(errorOf(swapped).message).toMatch(/execution\.maxCostUsd for openai-compatible\/unpriced-and-expensive requires both/u);
+      });
+
       it('names the destination host and credential variable, and re-asks when the route changes', async () => {
         vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
         const { cwd, home } = await workspace();
