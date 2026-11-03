@@ -1104,7 +1104,7 @@ describe('Open OCR MCP server', () => {
           documents: Array<{ plannedArtifacts: Array<{ path: string }> }>;
         }).documents;
         const planned = documents.flatMap((document) => document.plannedArtifacts.map((artifact) => artifact.path));
-        expect(planned.sort()).toEqual([path.join(cwd, '_devcontainer', 'devcontainer.json'), path.join(cwd, '_mcp.json')]);
+        expect(planned.sort()).toEqual([path.join(cwd, '_.devcontainer', 'devcontainer.json'), path.join(cwd, '_.mcp.json')]);
       });
 
       it('confines a caller configPath "output" the same way', async () => {

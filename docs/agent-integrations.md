@@ -261,8 +261,8 @@ the server does not let tool arguments override the operator:
   directory such as `.git` or `.claude`, except the default
   `.open-ocr-results`. Configuration and schema files must be regular files.
 - **Artifact names.** No directory or file an extraction writes starts with a
-  dot (`.mcp.png` becomes `_mcp.json`, `.devcontainer/x.png` becomes
-  `_devcontainer/x.json`), and agent instruction names gain `.ocr`
+  dot (`.mcp.png` becomes `_.mcp.json`, `.devcontainer/x.png` becomes
+  `_.devcontainer/x.json`), and agent instruction names gain `.ocr`
   (`CLAUDE.ocr.md`), so `outputDirectory: "."` cannot write a project
   `.mcp.json` or agent configuration. Missing directories are created one level
   at a time, and a component that is a symbolic link out of the output

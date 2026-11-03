@@ -265,13 +265,16 @@ const AGENT_INSTRUCTION_BASENAMES = new Set([
  * `.claude/commands/`, `.git/hooks/`, `.devcontainer/devcontainer.json`, and a
  * project `.mcp.json` that Claude Code loads as MCP server configuration. An
  * artifact mirrors its input's relative directory and basename, so without
- * this `.mcp.png` OCR'd into `.` would be written as `.mcp.json`. The leading
- * dot becomes `_`: `.claude/x.png` is written under `_claude/`, `.mcp.png` as
- * `_mcp.json`. This applies to every run, CLI included; an enumerated list of
+ * this `.mcp.png` OCR'd into `.` would be written as `.mcp.json`. The hidden
+ * name gains a `_` in front: `.claude/x.png` is written under `_.claude/`,
+ * `.mcp.png` as `_.mcp.json`. Replacing the dot instead (`_mcp.json`) made
+ * `.mcp.png` and the far more common `_mcp.png` collide and fail the batch;
+ * prefixing keeps the original name and only meets inputs that already start
+ * with `_.`. This applies to every run, CLI included; an enumerated list of
  * dangerous names would always be one tool behind.
  */
 function withoutLeadingDot(segment: string): string {
-  return segment.startsWith('.') ? `_${segment.slice(1)}` : segment;
+  return segment.startsWith('.') ? `_${segment}` : segment;
 }
 
 export function neutralizeAgentInstructionPath(directorySegments: string[], name: string): string[] {
@@ -660,6 +663,9 @@ export async function assertNoOutputCollisions(
   throw outputConflict(
     `Output path collision detected before extraction: ${details}${remainder}. `
     + 'Rename same-stem inputs or process them into separate output directories.',
+    undefined,
+    'Rename one of the colliding inputs, or extract them into separate --output directories; '
+      + '--overwrite cannot resolve a collision between two inputs of the same run.',
   );
 }
 
@@ -1036,7 +1042,7 @@ export class ManifestStore {
       && entry.fingerprintVersion === undefined
       && entry.fingerprint === legacy;
     if (!matchesCurrent && !matchesLegacy) return undefined;
-    // Outputs from the pre-5.0 layout (a hidden name such as `.mcp.json`) are
+    // Outputs from the 4.3.0-and-earlier layout (a hidden name such as `.mcp.json`) are
     // not what this run would write: re-extract into the current layout. The
     // old paths stay owned by the entry, so they never block the new write.
     const outputDirectory = path.dirname(this.manifestPath);

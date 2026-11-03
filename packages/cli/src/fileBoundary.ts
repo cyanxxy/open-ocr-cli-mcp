@@ -187,7 +187,10 @@ export function assertCallerPatternBounded(cwd: string, pattern: string, kind: '
   }
 }
 
-/** Glob syntax, as discovery reads it (see `isGlobPattern` in inputs.ts). */
+/**
+ * Glob syntax: the one definition both discovery (`isGlobPattern` in inputs.ts)
+ * and MCP input confinement use, so they always agree on literal vs glob.
+ */
 export const GLOB_SYNTAX = /[*?{}[\]()!]/u;
 
 /**

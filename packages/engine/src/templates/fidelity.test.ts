@@ -237,7 +237,7 @@ describe('required-field and typed-field validation', () => {
     );
   });
 
-  it.each(['see our website', '12345', 'orbit', 'https://', 'http://exa mple.com', 'user:pass@orbit.example'])(
+  it.each(['see our website', '12345', 'orbit', 'https://', 'http://exa mple.com', 'user:pass@orbit.example', 'https://paypal.com@evil.example/login', 'http://user:pass@orbit.example'])(
     'drops text that is not an http(s) URL or real host (%j) to null with a warning',
     (website) => {
       const result = presetRunResultFromText(presetText({

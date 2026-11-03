@@ -37,6 +37,7 @@ import {
   ocrErrorPayload,
   redactSensitiveErrorText,
 } from './errors';
+import { isRecord } from './jsonValidation';
 import { OCR_REQUEST_LIMITS } from './limits';
 import { executeOcrJobRequest } from './machine';
 import { MCP_ARTIFACT_CHUNK_BYTES, MCP_ARTIFACT_REGISTRY_LIMIT, McpArtifactRegistry } from './mcpArtifacts';
@@ -156,9 +157,6 @@ const CONFIRM_ENV = 'OPEN_OCR_MCP_CONFIRM';
 const CONFIRM_KEY = 'proceed';
 const CONFIRM_TTL_MS = 600_000;
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 type JsonRpcErrorBody = { code: number; message: string; data?: unknown };
 
@@ -169,8 +167,8 @@ type JsonRpcErrorBody = { code: number; message: string; data?: unknown };
  * when the request named no version at all.
  */
 function unsupportedProtocolVersion(message: { params?: unknown }): JsonRpcErrorBody | undefined {
-  const meta = isPlainRecord(message.params) ? message.params._meta : undefined;
-  const requested = isPlainRecord(meta) ? meta[PROTOCOL_VERSION_META_KEY] : undefined;
+  const meta = isRecord(message.params) ? message.params._meta : undefined;
+  const requested = isRecord(meta) ? meta[PROTOCOL_VERSION_META_KEY] : undefined;
   const supported = [...SERVED_PROTOCOL_VERSIONS];
   if (typeof requested === 'string' && supported.includes(requested)) return undefined;
   const error = typeof requested === 'string'
@@ -198,7 +196,7 @@ function unsupportedProtocolVersion(message: { params?: unknown }): JsonRpcError
  */
 function malformedConfirmationAnswer(message: { method: string; params?: unknown }): JsonRpcErrorBody | undefined {
   if (message.method !== 'tools/call' || process.env[CONFIRM_ENV] !== '1') return undefined;
-  if (!isPlainRecord(message.params) || !('inputResponses' in message.params)) return undefined;
+  if (!isRecord(message.params) || !('inputResponses' in message.params)) return undefined;
   const responses = message.params.inputResponses;
   const invalid = (detail: string): JsonRpcErrorBody => ({
     code: ProtocolErrorCode.InvalidParams,
@@ -207,17 +205,17 @@ function malformedConfirmationAnswer(message: { method: string; params?: unknown
     data: { reason: 'malformed_input_response', key: CONFIRM_KEY },
   });
   if (responses === undefined) return undefined;
-  if (!isPlainRecord(responses)) return invalid('expected an object keyed by input request');
+  if (!isRecord(responses)) return invalid('expected an object keyed by input request');
   if (!Object.hasOwn(responses, CONFIRM_KEY)) return undefined;
   const answer = responses[CONFIRM_KEY];
-  if (!isPlainRecord(answer)) return invalid(`"${CONFIRM_KEY}" is not an object`);
+  if (!isRecord(answer)) return invalid(`"${CONFIRM_KEY}" is not an object`);
   if ('method' in answer || 'result' in answer) {
     return invalid(`"${CONFIRM_KEY}" is a wrapped { method, result } envelope, not a bare ElicitResult`);
   }
   if (answer.action !== 'accept' && answer.action !== 'decline' && answer.action !== 'cancel') {
     return invalid(`"${CONFIRM_KEY}".action must be "accept", "decline", or "cancel"`);
   }
-  if (answer.content !== undefined && !isPlainRecord(answer.content)) {
+  if (answer.content !== undefined && !isRecord(answer.content)) {
     return invalid(`"${CONFIRM_KEY}".content must be an object`);
   }
   return undefined;

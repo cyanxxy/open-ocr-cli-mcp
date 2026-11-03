@@ -840,7 +840,7 @@ export function resolveCliOptions(
   // A preset answer is one bounded JSON record, so template mode keeps its
   // historical 16,384-token default. Only an explicit --max-tokens (or a run
   // request's extraction.maxTokens) changes it: a config-file maxTokens was
-  // written for simple/agentic runs, and before 5.0 template mode ignored it,
+  // written for simple/agentic runs, and through 4.3.0 template mode ignored it,
   // so honouring it here would silently cap template runs (4096, say).
   const defaultMaxTokens = effectiveMode === 'template'
     ? DEFAULT_TEMPLATE_MAX_TOKENS

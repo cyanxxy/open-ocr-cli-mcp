@@ -220,7 +220,7 @@ describe('CLI output', () => {
 
   it('can reserve job metadata for a reference-first single-document run', async () => {
     // `.open-ocr-manifest.jpg` can no longer collide: hidden names lose their
-    // leading dot (`_open-ocr-manifest.json`). The summary is still reserved.
+    // leading dot (`_.open-ocr-manifest.json`). The summary is still reserved.
     const metadataCollision = {
       ...input,
       absolutePath: '/workspace/batch-summary.jpg',
@@ -607,27 +607,36 @@ describe('artifact path hardening', () => {
     const { neutralizeAgentInstructionPath } = await import('./output');
     expect(neutralizeAgentInstructionPath([], 'CLAUDE')).toEqual(['CLAUDE.ocr']);
     expect(neutralizeAgentInstructionPath([], 'agents')).toEqual(['agents.ocr']);
-    expect(neutralizeAgentInstructionPath(['.claude', 'commands'], 'deploy')).toEqual(['_claude', 'commands', 'deploy']);
+    expect(neutralizeAgentInstructionPath(['.claude', 'commands'], 'deploy')).toEqual(['_.claude', 'commands', 'deploy']);
     expect(neutralizeAgentInstructionPath(['docs', '.GitHub'], 'copilot-instructions'))
-      .toEqual(['docs', '_GitHub', 'copilot-instructions.ocr']);
+      .toEqual(['docs', '_.GitHub', 'copilot-instructions.ocr']);
     expect(neutralizeAgentInstructionPath(['scans'], 'invoice')).toEqual(['scans', 'invoice']);
   });
 
   it('never starts a directory or file segment with a dot', async () => {
     const { neutralizeAgentInstructionPath } = await import('./output');
-    expect(neutralizeAgentInstructionPath([], '.mcp')).toEqual(['_mcp']);
-    expect(neutralizeAgentInstructionPath(['.devcontainer'], 'devcontainer')).toEqual(['_devcontainer', 'devcontainer']);
-    expect(neutralizeAgentInstructionPath(['docs', '.vscode', '.config'], '.env')).toEqual(['docs', '_vscode', '_config', '_env']);
+    expect(neutralizeAgentInstructionPath([], '.mcp')).toEqual(['_.mcp']);
+    expect(neutralizeAgentInstructionPath(['.devcontainer'], 'devcontainer')).toEqual(['_.devcontainer', 'devcontainer']);
+    expect(neutralizeAgentInstructionPath(['docs', '.vscode', '.config'], '.env')).toEqual(['docs', '_.vscode', '_.config', '_.env']);
     // Both rules apply: the instruction name gains `.ocr`, then loses its dot.
-    expect(neutralizeAgentInstructionPath([], '.cursorrules')).toEqual(['_cursorrules.ocr']);
+    expect(neutralizeAgentInstructionPath([], '.cursorrules')).toEqual(['_.cursorrules.ocr']);
     expect(neutralizeAgentInstructionPath(['a..b'], 'x.y')).toEqual(['a..b', 'x.y']);
   });
 
+  it('keeps a hidden input and its underscore-named sibling apart', async () => {
+    const { assertNoOutputCollisions } = await import('./output');
+    const sibling = (relativePath: string): ResolvedInput => ({
+      ...input, absolutePath: `/workspace/${relativePath}`, relativePath, displayPath: relativePath, name: relativePath,
+    });
+    await expect(assertNoOutputCollisions([sibling('.mcp.png'), sibling('_mcp.png'), sibling('ok.png')], options))
+      .resolves.toBeUndefined();
+  });
+
   it.each([
-    ['.mcp.png', '_mcp'],
-    ['.devcontainer/devcontainer.png', path.join('_devcontainer', 'devcontainer')],
-    ['.github/workflows/ci.png', path.join('_github', 'workflows', 'ci')],
-    ['scans/.hidden/.page.png', path.join('scans', '_hidden', '_page')],
+    ['.mcp.png', '_.mcp'],
+    ['.devcontainer/devcontainer.png', path.join('_.devcontainer', 'devcontainer')],
+    ['.github/workflows/ci.png', path.join('_.github', 'workflows', 'ci')],
+    ['scans/.hidden/.page.png', path.join('scans', '_.hidden', '_.page')],
   ])('writes %s without a hidden segment, consistently with planning', async (relativePath, expected) => {
     const hidden: ResolvedInput = {
       ...input, absolutePath: `/workspace/${relativePath}`, relativePath, displayPath: relativePath, name: path.basename(relativePath),
@@ -649,7 +658,7 @@ describe('artifact path hardening', () => {
 
   it('re-extracts a resumed entry whose recorded artifact has a hidden name from the old layout', async () => {
     const legacy = path.join(directory, '.mcp.json');
-    const current = path.join(directory, '_mcp.json');
+    const current = path.join(directory, '_.mcp.json');
     await writeFile(legacy, '{}\n');
     await writeFile(current, '{}\n');
     const manifest = new ManifestStore(directory);

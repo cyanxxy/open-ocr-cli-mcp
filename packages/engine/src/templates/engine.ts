@@ -683,6 +683,9 @@ function judgeUrl(value: string): UrlVerdict {
     if (hasControl || !/^https?:\/\//iu.test(trimmed)) return { ok: false };
     try {
       const url = new URL(trimmed);
+      // Userinfo is refused as in the scheme-less branch: in
+      // "https://paypal.com@evil.example" the visible name is not the host.
+      if (url.username !== '' || url.password !== '') return { ok: false };
       return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname !== '' ? { ok: true } : { ok: false };
     } catch {
       return { ok: false };
@@ -999,6 +1002,9 @@ export async function runExtractionPreset(
     // Gemini 3.x: omit temperature/topP/topK; use media resolution for OCR fidelity.
     let generationConfig: Record<string, unknown> = {
       maxOutputTokens: options?.maxTokens ?? DEFAULT_TEMPLATE_MAX_TOKENS,
+      // Each continuation hop re-bills the input and runs inside one SDK call,
+      // past --max-cost; a CONTINUATION stop is reported as truncated output.
+      automaticContinuation: false,
       responseMimeType: 'application/json',
       responseJsonSchema: buildPresetResponseSchema(preset),
       mediaResolution: generateContentMediaResolution(mimeType),

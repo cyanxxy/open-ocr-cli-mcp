@@ -926,7 +926,7 @@ describe('OcrJobService', () => {
   });
 
   it('reserves single-run manifest paths before invoking the provider', async () => {
-    // A hidden input name loses its dot (`_open-ocr-manifest.json`), so the
+    // A hidden input name loses its dot (`_.open-ocr-manifest.json`), so the
     // non-hidden summary is the metadata name an input can still collide with.
     const documentPath = path.join(directory, 'batch-summary.jpg');
     const outputDirectory = path.join(directory, 'single-output');

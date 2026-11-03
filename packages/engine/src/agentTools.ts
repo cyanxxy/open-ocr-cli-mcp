@@ -347,6 +347,9 @@ export async function executeReOcrRegion(
     } else {
       const generationConfig = applyThinkingConfig({
         maxOutputTokens: 8192,
+        // Each continuation hop re-bills the input and runs inside one SDK call,
+        // past --max-cost; a CONTINUATION stop is reported as truncated output.
+        automaticContinuation: false,
         responseMimeType: 'application/json',
         responseJsonSchema: responseSchema,
         mediaResolution: generateContentMediaResolution(croppedRegion.mimeType),

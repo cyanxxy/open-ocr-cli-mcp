@@ -5,6 +5,7 @@
 
 import { GoogleGenAI, ThinkingLevel as GoogleThinkingLevel } from '@google/genai';
 import { logger } from '../logger';
+import { isRecord } from './errorPayload';
 import { GeminiModel, OcrError, OcrErrorType, ThinkingLevel } from './types';
 import { knownModelThinkingLevels, providerDefaultThinkingLevel } from '../providers/registry';
 
@@ -72,8 +73,8 @@ interface GeminiResponseStatus {
 function assertNotFailedFinishReason(finishReason: string | undefined, operation: string): void {
   if (!finishReason || finishReason === 'STOP') return;
   // CONTINUATION (@google/genai >= 2.26): the per-request decode limit was hit.
-  // The SDK resumes such responses automatically; one that still surfaces here
-  // could not be continued and is just as incomplete as MAX_TOKENS.
+  // Automatic continuation is disabled on every request (each hop re-bills the
+  // input past --max-cost), so this output is as incomplete as MAX_TOKENS.
   if (finishReason === 'MAX_TOKENS' || finishReason === 'CONTINUATION') {
     throw new Error(
       `${operation} reached the output token limit and returned incomplete output. `
@@ -243,9 +244,6 @@ interface GoogleQuotaEvidence {
   details: Array<Record<string, unknown>>;
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function parseErrorBodyText(text: string): unknown {
   const trimmed = text.trim();
@@ -270,15 +268,15 @@ function absorbErrorBody(body: unknown, evidence: GoogleQuotaEvidence, depth = 0
     for (const entry of body) absorbErrorBody(entry, evidence, depth + 1);
     return;
   }
-  if (!isPlainRecord(body)) return;
-  const error = isPlainRecord(body.error) ? body.error : body;
+  if (!isRecord(body)) return;
+  const error = isRecord(body.error) ? body.error : body;
   if (typeof error.code === 'number') evidence.status ??= error.code;
   if (typeof error.code === 'string' && error.code) evidence.codes.add(error.code.toUpperCase());
   if (typeof error.status === 'string' && error.status) evidence.codes.add(error.status.toUpperCase());
   if (typeof error.message === 'string' && error.message) evidence.texts.push(error.message);
   if (Array.isArray(error.details)) {
     for (const detail of error.details) {
-      if (isPlainRecord(detail)) evidence.details.push(detail);
+      if (isRecord(detail)) evidence.details.push(detail);
     }
   }
 }
@@ -311,7 +309,7 @@ function collectGoogleQuotaEvidence(error: unknown): GoogleQuotaEvidence {
       absorbErrorBody(parseErrorBodyText(value), evidence);
     }
     // The Interactions SDK keeps the parsed body on `error`.
-    if (isPlainRecord(record.error)) absorbErrorBody(record.error, evidence);
+    if (isRecord(record.error)) absorbErrorBody(record.error, evidence);
     current = record.cause;
   }
   return evidence;
@@ -377,7 +375,7 @@ export function classifyGeminiQuotaError(error: unknown): GeminiQuotaVerdict | u
   const violations = evidence.details
     .filter((detail) => detail['@type'] === GOOGLE_RPC_QUOTA_FAILURE)
     .flatMap((detail) => (Array.isArray(detail.violations) ? detail.violations as unknown[] : []))
-    .filter(isPlainRecord);
+    .filter(isRecord);
   if (violations.some((violation) => typeof violation.quotaId === 'string'
     && (violation.quotaId.includes('PerDay') || violation.quotaId.includes('Daily')))) {
     return 'terminal';

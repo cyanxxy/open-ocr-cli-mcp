@@ -140,10 +140,14 @@ export function parseCliManifest(value: unknown, manifestPath: string): CliManif
     if (entry.error !== undefined && typeof entry.error !== 'string') {
       throw batchMetadataError(`${manifestPath}: entry ${source} has an invalid error`);
     }
+    if (entry.queued !== undefined && (entry.queued !== true || entry.status !== 'pending')) {
+      throw batchMetadataError(`${manifestPath}: entry ${source} has an invalid queued flag`);
+    }
     entries[source] = {
       fingerprint: entry.fingerprint,
       ...(entry.fingerprintVersion === 2 ? { fingerprintVersion: 2 as const } : {}),
       status: entry.status,
+      ...(entry.queued === true ? { queued: true as const } : {}),
       outputFiles: [...entry.outputFiles],
       ...(entry.ownedFiles !== undefined ? { ownedFiles: [...entry.ownedFiles] } : {}),
       completedAt: entry.completedAt,

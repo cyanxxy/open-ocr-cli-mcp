@@ -156,6 +156,67 @@ describe('crash-safe resume', () => {
     expect(statusOfAWhileBRuns).toBe('succeeded');
   });
 
+  it('resumes cleanly when a kill drops deferred final updates after the artifacts were committed', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg']);
+    const out = path.join(directory, 'out');
+    const extractDocument = markdownExtractor();
+    const service = new OcrJobService({ extractDocument });
+    // A SIGKILL inside the flush window: every deferred update is lost and the
+    // final flush never happens. Only the up-front claims reached disk.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via call() below
+    const original = ManifestStore.prototype.update;
+    vi.spyOn(ManifestStore.prototype, 'update').mockImplementation(function (this: ManifestStore, key, entry, opts) {
+      if (opts?.defer) return Promise.resolve();
+      return original.call(this, key, entry, opts);
+    });
+    vi.spyOn(ManifestStore.prototype, 'flush').mockRejectedValue(new Error('killed'));
+    await expect(run(service, [docs], batchOptions())).rejects.toThrow('killed');
+    vi.restoreAllMocks();
+
+    await expect(stat(path.join(out, 'docs', 'a.md'))).resolves.toBeDefined();
+    await expect(stat(path.join(out, 'docs', 'b.md'))).resolves.toBeDefined();
+    const onDisk = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+      entries: Record<string, ManifestEntry>;
+    };
+    expect(Object.values(onDisk.entries).map((entry) => entry.status)).toEqual(['pending', 'pending']);
+
+    const resumed = await run(service, [docs], batchOptions());
+    expect(resumed.summary).toMatchObject({ succeeded: 2, failed: 0 });
+    expect(extractDocument).toHaveBeenCalledTimes(4);
+    expect(await inspectBatchStatus(out, directory)).toMatchObject({ healthy: true, untrackedArtifacts: [] });
+  });
+
+  it('keeps unstarted claims queued with their previous error, so a crash reports only started work as interrupted', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg', 'c.jpg']);
+    const out = path.join(directory, 'out');
+    const manifestPath = path.join(out, '.open-ocr-manifest.json');
+    await run(new OcrJobService({ extractDocument: vi.fn<OcrDocumentExtractor>(() => Promise.reject(new Error('provider down'))) }), [docs], batchOptions());
+
+    // What a SIGKILL while a.jpg is running would leave on disk.
+    let snapshot = '';
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
+      if (input.name === 'a.jpg') {
+        await new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 400));
+        snapshot = await readFile(manifestPath, 'utf8');
+      }
+      return { artifacts: { markdown: `# ${input.name}` }, attempts: 1 };
+    });
+    await run(new OcrJobService({ extractDocument }), [docs], batchOptions());
+    const entries = (JSON.parse(snapshot) as { entries: Record<string, ManifestEntry> }).entries;
+    const byName = (name: string) => Object.entries(entries).find(([key]) => key.endsWith(name))?.[1];
+    expect(byName('a.jpg')).toMatchObject({ status: 'pending' });
+    expect(byName('a.jpg')?.queued).toBeUndefined();
+    expect(byName('b.jpg')).toMatchObject({ status: 'pending', queued: true });
+    expect(byName('b.jpg')?.error).toContain('provider down');
+
+    const crashed = path.join(directory, 'crashed');
+    await mkdir(crashed, { recursive: true });
+    await writeFile(path.join(crashed, '.open-ocr-manifest.json'), snapshot);
+    const report = await inspectBatchStatus(crashed, directory);
+    expect(report.counts).toMatchObject({ interrupted: 1, queued: 2 });
+    expect(renderBatchStatus(report)).toContain('Not started: 2 document(s)');
+  });
+
   it('withdraws the claims of documents a run never started', async () => {
     const docs = await seedDocs(['a.jpg', 'b.jpg', 'c.jpg']);
     const out = path.join(directory, 'out');
@@ -318,6 +379,21 @@ describe('spend accounting across runs', () => {
     const report = await inspectBatchStatus(path.join(directory, 'out'), directory);
     expect(report.cumulativeUsage?.estimatedCostUsd).toBeCloseTo(0.01);
     expect(report.lastRun?.usage.estimatedCostUsd).toBe(0);
+  });
+
+  it('records a capped run\'s spend durably as each document finishes, not after the flush interval', async () => {
+    const docs = await seedDocs(['a.jpg', 'b.jpg']);
+    const manifestPath = path.join(directory, 'out', '.open-ocr-manifest.json');
+    let onDiskWhileBRuns: { usage?: { estimatedCostUsd: number }; entries: Record<string, ManifestEntry> } | undefined;
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input, _options, _signal, _step, runtime) => {
+      runtime.recordUsage({ usage: { input_tokens: 1, total_tokens: 1, cost: 0.01 } });
+      if (input.name === 'b.jpg') onDiskWhileBRuns = JSON.parse(await readFile(manifestPath, 'utf8')) as typeof onDiskWhileBRuns;
+      return { artifacts: { markdown: `# ${input.name}` }, attempts: 1 };
+    });
+    await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ maxCost: '5' }));
+    const a = Object.entries(onDiskWhileBRuns?.entries ?? {}).find(([key]) => key.endsWith('a.jpg'))?.[1];
+    expect(a?.status).toBe('succeeded');
+    expect(onDiskWhileBRuns?.usage?.estimatedCostUsd).toBeCloseTo(0.01);
   });
 
   it('stops paid work when a priced provider returns no usage under --max-cost', async () => {

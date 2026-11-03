@@ -335,6 +335,12 @@ export interface ManifestEntry {
    * update leaves files resume recognises as its own and re-extracts.
    */
   status: 'succeeded' | 'partial' | 'failed' | 'pending';
+  /**
+   * On a `pending` claim only: the run claimed the document up front but had
+   * not started it yet. A crash then leaves it queued rather than interrupted,
+   * and `error` still holds the previous run's failure, if any.
+   */
+  queued?: true;
   outputFiles: string[];
   /**
    * Every artifact path this entry has written or claimed, across format

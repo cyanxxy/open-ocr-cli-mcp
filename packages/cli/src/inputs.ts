@@ -9,6 +9,7 @@ import { globIterate, Ignore, type IgnoreLike } from 'glob';
 
 import { EXTENSION_TO_MIME, FILE_CONSTRAINTS, maxFileSizeForMime } from '@open-ocr/engine/constants';
 import { CliExitError, type OcrErrorCode } from './errors';
+import { GLOB_SYNTAX } from './fileBoundary';
 import type { ResolvedCliOptions, ResolvedInput } from './types';
 
 const SUPPORTED_EXTENSIONS: ReadonlySet<string> = new Set(Object.keys(EXTENSION_TO_MIME));
@@ -283,7 +284,7 @@ async function detectLocalMimeType(absolutePath: string): Promise<string> {
 }
 
 function isGlobPattern(value: string): boolean {
-  return /[*?{}[\]()!]/.test(value);
+  return GLOB_SYNTAX.test(value);
 }
 
 /**

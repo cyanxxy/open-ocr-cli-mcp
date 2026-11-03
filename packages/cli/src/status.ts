@@ -29,6 +29,8 @@ export interface BatchStatusEntry {
    */
   sourceKind: 'path' | 'synthetic';
   status: ManifestEntry['status'];
+  /** A pending claim the run had not started (see ManifestEntry.queued). */
+  queued?: true;
   completedAt: string;
   outputFiles: string[];
   missingOutputFiles: string[];
@@ -70,6 +72,13 @@ export interface BatchStatusReport {
   untrackedArtifacts: string[];
   /** Staging/backup leftovers (`*.<pid>-<uuid>.tmp|.bak`) of an interrupted write. */
   strayTempFiles: string[];
+  /**
+   * Directories holding recorded artifacts that were not audited because the
+   * scan stopped at {@link MAX_STATUS_SCAN_DIRECTORIES}. Non-zero means the
+   * untracked and leftover lists are incomplete, so the batch is not reported
+   * healthy.
+   */
+  unscannedDirectories: number;
   lastRun?: Pick<
     BatchSummary,
     | 'startedAt'
@@ -92,8 +101,10 @@ export interface BatchStatusReport {
     skipped: number;
     missingArtifacts: number;
     missingSources: number;
-    /** Manifest entries claimed by a run that never finished them. */
+    /** Manifest entries a run started but never finished. */
     interrupted: number;
+    /** Manifest entries a run claimed up front but had not started when it stopped. */
+    queued: number;
     untrackedArtifacts: number;
     strayTempFiles: number;
   };
@@ -342,16 +353,20 @@ async function scanOutputDirectory(
   outputDirectory: string,
   recorded: Iterable<string>,
   owned: ReadonlySet<string>,
-): Promise<{ untrackedArtifacts: string[]; strayTempFiles: string[] }> {
+): Promise<{ untrackedArtifacts: string[]; strayTempFiles: string[]; unscannedDirectories: number }> {
   const untrackedArtifacts: string[] = [];
   const strayTempFiles: string[] = [];
   const candidates = possibleBatchPaths(outputDirectory, recorded);
   let scanned = 0;
+  let unscannedDirectories = 0;
   for (const [directory, names] of candidates) {
     if (path.relative(outputDirectory, directory).split(path.sep).some((segment) => SKIPPED_DIRECTORY_NAMES.has(segment))) {
       continue;
     }
-    if (scanned >= MAX_STATUS_SCAN_DIRECTORIES) break;
+    if (scanned >= MAX_STATUS_SCAN_DIRECTORIES) {
+      unscannedDirectories += 1;
+      continue;
+    }
     scanned += 1;
     let entries: Array<{ name: string; isFile(): boolean }>;
     try {
@@ -376,7 +391,7 @@ async function scanOutputDirectory(
   }
   untrackedArtifacts.sort((left, right) => left.localeCompare(right));
   strayTempFiles.sort((left, right) => left.localeCompare(right));
-  return { untrackedArtifacts, strayTempFiles };
+  return { untrackedArtifacts, strayTempFiles, unscannedDirectories };
 }
 
 export async function inspectBatchStatus(
@@ -415,7 +430,11 @@ export async function inspectBatchStatus(
       recorded.push(file);
     }
   }
-  const { untrackedArtifacts, strayTempFiles } = await scanOutputDirectory(outputDirectory, recorded, owned);
+  const { untrackedArtifacts, strayTempFiles, unscannedDirectories } = await scanOutputDirectory(
+    outputDirectory,
+    recorded,
+    owned,
+  );
   const entries = await Promise.all(Object.entries(manifest?.entries ?? {}).map(async ([source, entry]) => {
     const missingOutputFiles = (await Promise.all(entry.outputFiles.map(async (file) => ({
       file,
@@ -428,6 +447,7 @@ export async function inspectBatchStatus(
       source,
       sourceKind: synthetic ? 'synthetic' : 'path',
       status: entry.status,
+      ...(entry.queued ? { queued: true as const } : {}),
       completedAt: entry.completedAt,
       outputFiles: entry.outputFiles,
       missingOutputFiles,
@@ -452,7 +472,8 @@ export async function inspectBatchStatus(
     skipped: summaryCounts?.skipped ?? 0,
     missingArtifacts: entries.reduce((sum, entry) => sum + entry.missingOutputFiles.length, 0),
     missingSources: entries.filter((entry) => !entry.sourceExists).length,
-    interrupted: entries.filter((entry) => entry.status === 'pending').length,
+    interrupted: entries.filter((entry) => entry.status === 'pending' && !entry.queued).length,
+    queued: entries.filter((entry) => entry.status === 'pending' && entry.queued).length,
     untrackedArtifacts: untrackedArtifacts.length,
     strayTempFiles: strayTempFiles.length,
   };
@@ -482,6 +503,7 @@ export async function inspectBatchStatus(
     ...(manifest?.usage ? { cumulativeUsage: manifest.usage } : {}),
     untrackedArtifacts,
     strayTempFiles,
+    unscannedDirectories,
     ...(summary ? {
       lastRun: {
         startedAt: summary.startedAt,
@@ -502,7 +524,8 @@ export async function inspectBatchStatus(
       && !manifestHasProblems
       && !lastRunHasProblems
       && untrackedArtifacts.length === 0
-      && strayTempFiles.length === 0,
+      && strayTempFiles.length === 0
+      && unscannedDirectories === 0,
     entries,
   };
 }
@@ -527,6 +550,12 @@ export function renderBatchStatus(report: BatchStatusReport): string {
   }
   if (report.counts.interrupted > 0) {
     lines.push(`Interrupted: ${report.counts.interrupted} document(s) were being written when a run stopped; resume re-extracts them`);
+  }
+  if (report.unscannedDirectories > 0) {
+    lines.push(`Audit incomplete: ${report.unscannedDirectories} artifact ${report.unscannedDirectories === 1 ? 'directory' : 'directories'} beyond the ${MAX_STATUS_SCAN_DIRECTORIES}-directory limit were not checked for untracked or leftover files`);
+  }
+  if (report.counts.queued > 0) {
+    lines.push(`Not started: ${report.counts.queued} document(s) were still queued when a run stopped; resume extracts them`);
   }
   if (report.untrackedArtifacts.length > 0) {
     lines.push(`Untracked files: ${report.untrackedArtifacts.length} artifact-like file(s) no manifest entry owns; resume will not replace them`);

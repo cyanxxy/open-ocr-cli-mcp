@@ -680,6 +680,10 @@ export class OcrJobService {
           fingerprint: fingerprints[index]?.current ?? '',
           fingerprintVersion: 2,
           status: 'pending',
+          // Not started yet: a crash leaves it queued, not interrupted, and the
+          // previous run's failure stays readable.
+          queued: true,
+          ...(previous?.error !== undefined ? { error: previous.error } : {}),
           outputFiles: previous?.outputFiles ?? [],
           ownedFiles: possibleTargets[index] ?? [],
           completedAt: new Date().toISOString(),
@@ -693,6 +697,12 @@ export class OcrJobService {
         }
       }
     }
+    // A finished document's final update also carries the spend it caused
+    // (the manifest's usage snapshot). Deferring it is safe for resume, but a
+    // crash inside the flush window would drop that spend from the cumulative
+    // total --max-cost is enforced on, so a capped run writes it durably
+    // (concurrent updates still share one write).
+    const deferPaidUpdates = options.maxCostUsd === undefined;
     /** Withdraw claims of documents this run never started, and persist everything deferred. */
     const settleManifest = async (): Promise<void> => {
       if (!manifest) return;
@@ -771,11 +781,18 @@ export class OcrJobService {
             return;
           }
           cursor += 1;
-          unstartedClaims.delete(index);
+          const claimed = unstartedClaims.delete(index);
           const input = inputs[index];
           const jobStart = performance.now();
           const jobStartedAt = new Date().toISOString();
           const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
+          const claim = claimed ? manifest?.entry(key) : undefined;
+          if (claim?.queued) {
+            // Started: a crash from here on interrupts it. Deferred, because
+            // the pending claim itself is already durable.
+            const { queued: _queued, error: _error, ...started } = claim;
+            await manifest?.update(key, started, { defer: true });
+          }
           const fingerprint = fingerprints[index]?.current ?? '';
           await events.emit({
             type: 'document.started',
@@ -915,7 +932,7 @@ export class OcrJobService {
                 status: jobStatus,
                 outputFiles: outputFiles ?? [],
                 completedAt: result.completedAt,
-              }, { defer: true });
+              }, { defer: deferPaidUpdates });
             } catch (error) {
               if (progressFailure !== undefined && error === progressFailure) throw error;
               const cancelled = runtime.abortController.signal.aborted && !timedOut;
@@ -956,7 +973,7 @@ export class OcrJobService {
                 outputFiles: manifest?.entry(key)?.outputFiles ?? [],
                 completedAt: result.completedAt,
                 error: failure.error,
-              }, { defer: true });
+              }, { defer: deferPaidUpdates });
               if (options.failFast && !cancelled) failFastTriggered = true;
             } finally {
               clearTimeout(timeout);

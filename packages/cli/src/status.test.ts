@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { CliExitError } from './errors';
-import { inspectBatchStatus, renderBatchStatus } from './status';
+import { inspectBatchStatus, MAX_STATUS_SCAN_DIRECTORIES, renderBatchStatus } from './status';
 import { BatchOutputLock, processStartIdentity } from './output';
 
 let directory: string;
@@ -59,6 +59,26 @@ afterEach(async () => {
 });
 
 describe('CLI batch status', () => {
+  it('reports an audit cut short by the directory limit instead of calling the batch healthy', async () => {
+    const entries: Record<string, unknown> = {};
+    for (let index = 0; index <= MAX_STATUS_SCAN_DIRECTORIES; index += 1) {
+      const folder = path.join(directory, 'docs', `d${index}`);
+      await mkdir(folder, { recursive: true });
+      const artifact = path.join(folder, 'page.md');
+      await writeFile(artifact, '# page');
+      entries[path.join(directory, 'src', `d${index}.png`)] = {
+        fingerprint: `f${index}`, status: 'succeeded', outputFiles: [artifact], completedAt: '2026-07-15T00:00:00.000Z',
+      };
+    }
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({ version: 1, entries }));
+    const report = await inspectBatchStatus(directory, directory);
+    // The output directory (batch metadata) is audited too, so two of the
+    // MAX + 2 candidate directories fall past the limit.
+    expect(report.unscannedDirectories).toBe(2);
+    expect(report.healthy).toBe(false);
+    expect(renderBatchStatus(report)).toContain('Audit incomplete: 2 artifact directories');
+  }, 60_000);
+
   it('audits manifest artifacts and renders actionable failures', async () => {
     const source = path.join(directory, 'invoice.pdf');
     const presentOutput = path.join(directory, 'invoice.md');

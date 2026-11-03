@@ -118,8 +118,8 @@ file names are document-controlled:
   mirror the input's relative path, so an input `.mcp.png` would otherwise
   become `.mcp.json` (a project MCP server configuration Claude Code loads) and
   `.devcontainer/devcontainer.png` would become `.devcontainer/devcontainer.json`.
-  The leading dot of each hidden segment is rewritten to `_` (`_mcp.json`,
-  `_devcontainer/`), and agent instruction names such as `CLAUDE` or `AGENTS`
+  Each hidden segment gains a leading `_` (`_.mcp.json`,
+  `_.devcontainer/`), and agent instruction names such as `CLAUDE` or `AGENTS`
   gain `.ocr` (`CLAUDE.ocr.md`).
 - Missing artifact directories are created one level at a time from the output
   directory. Each existing component is checked first, and a non-directory or a

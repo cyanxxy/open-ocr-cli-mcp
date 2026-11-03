@@ -174,6 +174,9 @@ export async function extractStructuredDataFromFile(
   const base64Data = fileData.split(',')[1] || fileData;
   let generationConfig: Record<string, unknown> = {
     maxOutputTokens: options?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    // Each continuation hop re-bills the input and runs inside one SDK call,
+    // past --max-cost; a CONTINUATION stop is reported as truncated output.
+    automaticContinuation: false,
     responseMimeType: 'application/json',
     responseJsonSchema,
     mediaResolution: generateContentMediaResolution(mimeType),
@@ -281,6 +284,9 @@ function buildGenerationConfig(
   let config: Record<string, unknown> = {
     ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
     maxOutputTokens: options?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    // Each continuation hop re-bills the input and runs inside one SDK call,
+    // past --max-cost; a CONTINUATION stop is reported as truncated output.
+    automaticContinuation: false,
   };
 
   if (wantsJsonOutput(options)) {

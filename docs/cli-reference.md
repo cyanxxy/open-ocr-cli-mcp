@@ -157,13 +157,13 @@ on it, because that would bill the same work twice.
 Artifact names never match files coding agents load as instructions or tools
 load as configuration. An input named `CLAUDE.png` (or `AGENTS`, `GEMINI`,
 `copilot-instructions`, and similar) is written as `CLAUDE.ocr.md`. No
-directory or file name in the output tree starts with a dot: the leading dot of
-every hidden segment of the input path becomes `_`, so `.claude/x.png` is
-written under `_claude/`, `.devcontainer/devcontainer.png` as
-`_devcontainer/devcontainer.json`, and `.mcp.png` as `_mcp.json` rather than a
+directory or file name in the output tree starts with a dot: every hidden
+segment of the input path gains a leading `_`, so `.claude/x.png` is written
+under `_.claude/`, `.devcontainer/devcontainer.png` as
+`_.devcontainer/devcontainer.json`, and `.mcp.png` as `_.mcp.json` rather than a
 project MCP configuration. This applies to every run, CLI and MCP alike. A
-resumed entry whose recorded artifact still has a hidden name (written before
-5.0) is re-extracted into the new layout. Extracted text is untrusted document
+resumed entry whose recorded artifact still has a hidden name (written by 4.3.0
+or earlier) is re-extracted into the new layout. Extracted text is untrusted document
 content.
 
 Single-file `extract` normally prints content to stdout. `--output` or

@@ -31,8 +31,8 @@ section before upgrading. CLI flags behave as before except where noted.
   defeated by declaring a model free.
 - Inputs named like agent instruction files (`CLAUDE`, `AGENTS`, `GEMINI`,
   `copilot-instructions`, and similar) are written as `<name>.ocr.<ext>`, and
-  no artifact path segment starts with a dot: `.mcp.png` becomes `_mcp.json`
-  and `.claude/x.png` becomes `_claude/x.md`, for CLI and MCP runs.
+  no artifact path segment starts with a dot: `.mcp.png` becomes `_.mcp.json`
+  and `.claude/x.png` becomes `_.claude/x.md`, for CLI and MCP runs.
 - Kimi defaults to `kimi-k3.1-pro`, Moonshot's current flagship (cheaper than
   `kimi-k3`, which stays available).
 - Template mode uses 16384 output tokens unless `--max-tokens` or a request's
@@ -132,7 +132,8 @@ section before upgrading. CLI flags behave as before except where noted.
   accepts HEIC/HEIF images. OpenRouter Gemini 3.8 Flash fallback price is
   OpenRouter's ($0.825 / $4.125). OpenRouter attribution uses
   `X-OpenRouter-Title`.
-- `@google/genai` 2.32.0. The SDK's automatic continuation is disabled, since
+- `@google/genai` 2.32.0. The SDK's automatic continuation is disabled on
+  every Gemini request (generateContent and Interactions), since
   each hop re-bills the input and runs past `--max-cost`; a
   `requires_continuation` stop is reported as truncated output.
 - MCP: absolute paths and file names containing `( ) [ ] { } ! ?` are read
@@ -154,6 +155,10 @@ section before upgrading. CLI flags behave as before except where noted.
   document (2000 documents: 4001 writes and 2.6 GB before, 6 writes and 7 MB
   after) with the same crash safety; documents finished in the last second
   before a SIGKILL are extracted again.
+- `status` separates documents a killed run had not started ("Not started",
+  previous error kept) from those it was writing ("Interrupted"), and says
+  when its directory limit left part of the batch unaudited instead of
+  reporting it healthy.
 - `@modelcontextprotocol/server` and `/client` 2.4.0.
 - Docs: Codex needs `CODEX_MCP_PROTOCOL_VERSION` and the `mcp_2026_07_28`
   feature for this server (from Codex source; not yet in its docs); Claude
