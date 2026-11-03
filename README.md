@@ -121,7 +121,10 @@ Batches are crash-safe: a run killed at any point resumes with the same
 command, re-extracting only documents whose content changed or that never
 finished. `--max-cost` is enforced on the directory's cumulative spend, and fails
 closed when a paid provider returns no usage. `status` shows last-run and
-cumulative usage, interrupted documents, untracked files, and stale locks.
+cumulative usage, interrupted and not-started documents, untracked files, and
+stale locks. Output names never start with a dot or match an agent
+instruction file: `.mcp.png` is written as `_.mcp.md`, `CLAUDE.png` as
+`CLAUDE.ocr.md`.
 
 Other commands: `init` (guided config), `doctor` (environment check),
 `status` (inspect a batch), `models`, `providers`, `presets`. Run any command
