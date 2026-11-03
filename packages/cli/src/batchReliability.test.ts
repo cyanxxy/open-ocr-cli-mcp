@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -296,9 +296,16 @@ describe('crash-safe resume', () => {
     const extractDocument = markdownExtractor();
     const service = new OcrJobService({ extractDocument });
     await run(service, [docs], batchOptions());
-    const { mtime } = await stat(file);
-    await writeFile(file, Uint8Array.from([0xff, 0xd8, 0xff, 0xdb, 9, 9, 9, 9]));
-    await utimes(file, mtime, mtime);
+    // One handle for read-stat, rewrite, and timestamp restore, so the test
+    // never re-resolves the path between checking it and changing it.
+    const handle = await open(file, 'r+');
+    try {
+      const { atime, mtime } = await handle.stat();
+      await handle.write(Uint8Array.from([0xff, 0xd8, 0xff, 0xdb, 9, 9, 9, 9]), 0, 8, 0);
+      await handle.utimes(atime, mtime);
+    } finally {
+      await handle.close();
+    }
     const second = await run(service, [docs], batchOptions());
     expect(second.summary.succeeded).toBe(1);
     expect(extractDocument).toHaveBeenCalledTimes(2);
