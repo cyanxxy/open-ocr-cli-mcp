@@ -9,7 +9,7 @@
     {
       "id": "kimi-direct",
       "provider": "kimi",
-      "model": "kimi-k3",
+      "model": "kimi-k3.1-pro",
       "apiKeyEnv": "MOONSHOT_API_KEY"
     },
     {

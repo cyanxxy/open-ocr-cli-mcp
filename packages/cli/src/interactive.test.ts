@@ -55,7 +55,7 @@ describe('interactive command menu', () => {
       'scans/*.png',
       '--provider', 'kimi',
       '--gateway', 'direct',
-      '--model', 'kimi-k3',
+      '--model', 'kimi-k3.1-pro',
       '--thinking', 'high',
       '--api-key-env', 'MOONSHOT_API_KEY',
       '--mode', 'template',

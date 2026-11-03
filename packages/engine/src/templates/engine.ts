@@ -6,6 +6,7 @@ import {
   getGenAIClient,
 } from '../gemini/client';
 import { parseJsonPayload } from '../gemini/structured';
+import { OcrError, OcrErrorType } from '../gemini/types';
 import { logger } from '../logger';
 import { recordGeminiUsage } from '../gemini/usage';
 import { waitForGeminiRequestSlot } from '../gemini/requestPolicy';
@@ -21,7 +22,12 @@ import type {
 
 interface TemplateGenerationOptions {
   abortSignal?: AbortSignal;
+  /** Output-token ceiling; defaults to {@link DEFAULT_TEMPLATE_MAX_TOKENS}. */
+  maxTokens?: number;
 }
+
+/** Output-token ceiling for a preset extraction when the caller sets none. */
+export const DEFAULT_TEMPLATE_MAX_TOKENS = 16384;
 
 type PrimitiveFieldValue = string | number | boolean | string[] | null;
 
@@ -55,70 +61,127 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function scalarText(value: unknown): string {
+const SCHEMA_ERROR_PREFIX = 'Preset extraction response did not match the expected schema';
+
+/**
+ * A preset response the model shaped wrongly. Typed as `OUTPUT_INVALID` so the
+ * CLI reports "the model's answer did not conform" (retryable) rather than a
+ * provider failure, and the message names the JSON path that broke.
+ */
+function presetSchemaError(path: string, problem: string): OcrError {
+  return new OcrError(OcrErrorType.OUTPUT_INVALID, `${SCHEMA_ERROR_PREFIX}: ${path} ${problem}`);
+}
+
+function describeReceived(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'string') return `"${value.length > 40 ? `${value.slice(0, 40)}…` : value}"`;
+  if (typeof value === 'number') return String(value);
+  return `a ${typeof value}`;
+}
+
+function scalarText(value: unknown, path = 'value'): string {
   if (typeof value === 'string' || typeof value === 'boolean') return String(value);
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  throw new Error('Preset extraction response did not match the expected schema: field and row values must be finite scalars');
+  throw presetSchemaError(path, `must be a string, finite number, or boolean (got ${describeReceived(value)})`);
+}
+
+/**
+ * Tolerance for a confidence just outside [0, 1]. Models occasionally emit
+ * 1.0000001 or -0.001 from float arithmetic; those are clamped with a warning.
+ * Anything further out (1.5, 95) is a real contract violation and fails with
+ * the field named, since there is no safe reading of it.
+ */
+const CONFIDENCE_TOLERANCE = 0.05;
+
+type ConfidenceReading = { value: number; warning?: string } | { error: string };
+
+/**
+ * Read a field's confidence. Policy (documented here because it is a choice):
+ * - a finite number in [0, 1] is used as-is;
+ * - a numeric string ("0.9") is coerced, with a warning;
+ * - a number within {@link CONFIDENCE_TOLERANCE} of the range is clamped, with
+ *   a warning;
+ * - anything else is rejected, naming the field and the value received.
+ */
+function readConfidence(raw: unknown, field: string): ConfidenceReading {
+  let numeric: number | undefined;
+  const warnings: string[] = [];
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    numeric = raw;
+  } else if (typeof raw === 'string' && /^\s*-?(?:\d+(?:\.\d*)?|\.\d+)\s*$/u.test(raw)) {
+    numeric = Number(raw);
+    warnings.push(`Field "${field}": confidence was the string "${raw.trim()}"; read as ${numeric}.`);
+  }
+  if (numeric === undefined || numeric < -CONFIDENCE_TOLERANCE || numeric > 1 + CONFIDENCE_TOLERANCE) {
+    return { error: `must be a number from 0 to 1 (got ${describeReceived(raw)})` };
+  }
+  if (numeric < 0 || numeric > 1) {
+    const clamped = Math.min(1, Math.max(0, numeric));
+    warnings.push(`Field "${field}": confidence ${numeric} was outside 0-1; clamped to ${clamped}.`);
+    numeric = clamped;
+  }
+  return { value: numeric, ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}) };
 }
 
 /**
  * Fail closed on malformed preset JSON. Models (and non-Gemini providers without
  * responseJsonSchema) can return primitives, arrays, or half-shaped objects that
- * would otherwise become empty-but-plausible extraction results.
+ * would otherwise become empty-but-plausible extraction results. Every failure
+ * names the path that broke ("fields.total.confidence must be …").
  *
  * Partial extraction remains valid: `fields` may be `{}` and individual preset
  * rules may be omitted — those become validationErrors later, not schema failures.
  */
 function assertValidPresetPayload(value: unknown): RawPresetPayload {
-  const schemaError = new Error('Preset extraction response did not match the expected schema');
-
   if (!isRecord(value)) {
-    throw schemaError;
+    throw presetSchemaError('the response', `must be a JSON object (got ${describeReceived(value)})`);
   }
 
   if (!isRecord(value.fields)) {
-    throw schemaError;
+    throw presetSchemaError('fields', `must be an object keyed by field name (got ${describeReceived(value.fields)})`);
   }
 
   if (value.documentType !== undefined && typeof value.documentType !== 'string') {
-    throw schemaError;
+    throw presetSchemaError('documentType', `must be a string (got ${describeReceived(value.documentType)})`);
   }
 
   if (value.summary !== undefined && typeof value.summary !== 'string') {
-    throw schemaError;
+    throw presetSchemaError('summary', `must be a string (got ${describeReceived(value.summary)})`);
   }
 
   if (value.rows !== undefined) {
-    if (!Array.isArray(value.rows) || !value.rows.every(isRecord)) throw schemaError;
-    for (const row of value.rows) {
-      for (const cell of Object.values(row)) {
-        if (cell !== null) scalarText(cell);
-      }
+    if (!Array.isArray(value.rows)) {
+      throw presetSchemaError('rows', `must be an array of objects (got ${describeReceived(value.rows)})`);
     }
+    value.rows.forEach((row: unknown, index: number) => {
+      if (!isRecord(row)) throw presetSchemaError(`rows[${index}]`, `must be an object (got ${describeReceived(row)})`);
+      for (const [column, cell] of Object.entries(row)) {
+        if (cell !== null) scalarText(cell, `rows[${index}].${column}`);
+      }
+    });
   }
 
   if (value.warnings !== undefined) {
-    if (!Array.isArray(value.warnings) || !value.warnings.every((entry) => typeof entry === 'string')) {
-      throw schemaError;
+    if (!Array.isArray(value.warnings)) {
+      throw presetSchemaError('warnings', `must be an array of strings (got ${describeReceived(value.warnings)})`);
     }
+    const bad = value.warnings.findIndex((entry: unknown) => typeof entry !== 'string');
+    if (bad >= 0) throw presetSchemaError(`warnings[${bad}]`, `must be a string (got ${describeReceived(value.warnings[bad])})`);
   }
 
-  for (const field of Object.values(value.fields)) {
+  for (const [name, field] of Object.entries(value.fields)) {
+    const path = `fields.${name}`;
     if (!isRecord(field) || !('value' in field)) {
-      throw schemaError;
+      throw presetSchemaError(path, `must be an object with "value" and "confidence" (got ${describeReceived(field)})`);
     }
-    if (
-      typeof field.confidence !== 'number'
-      || !Number.isFinite(field.confidence)
-      || field.confidence < 0
-      || field.confidence > 1
-    ) {
-      throw schemaError;
-    }
+    const confidence = readConfidence(field.confidence, name);
+    if ('error' in confidence) throw presetSchemaError(`${path}.confidence`, confidence.error);
     if (Array.isArray(field.value)) {
-      if (!field.value.every((entry: unknown) => typeof entry === 'string')) throw schemaError;
+      const bad = field.value.findIndex((entry: unknown) => typeof entry !== 'string');
+      if (bad >= 0) throw presetSchemaError(`${path}.value[${bad}]`, `must be a string (got ${describeReceived(field.value[bad])})`);
     } else if (field.value !== null) {
-      scalarText(field.value);
+      scalarText(field.value, `${path}.value`);
     }
   }
 
@@ -126,76 +189,191 @@ function assertValidPresetPayload(value: unknown): RawPresetPayload {
 }
 
 function parsePresetPayload(rawText: string): RawPresetPayload {
-  // Prefer a direct JSON parse so primitives/arrays reach shape validation with a
-  // clear schema error (instead of failing earlier as "not an object"). Fall back
-  // to extractJsonPayload for fenced or prose-wrapped model responses.
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText.trim());
-  } catch {
-    parsed = parseJsonPayload<unknown>(rawText, 'Preset extraction');
-  }
-  return assertValidPresetPayload(parsed);
+  // The shared tolerant extractor parses a bare response directly (so
+  // primitives/arrays reach shape validation with a clear schema error) and
+  // otherwise unwraps fences, prose, and inline reasoning.
+  return assertValidPresetPayload(parseJsonPayload<unknown>(rawText, 'Preset extraction'));
 }
 
-function clampConfidence(value: unknown): number {
-  if (typeof value !== 'number' || Number.isNaN(value)) {
-    return 0;
-  }
-  return Math.min(1, Math.max(0, value));
+/** ISO 4217 currencies with three minor-unit digits. */
+const THREE_DECIMAL_CURRENCIES = ['BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND'] as const;
+const THREE_DECIMAL_CODE = new RegExp(`(?:^|[^A-Za-z])(${THREE_DECIMAL_CURRENCIES.join('|')})(?![A-Za-z])`, 'iu');
+
+/** The three-decimal currency named in `text`, if any. */
+function threeDecimalCurrencyIn(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  return THREE_DECIMAL_CODE.exec(text)?.[1]?.toUpperCase();
 }
+
+interface ParsedLocaleNumber {
+  value: number;
+  /** Digits after the decimal separator in the source text. */
+  decimals: number;
+  /** Set when one separator followed by exactly three digits had to be guessed. */
+  ambiguity?: { chosen: 'grouping' | 'decimal'; alternative: number };
+}
+
+const GROUPING_SPACE = /[\s\u00a0\u202f'\u2019]/u;
+
+/**
+ * Currency abbreviations that are written with a trailing period, lower-cased
+ * ("Rs.", "Re.", "Fr.", "SFr.", "Bs.", "S/.", "B/.", "Kr.", "Dhs.", "Ksh.").
+ * The period ends the abbreviation; it is never a decimal point.
+ */
+const CURRENCY_ABBREVIATIONS = new Set([
+  'rs', 're', 'rp', 'fr', 'sfr', 'chf', 'bs', 'bss', 'bsf', 's/', 'b/', 'kr', 'dkr', 'skr', 'nkr', 'ikr',
+  'dh', 'dhs', 'ksh', 'kshs', 'sh', 'shs', 'ush', 'tsh', 'tk', 'ft', 'gs', 'br', 'esc', 'pts', 'ptas',
+  'lm', 'ls', 'lt', 'lei', 'z\u0142', 'k\u010d', 'din', 'rm',
+]);
 
 /**
  * Parse a human-formatted number that may use US ("1,234.56"), European
- * ("1.234,56"), or plain ("1234") grouping/decimal conventions, with optional
- * currency symbols/letters. Returns null when no numeric value can be recovered
- * so the caller can fall back to the original string.
+ * ("1.234,56"), space/apostrophe ("1 234,56", "1'234.56"), or plain ("1234")
+ * grouping/decimal conventions, with currency symbols or codes around it.
  *
- * The previous implementation stripped everything except digits/dots/minus,
- * which corrupted thousands-separated and European values (e.g. "1.234,56"
- * became NaN, "1,234.56" became 1.234).
+ * The sign is read wherever documents put it: a leading minus before or after
+ * the currency ("-$5", "USD -5.00"), a trailing minus ("5.00-"), accounting
+ * parentheses ("(27.00)"), and the Unicode minus sign (U+2212).
+ *
+ * Returns null — so the caller keeps the original text — whenever a value
+ * cannot be read without guessing its magnitude: two separate numbers
+ * ("3 @ 5.00"), irregular grouping ("1,23,4"), and the like. The one guess that
+ * is made, a single separator followed by exactly three digits ("1.234"), is
+ * reported through `ambiguity` so the caller can warn about it.
+ *
+ * A "." right after a known currency abbreviation ("Rs.500", "S/.100") ends
+ * the abbreviation. Any other separator right after letters ("No.5", "USD.50")
+ * returns 'separator-after-letters' instead of being read as a decimal point.
  */
-function parseLocaleNumber(raw: string): number | null {
-  const trimmed = raw.trim();
-  if (!/[0-9]/.test(trimmed)) {
-    return null;
-  }
+function parseLocaleNumber(
+  raw: string,
+  mode: 'number' | 'currency',
+  threeDecimalCurrency: boolean,
+): ParsedLocaleNumber | 'separator-after-letters' | null {
+  const text = raw.normalize('NFKC').replace(/[\u2212\ufe63\uff0d]/gu, '-').trim();
+  const cores = text.match(/\d(?:[\d.,\s\u00a0\u202f'\u2019]*\d)?/gu);
+  if (!cores || cores.length !== 1) return null;
+  let core = cores[0];
+  const coreStart = text.indexOf(core);
+  let prefix = text.slice(0, coreStart);
+  const suffix = text.slice(coreStart + core.length);
 
-  const sign = /^-/.test(trimmed) ? -1 : 1;
-  let cleaned = trimmed.replace(/[^0-9.,]/g, '');
-  if (cleaned === '') {
-    return null;
-  }
-
-  const hasComma = cleaned.includes(',');
-  const hasDot = cleaned.includes('.');
-
-  if (hasComma && hasDot) {
-    // The right-most separator is the decimal point; the other is grouping.
-    const decimalSep = cleaned.lastIndexOf(',') > cleaned.lastIndexOf('.') ? ',' : '.';
-    const groupSep = decimalSep === ',' ? '.' : ',';
-    cleaned = cleaned.split(groupSep).join('').replace(decimalSep, '.');
-  } else if (hasComma) {
-    // Only commas: a single comma with a non-3-digit tail is a decimal comma
-    // ("1,5", "1234,56"); otherwise treat commas as grouping ("1,234", "1,234,567").
-    const parts = cleaned.split(',');
-    cleaned = parts.length === 2 && parts[1].length !== 3
-      ? `${parts[0]}.${parts[1]}`
-      : parts.join('');
-  } else if (hasDot) {
-    // Only dots: multiple dots can only be grouping ("1.234.567"); a single dot
-    // is treated as the decimal point.
-    const parts = cleaned.split('.');
-    if (parts.length > 2) {
-      cleaned = parts.join('');
+  // ".5" / ",5": the separator sits outside the digit run. A separator right
+  // after letters (or "S/.") is never a decimal point: it ends a currency
+  // abbreviation ("Rs.500", "Fr.25", "S/.100"), which is dropped, or it is
+  // something else ("No.5"), which is not guessed at.
+  const leadingSeparator = /[.,]$/u.exec(prefix);
+  if (leadingSeparator) {
+    const beforeSeparator = prefix.slice(0, -1);
+    const word = /[\p{L}/]+$/u.exec(beforeSeparator)?.[0];
+    if (word !== undefined) {
+      if (leadingSeparator[0] !== '.' || !CURRENCY_ABBREVIATIONS.has(word.toLocaleLowerCase('en'))) {
+        return 'separator-after-letters';
+      }
+      prefix = beforeSeparator;
+    } else {
+      prefix = beforeSeparator;
+      core = `0${leadingSeparator[0]}${core}`;
     }
   }
 
-  const result = Number(cleaned);
-  return Number.isFinite(result) ? sign * result : null;
+  const negative = prefix.includes('-')
+    || /^\s*-/u.test(suffix)
+    || (prefix.includes('(') && suffix.includes(')'));
+
+  if (GROUPING_SPACE.test(core)) {
+    if (!/^\d{1,3}(?:[\s\u00a0\u202f'\u2019]\d{3})+(?:[.,]\d+)?$/u.test(core)) return null;
+    core = core.replace(/[\s\u00a0\u202f'\u2019]/gu, '');
+  }
+
+  const commaCount = core.split(',').length - 1;
+  const dotCount = core.split('.').length - 1;
+  let normalized: string;
+  let decimals = 0;
+  let ambiguity: ParsedLocaleNumber['ambiguity'];
+
+  if (commaCount > 0 && dotCount > 0) {
+    // The right-most separator is the decimal point; the other is grouping.
+    const decimalSep = core.lastIndexOf(',') > core.lastIndexOf('.') ? ',' : '.';
+    const groupSep = decimalSep === ',' ? '.' : ',';
+    const [integerPart, fraction, ...extra] = core.split(decimalSep);
+    if (extra.length > 0) return null;
+    const groups = integerPart.split(groupSep);
+    if (groups[0].length > 3 || !groups.slice(1).every((group) => group.length === 3)) return null;
+    normalized = `${groups.join('')}.${fraction}`;
+    decimals = fraction.length;
+  } else if (commaCount + dotCount === 0) {
+    normalized = core;
+  } else {
+    const separator = commaCount > 0 ? ',' : '.';
+    const parts = core.split(separator);
+    if (parts.length > 2) {
+      // Repeated separators can only be grouping ("1.234.567").
+      if (parts[0].length > 3 || !parts.slice(1).every((part) => part.length === 3)) return null;
+      normalized = parts.join('');
+    } else {
+      const [integerPart, fraction] = parts;
+      const groupingPossible = fraction.length === 3 && integerPart.length <= 3 && !/^0+$/u.test(integerPart);
+      if (!groupingPossible) {
+        normalized = `${integerPart}.${fraction}`;
+        decimals = fraction.length;
+      } else {
+        const sign = negative ? -1 : 1;
+        const asGrouping = Number(`${integerPart}${fraction}`);
+        const asDecimal = Number(`${integerPart}.${fraction}`);
+        // Currency: grouping unless the currency has three minor digits.
+        // Plain numbers keep the long-standing reading (comma groups, dot decimal).
+        const chooseDecimal = mode === 'currency' ? threeDecimalCurrency : separator === '.';
+        if (chooseDecimal) {
+          normalized = `${integerPart}.${fraction}`;
+          decimals = 3;
+          ambiguity = { chosen: 'decimal', alternative: sign * asGrouping };
+        } else {
+          normalized = `${integerPart}${fraction}`;
+          ambiguity = { chosen: 'grouping', alternative: sign * asDecimal };
+        }
+      }
+    }
+  }
+
+  const magnitude = Number(normalized);
+  if (!Number.isFinite(magnitude)) return null;
+  const value = negative && magnitude !== 0 ? -magnitude : magnitude;
+  return { value, decimals, ...(ambiguity ? { ambiguity } : {}) };
 }
 
-export function normalizeFieldValue(value: unknown, type: PresetExtractedField['type']): PrimitiveFieldValue {
+/** Decimal places a number literal was written with, e.g. 3 for 1.234. */
+function decimalsOf(value: number): number {
+  const text = String(value);
+  if (text.includes('e')) return 0;
+  return text.split('.')[1]?.length ?? 0;
+}
+
+function formatAmount(value: number, sourceDecimals: number, threeDecimalCurrency: boolean): string {
+  const minorUnits = threeDecimalCurrency ? 3 : 2;
+  // Never round away digits the document printed: "0.125" stays "0.125".
+  return value.toFixed(Math.min(10, Math.max(minorUnits, sourceDecimals)));
+}
+
+/** Context for {@link normalizeFieldValue}'s warnings. */
+export interface FieldNormalizationContext {
+  /** Field name used in warnings. */
+  field?: string;
+  /** The document's currency (e.g. the preset's `currency` field), when known. */
+  currency?: string;
+  /** Receives non-fatal findings, such as an ambiguous separator. */
+  warnings?: string[];
+}
+
+export function normalizeFieldValue(
+  value: unknown,
+  type: PresetExtractedField['type'],
+  context: FieldNormalizationContext = {},
+): PrimitiveFieldValue {
+  const label = context.field ? `Field "${context.field}"` : 'Value';
+  const warn = (message: string): void => {
+    context.warnings?.push(message);
+  };
   if (value == null) {
     return type === 'list' ? [] : null;
   }
@@ -220,22 +398,38 @@ export function normalizeFieldValue(value: unknown, type: PresetExtractedField['
     return scalarText(value).trim();
   }
 
-  if (type === 'number') {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      return value;
+  if (type === 'number' || type === 'currency') {
+    const text = scalarText(value).trim();
+    const threeDecimalCode = threeDecimalCurrencyIn(typeof value === 'string' ? value : undefined)
+      ?? threeDecimalCurrencyIn(context.currency);
+    const threeDecimal = type === 'currency' && threeDecimalCode !== undefined;
+    if (typeof value === 'number') {
+      return type === 'number' ? value : formatAmount(value, Math.min(6, decimalsOf(value)), threeDecimal);
     }
-    const numeric = parseLocaleNumber(scalarText(value));
-    return numeric !== null ? numeric : scalarText(value).trim();
-  }
-
-  if (type === 'currency') {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      return value.toFixed(2);
+    const parsed = parseLocaleNumber(text, type, threeDecimal);
+    if (parsed === 'separator-after-letters') {
+      warn(`${label}: "${text}" has a separator directly after letters, which is not read as a decimal point; kept as text.`);
+      return text;
     }
-
-    const trimmed = scalarText(value).trim();
-    const numeric = parseLocaleNumber(trimmed);
-    return numeric !== null ? numeric.toFixed(2) : trimmed;
+    if (!parsed) {
+      if (type === 'currency' && /\d/u.test(text)) {
+        warn(`${label}: "${text}" could not be read as a single amount; kept as text.`);
+      }
+      return text;
+    }
+    const render = (amount: number): string => (
+      type === 'currency' ? formatAmount(amount, parsed.decimals, threeDecimal) : String(amount)
+    );
+    if (parsed.ambiguity) {
+      const chosen = parsed.ambiguity.chosen === 'grouping'
+        ? `read as ${render(parsed.value)} (thousands separator)`
+        : `read as ${render(parsed.value)} (decimal separator${threeDecimal ? `; ${threeDecimalCode} uses three decimals` : ''})`;
+      const alternative = parsed.ambiguity.chosen === 'grouping'
+        ? `if it is a decimal separator the value is ${parsed.ambiguity.alternative}`
+        : `if it is a thousands separator the value is ${parsed.ambiguity.alternative}`;
+      warn(`${label}: "${text}" has one separator followed by exactly three digits, which is ambiguous; ${chosen}; ${alternative}.`);
+    }
+    return type === 'number' ? parsed.value : render(parsed.value);
   }
 
   return scalarText(value).trim();
@@ -320,10 +514,23 @@ export function normalizePresetPayload(
   preset: ExtractionPreset,
 ): PresetStructuredOutput {
   const validationErrors: string[] = [];
+  const validationWarnings: string[] = [];
 
   // audit T-01: rule.field is the stable contract key for the fields map.
   // Enforce uniqueness so diverging presets cannot silently overwrite entries.
   const seenFieldKeys = new Set<string>();
+
+  const rawFieldEntry = (key: string): { value: unknown; confidence: unknown } => {
+    const rawField = rawPayload.fields && Object.hasOwn(rawPayload.fields, key) ? rawPayload.fields[key] : undefined;
+    return isRecord(rawField)
+      ? { value: rawField.value, confidence: rawField.confidence }
+      : { value: rawField, confidence: undefined };
+  };
+
+  // The document's own currency, so "1.234" on a KWD invoice reads as a
+  // three-decimal amount rather than as thousands grouping.
+  const currencyRule = preset.rules.find((rule) => rule.field === 'currency' && rule.type === 'text');
+  const documentCurrency = currencyRule ? rawFieldEntry(currencyRule.field).value : undefined;
 
   const fields: Record<string, PresetExtractedField> = {};
   for (const rule of preset.rules) {
@@ -333,31 +540,71 @@ export function normalizePresetPayload(
     }
     seenFieldKeys.add(rule.field);
 
-    const rawField = rawPayload.fields?.[rule.field];
-    const rawValue = typeof rawField === 'object' && rawField !== null && !Array.isArray(rawField)
-      ? rawField.value
-      : rawField;
-    const rawConfidence = typeof rawField === 'object' && rawField !== null && !Array.isArray(rawField)
-      ? rawField.confidence
-      : undefined;
+    const raw = rawFieldEntry(rule.field);
 
     // audit T-09: bound string field values just like row cells.
-    const rawNormalized = normalizeFieldValue(rawValue, rule.type);
-    const value = typeof rawNormalized === 'string' ? clampFieldLength(rawNormalized) : rawNormalized;
+    const rawNormalized = normalizeFieldValue(raw.value, rule.type, {
+      field: rule.field,
+      currency: typeof documentCurrency === 'string' ? documentCurrency : undefined,
+      warnings: validationWarnings,
+    });
+    const clamped = typeof rawNormalized === 'string' ? clampFieldLength(rawNormalized) : rawNormalized;
+    const value = checkTypedValue(rule, clamped, validationWarnings);
     validateRule(rule, value, validationErrors);
+
+    // A value dropped as unsafe carries no confidence: nothing was kept.
+    const dropped = value === null && clamped !== null;
+    let confidence = 0;
+    if (raw.confidence !== undefined && !dropped) {
+      const reading = readConfidence(raw.confidence, rule.field);
+      if ('value' in reading) {
+        confidence = reading.value;
+        if (reading.warning) validationWarnings.push(reading.warning);
+      }
+    }
 
     fields[rule.field] = {
       type: rule.type,
       value,
-      confidence: clampConfidence(rawConfidence),
+      confidence,
       required: Boolean(rule.required),
     };
+  }
+
+  const unknownFields = Object.keys(rawPayload.fields ?? {}).filter((key) => !seenFieldKeys.has(key));
+  if (unknownFields.length > 0) {
+    validationWarnings.push(
+      `Ignored field(s) the "${preset.id}" preset does not define: ${unknownFields.map((key) => `"${key}"`).join(', ')}.`,
+    );
   }
 
   const { rows, truncatedRowCount } = normalizeRows(rawPayload.rows);
   if (truncatedRowCount > 0) {
     // audit T-09: surface truncation so consumers know the export is partial.
     validationErrors.push(`Row output truncated to ${MAX_ROWS} rows; ${truncatedRowCount} additional row(s) dropped.`);
+  }
+  const fixedColumns = preset.tableColumns && preset.tableColumns.length > 0 ? preset.tableColumns : undefined;
+  if (rows && fixedColumns) {
+    const known = new Set(fixedColumns);
+    const extraColumns = new Map<string, number>();
+    rows.forEach((row, index) => {
+      for (const key of Object.keys(row)) {
+        if (!known.has(key) && !extraColumns.has(key)) extraColumns.set(key, index);
+      }
+    });
+    if (extraColumns.size > 0) {
+      const listed = [...extraColumns].map(([key, index]) => `"${key}" (first in row ${index + 1})`).join(', ');
+      validationWarnings.push(
+        `Row column(s) the "${preset.id}" preset does not define are kept in JSON but omitted from CSV and Markdown: ${listed}.`,
+      );
+    }
+  }
+  if (preset.outputShape === 'table' && !rows) {
+    validationWarnings.push(
+      fixedColumns
+        ? 'No line-item rows were extracted; CSV output contains only the header row.'
+        : 'No line-item rows were extracted.',
+    );
   }
 
   return {
@@ -374,10 +621,141 @@ export function normalizePresetPayload(
       ? rawPayload.warnings.map((warning) => String(warning).trim()).filter(Boolean)
       : undefined,
     validationErrors: validationErrors.length > 0 ? validationErrors : undefined,
+    validationWarnings: validationWarnings.length > 0 ? validationWarnings : undefined,
   };
 }
 
-function escapeMarkdown(value: string): string {
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/u;
+const EMAIL = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/u;
+/** A scheme-like prefix: everything before the first ":" that holds no "/", "?", or "#". */
+const URL_SCHEME_PREFIX = /^([^:/?#]*):(.*)$/su;
+const DNS_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/iu;
+const DOTTED_QUAD = /^\d{1,3}(?:\.\d{1,3}){3}$/u;
+
+/**
+ * Whether a parsed hostname names a real host for a value written without a
+ * scheme: `localhost`, a dotted-quad or bracketed IPv6 literal, or a DNS name
+ * with at least two labels and an alphabetic (or punycode) top-level label.
+ * `written` is the lower-cased text as written, so the URL parser's
+ * numeric-host rewriting ("12345" -> 0.0.48.57) never turns a number into an
+ * address.
+ */
+function isRealHostname(hostname: string, written: string): boolean {
+  if (hostname === 'localhost') return true;
+  if (/^\[[0-9a-f:.]+\]$/iu.test(hostname)) return true;
+  if (DOTTED_QUAD.test(hostname)) return written.startsWith(hostname);
+  const labels = hostname.split('.');
+  if (labels.length < 2 || !labels.every((label) => DNS_LABEL.test(label))) return false;
+  const tld = labels[labels.length - 1];
+  return /^[a-z]{2,63}$/iu.test(tld) || /^xn--[a-z0-9-]+$/iu.test(tld);
+}
+
+type UrlVerdict = { ok: true } | { ok: false; scheme?: string };
+
+/** The scheme a prefix names, for the warning; a dotted prefix is a host, not a scheme. */
+function schemeOf(prefix: RegExpExecArray | null): { scheme?: string } {
+  if (!prefix || !/^[a-z][a-z0-9+-]*$/iu.test(prefix[1])) return {};
+  return { scheme: prefix[1].toLowerCase() };
+}
+
+/**
+ * Decide whether a url-typed value is safe to keep. Only two shapes are kept:
+ * an absolute http(s) URL whose scheme is written plainly at the start, and a
+ * scheme-less `host[:port][/path]` whose host parses as a real host name.
+ * Everything else — `javascript:`, `data:`, `vbscript:`, `file:` in any case
+ * mix, whitespace or control characters hidden in the scheme ("java\tscript:"),
+ * a remainder that merely starts with a digit ("javascript:1;alert(1)"), or
+ * text that is not a URL at all — is rejected, because a consumer that renders
+ * the value as a link would execute or open it.
+ */
+function judgeUrl(value: string): UrlVerdict {
+  const trimmed = value.trim();
+  // Browsers ignore ASCII whitespace and control characters inside a scheme
+  // ("java\tscript:"), so the scheme is identified with them removed.
+  // eslint-disable-next-line no-control-regex
+  const compact = trimmed.replace(/[\u0000- \u007f]/gu, '');
+  // eslint-disable-next-line no-control-regex
+  const hasControl = /[\u0000-\u001f\u007f-\u009f]/u.test(trimmed);
+  const prefix = URL_SCHEME_PREFIX.exec(compact);
+
+  if (prefix && /^https?$/iu.test(prefix[1])) {
+    // The scheme must be written plainly: "ht\ttp://" is not kept.
+    if (hasControl || !/^https?:\/\//iu.test(trimmed)) return { ok: false };
+    try {
+      const url = new URL(trimmed);
+      // Userinfo is refused as in the scheme-less branch: in
+      // "https://paypal.com@evil.example" the visible name is not the host.
+      if (url.username !== '' || url.password !== '') return { ok: false };
+      return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname !== '' ? { ok: true } : { ok: false };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  // Without an http(s) scheme the value must be a plain host[:port][/path]:
+  // no whitespace or control characters, starting with a host character, and,
+  // when a colon comes before any "/", a numeric port right after it
+  // ("localhost:3000", "example.com:8080/x").
+  if (hasControl || /\s/u.test(trimmed) || !/^[\p{L}\p{N}[]/u.test(trimmed)) return { ok: false, ...schemeOf(prefix) };
+  if (prefix && !/^\d{1,5}(?:[/?#]|$)/u.test(prefix[2])) return { ok: false, ...schemeOf(prefix) };
+  let url: URL;
+  try {
+    url = new URL(`http://${trimmed}`);
+  } catch {
+    return { ok: false, ...schemeOf(prefix) };
+  }
+  if (url.username !== '' || url.password !== '' || !isRealHostname(url.hostname, trimmed.toLowerCase())) {
+    return { ok: false, ...schemeOf(prefix) };
+  }
+  return { ok: true };
+}
+
+function isCalendarDate(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1) return false;
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return day <= daysInMonth;
+}
+
+/**
+ * Check a normalized value against its declared type. Values that merely look
+ * wrong (an ambiguous `12/01/26` date, a malformed email) are kept with a
+ * warning: the document may genuinely print them that way. A URL is stricter:
+ * anything but an http(s) URL or a plain host name (see judgeUrl) is dropped
+ * to null, because a consumer that renders it as a link would execute or open
+ * it.
+ */
+function checkTypedValue(rule: ExtractionRule, value: PrimitiveFieldValue, warnings: string[]): PrimitiveFieldValue {
+  if (typeof value !== 'string' || value.trim() === '') return value;
+  const label = `Field "${rule.field}"`;
+  if (rule.type === 'date') {
+    const match = ISO_DATE.exec(value);
+    if (!match || !isCalendarDate(Number(match[1]), Number(match[2]), Number(match[3]))) {
+      warnings.push(`${label}: "${value}" is not an ISO 8601 date (YYYY-MM-DD); its day/month order or year may be ambiguous.`);
+    }
+    return value;
+  }
+  if (rule.type === 'email') {
+    const candidate = value.replace(/^mailto:/iu, '');
+    if (!EMAIL.test(candidate)) warnings.push(`${label}: "${value}" does not look like an email address.`);
+    return value;
+  }
+  if (rule.type === 'url') {
+    const verdict = judgeUrl(value);
+    if (verdict.ok) return value;
+    warnings.push(verdict.scheme
+      ? `${label}: "${value}" uses the "${verdict.scheme}:" scheme; only http and https URLs are kept, so the value was set to null.`
+      : `${label}: "${value}" is not a valid http(s) URL or host name, so the value was set to null.`);
+    return null;
+  }
+  return value;
+}
+
+/**
+ * Escape untrusted text for one line of GFM: a table cell or a list item.
+ * Exported so every Markdown renderer of model-supplied values (template and
+ * agentic output alike) neutralizes them the same way.
+ */
+export function escapeMarkdown(value: string): string {
   // audit T-05: a GFM table cell must stay on one line and must not let the
   // model's content open code spans or inject raw HTML. We strip C0/C1
   // control chars (CR/LF survive), collapse line breaks to a space, then
@@ -442,6 +820,11 @@ export function buildPresetMarkdown(result: PresetStructuredOutput, preset: Extr
     sections.push('', '## Validation', '', ...result.validationErrors.map((issue) => `- ${escapeMarkdown(issue)}`));
   }
 
+  if (result.validationWarnings && result.validationWarnings.length > 0) {
+    // These quote model output (field values), so they are escaped like warnings.
+    sections.push('', '## Validation warnings', '', ...result.validationWarnings.map((issue) => `- ${escapeMarkdown(issue)}`));
+  }
+
   if (result.warnings && result.warnings.length > 0) {
     // audit T-05: warnings come from model output, so escape them too.
     sections.push('', '## Warnings', '', ...result.warnings.map((warning) => `- ${escapeMarkdown(warning)}`));
@@ -450,14 +833,24 @@ export function buildPresetMarkdown(result: PresetStructuredOutput, preset: Extr
   return sections.join('\n');
 }
 
+/**
+ * CSV for a table preset. With declared `tableColumns` the header is known
+ * before extraction, so a document with no line items still yields a valid,
+ * header-only CSV (and `normalizePresetPayload` warns about the empty table);
+ * discarding the extracted fields over an empty table helped nobody. Only a
+ * table preset without declared columns and without rows has no CSV.
+ */
 export function buildPresetCsv(result: PresetStructuredOutput, preset: ExtractionPreset): string | undefined {
-  if (preset.outputShape !== 'table' || !result.rows || result.rows.length === 0) {
+  if (preset.outputShape !== 'table') {
     return undefined;
   }
-
+  const rows = result.rows ?? [];
   const columns = preset.tableColumns && preset.tableColumns.length > 0
     ? preset.tableColumns
-    : Object.keys(result.rows[0]);
+    : rows.length > 0 ? Object.keys(rows[0]) : undefined;
+  if (!columns) {
+    return undefined;
+  }
 
   const escapeCsv = (value: string) => {
     // audit H-11: neutralize spreadsheet formula injection. Cells beginning with
@@ -480,7 +873,7 @@ export function buildPresetCsv(result: PresetStructuredOutput, preset: Extractio
 
   return [
     columns.join(','),
-    ...result.rows.map((row) => columns.map((column) => escapeCsv(row[column] ?? '')).join(',')),
+    ...rows.map((row) => columns.map((column) => escapeCsv(row[column] ?? '')).join(',')),
   ].join('\n');
 }
 
@@ -608,7 +1001,10 @@ export async function runExtractionPreset(
 
     // Gemini 3.x: omit temperature/topP/topK; use media resolution for OCR fidelity.
     let generationConfig: Record<string, unknown> = {
-      maxOutputTokens: 16384,
+      maxOutputTokens: options?.maxTokens ?? DEFAULT_TEMPLATE_MAX_TOKENS,
+      // Each continuation hop re-bills the input and runs inside one SDK call,
+      // past --max-cost; a CONTINUATION stop is reported as truncated output.
+      automaticContinuation: false,
       responseMimeType: 'application/json',
       responseJsonSchema: buildPresetResponseSchema(preset),
       mediaResolution: generateContentMediaResolution(mimeType),

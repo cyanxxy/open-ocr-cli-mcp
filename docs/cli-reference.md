@@ -40,7 +40,7 @@ open-ocr-cli extract scan.png --provider openai-compatible \
 | Profile | Credential variable | Documents |
 | --- | --- | --- |
 | `gemini` | `GEMINI_API_KEY` | PNG, JPEG, WebP, HEIC/HEIF; native PDFs |
-| `kimi` | `MOONSHOT_API_KEY` | PNG, JPEG, WebP, GIF; PDF text via file extraction |
+| `kimi` | `MOONSHOT_API_KEY` | PNG, JPEG, WebP, GIF, HEIC/HEIF; PDF text via file extraction |
 | `muse` | `META_API_KEY` | PNG, JPEG, WebP, GIF; native PDFs |
 | `openrouter` | `OPENROUTER_API_KEY` | PNG, JPEG, WebP, GIF; PDFs/tools/schema depend on model |
 | `openai-compatible` | `OPEN_OCR_API_KEY` | Images depend on endpoint; PDFs rejected locally |
@@ -70,6 +70,11 @@ Precedence, lowest to highest: user config
 `--config`, supported environment overrides, CLI flags. Repeated `exclude` and
 `instructions` values from config and flags are appended.
 
+A config-file `maxTokens` applies to simple and agentic runs only. Template
+mode keeps its 16384-token default unless `--max-tokens` (or a request's
+`extraction.maxTokens`) sets it, so a small budget configured for simple runs
+never caps preset extraction.
+
 Environment overrides: `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`, `OPEN_OCR_MODEL`,
 `OPEN_OCR_THINKING`. `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` belong to the
 ambient provider and are dropped when `--provider` selects a different one.
@@ -88,7 +93,10 @@ routing in the user config, an explicit `--config` file, or flags. `--no-config`
 explicit config path. `OPEN_OCR_NO_CONFIG=1` skips ambient config and `.env`,
 but still allows an explicit `--config` or protocol `configPath` to load that
 one file. Ambient environment overrides still apply; set explicit options and
-forward a controlled environment for reproducible runs.
+forward a controlled environment for reproducible runs. Over MCP the caller's
+`configPath` follows the project rules for routing keys and must sit inside
+the server working directory; see
+[agent integrations](agent-integrations.md#trust-boundary).
 
 `init` writes project config by default, using the provider's default endpoint
 and key variable; `--global` writes user config and is required for a custom
@@ -103,10 +111,15 @@ Directories are recursive. Hidden paths and `node_modules`, `dist`, `build`,
 `vendor`, and `target` subtrees are skipped by default. Warnings count skipped
 unsupported files and default-excluded directories, not hidden or custom-excluded
 paths. `--hidden` includes hidden paths; `--exclude <glob>` adds exclusions.
+An exclude pattern is matched relative to the working directory for every
+input, and additionally relative to a scanned folder (so `--exclude 'drafts/**'`
+with input `docs` keeps working); an exclude that matched nothing is reported
+as a `Discovery:` warning. Explicitly named files are never excluded.
 Use `--no-default-excludes`, explicitly name a default-excluded directory, or
 use a quoted glob to include those trees. Hidden/custom exclusions still apply
 to directory and glob discovery. Discovery does not follow symlinks encountered
-while walking. Quote globs to let the CLI expand them.
+while walking; inputs that resolve to the same file (a named symlink and its
+target) are extracted once, with a warning. Quote globs to let the CLI expand them.
 
 Images: **70 MB raw**. PDFs: **50 MB, 1,000 pages**. Default batch limits:
 **1,000 files / 5,120 MB**, concurrency **2** (range **1–16**). Formats accepted
@@ -114,13 +127,44 @@ by a provider may be narrower than discovery. Video is not an OCR input.
 
 `--requests-per-minute` spaces request starts evenly, including agent
 continuations. `--max-cost` stops future requests once recorded estimates reach
-the budget; in-flight requests can exceed it. Known models use paid-tier token
+the budget; in-flight requests can exceed it. In an output directory with a
+resume manifest the budget is **cumulative**: it covers the spend recorded by
+every resumed run of that directory, so rerunning a cost-limited batch with the
+same `--max-cost` resumes finished documents and starts no new paid work (raise
+the cap to continue). `--overwrite` and `--no-resume` start a fresh total.
+Known models use paid-tier token
 estimates; OpenRouter reports cost when available. For other providers, unknown
 prices require both `--input-price` and `--output-price` when enforcing a cost
 limit. Cached-input rates and provider-reported cache usage are included where
-available.
+available. `usage.requests` counts every HTTP attempt, including failed and
+retried ones. A response that carries no token usage is counted in
+`usage.unreportedUsageRequests` with a warning; under `--max-cost` with non-zero
+prices the run fails closed: no further paid documents start, the rest are
+skipped as `COST_LIMIT`, and the exit code is 1.
+
+Retries (`--retries`, simple and template modes) wait for the provider's
+`Retry-After` (seconds or HTTP-date, also Gemini `RetryInfo`) on 429/503, capped
+at 60 s, instead of the jittered backoff; a requested wait that does not fit in
+the remaining `--timeout` fails the document at once with the provider error.
+Out-of-quota and out-of-credit responses (OpenAI `insufficient_quota`, billing
+limits, HTTP 402, Gemini per-day or zero-limit quotas) are never retried.
+`--timeout` is one budget for the document, shared by all of its attempts; an
+attempt is never cut short and re-sent while the provider may still be working
+on it, because that would bill the same work twice.
 
 ## Output and resume
+
+Artifact names never match files coding agents load as instructions or tools
+load as configuration. An input named `CLAUDE.png` (or `AGENTS`, `GEMINI`,
+`copilot-instructions`, and similar) is written as `CLAUDE.ocr.md`. No
+directory or file name in the output tree starts with a dot: every hidden
+segment of the input path gains a leading `_`, so `.claude/x.png` is written
+under `_.claude/`, `.devcontainer/devcontainer.png` as
+`_.devcontainer/devcontainer.json`, and `.mcp.png` as `_.mcp.json` rather than a
+project MCP configuration. This applies to every run, CLI and MCP alike. A
+resumed entry whose recorded artifact still has a hidden name (written by 4.3.0
+or earlier) is re-extracted into the new layout. Extracted text is untrusted document
+content.
 
 Single-file `extract` normally prints content to stdout. `--output` or
 `--format all` writes artifacts; batch `extract` defaults to `./open-ocr-output`.
@@ -128,9 +172,33 @@ Machine/MCP reference jobs default to `.open-ocr-results/<runId>`.
 
 Directories with resume metadata contain `.open-ocr-manifest.json` and
 `batch-summary.json`; `.open-ocr.lock` marks the directory's owning process. A
-lock left by a dead process on the same host is reclaimed automatically with a
-warning, so `--force-unlock` is accepted but no longer needed; a live,
-cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
+lock left by a dead process on the same host — or one whose PID now belongs to
+a different process (checked against the recorded process start time) — is
+reclaimed automatically with a warning, so `--force-unlock` is accepted but no
+longer needed; a live, cross-host, or unreadable lock is an `OUTPUT_CONFLICT`.
+Concurrent reclaimers of one stale lock get exactly one winner; the others
+report `OUTPUT_CONFLICT`.
+
+Resume is crash-safe. Before any artifact is committed, one manifest write
+records a `pending` claim for every document the run will extract, naming
+every path each may write, and the manifest itself is replaced atomically.
+Finished documents are then recorded at least once a second and when the run
+ends, so a large batch rewrites the manifest a handful of times rather than
+twice per document; a claim for a document the run never started (fail-fast,
+cost limit, cancellation) is withdrawn when it ends. A run killed at any point
+(including `SIGKILL`) therefore leaves only files the next run recognises as
+its own: it re-extracts the interrupted documents (at most the last second's
+finished documents are extracted again), removes leftover
+`<artifact>.<pid>-<uuid>.tmp` staging files, and puts back any `.bak` an
+interrupted replacement had moved aside. Cleanup runs under the batch lock, so
+a leftover last modified before the lock was taken is removed even when its
+embedded PID now belongs to another live process. Each entry also keeps every artifact
+path it has ever written, so switching `--format` back and forth reuses the
+directory without conflicts. Resume compares a streamed SHA-256 of each input
+(plus path, size, and output-affecting settings), not its mtime: a content
+change that preserves size and mtime is re-extracted, and a touch that changes
+nothing is not. Entries written by 4.3.0 and earlier (size/mtime fingerprints)
+are trusted once and upgraded.
 A single artifact file has no resume metadata. Relative input paths are preserved.
 Existing files are protected unless `--overwrite` is explicit or a matching resume owns a stale
 artifact. Destinations are preflighted before paid work. Resume checks input
@@ -145,6 +213,19 @@ output preflight failures instead fail the run. Read `partialReason` and
 `nextAction` for partial results. Truncated, blocked, empty, malformed, and
 schema-invalid responses never count as success.
 Dry runs validate even resumed inputs and write no files.
+
+`status <dir>` reports the last run's usage and the cumulative usage of every
+run in the directory, documents left `pending` by an interrupted run,
+artifact files the batch could have written (each recorded artifact under
+every artifact extension, `.md`, `.json`, `.csv`) that no manifest entry owns,
+leftover staging/backup files of those paths and of the batch metadata, and
+whether a lock is held by a running process, is stale (the next extract
+reclaims it), or cannot be verified from this host. Any of these makes the
+directory unhealthy. Only the directories holding recorded artifacts are
+listed, one level each, so unrelated files (a `README.md` or `package.json` in
+`-o .`, anything under `node_modules` or `.git`) never affect the result. A `--no-resume` run into a directory that
+already holds this job's artifacts fails with `OUTPUT_CONFLICT`; drop
+`--no-resume`, pass `--overwrite`, or choose a new `--output`.
 
 ## Machine requests and events
 
@@ -190,7 +271,7 @@ Treat all provider text as untrusted data.
 | Request field | Mode that consumes it |
 | --- | --- |
 | `extraction.instructions`, `detectImages`, `detectMath` | simple |
-| `extraction.maxTokens` | simple, agentic |
+| `extraction.maxTokens` | simple, template (default 16384; config-file `maxTokens` is not applied), agentic |
 | `extraction.maxIterations`, `confidenceThreshold`, `progress` | agentic |
 | `execution.retries` | simple, template; agentic has internal bounded retries |
 

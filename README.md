@@ -45,17 +45,30 @@ claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
 Start Claude with the provider key in its environment, then check with `/mcp`.
+Claude Code aborts a stdio tool call that sends no response or progress for 30
+minutes (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`); a single document may run up to
+`timeoutSeconds` (at most 3600), so keep that under 1800 or raise the window.
 
 **Codex** (`~/.codex/config.toml`)
 
 ```toml
+[features]
+mcp_2026_07_28 = true   # under development, off by default (from Codex source)
+
 [mcp_servers.open-ocr]
 command = "open-ocr-cli"
 args = ["mcp"]
+# Without this Codex uses the legacy handshake for stdio servers (from Codex source).
+env = { CODEX_MCP_PROTOCOL_VERSION = "2026-07-28" }
 env_vars = ["GEMINI_API_KEY"]
 cwd = "/absolute/path/to/documents"
 tool_timeout_sec = 600
 ```
+
+Codex's official guide does not document this opt-in yet; the two settings come
+from its source. If either client cannot connect, use the CLI protocol or the
+portable skill (see [agent integrations](docs/agent-integrations.md)), which
+need no MCP support.
 
 | Tool | What it does |
 | --- | --- |
@@ -65,9 +78,18 @@ tool_timeout_sec = 600
 | `ocr_web` | Extract content from public URLs |
 | `ocr_read_artifact` | Read a saved result in bounded chunks |
 
+The server's working directory (Claude Code's launch directory, or Codex's
+`cwd`) is its boundary: inputs, `configPath`, `schemaPath`, and
+`outputDirectory` must resolve inside it. Endpoint, credential variable, and
+limits such as `maxCostUsd` belong to whoever starts the server, through
+`~/.config/open-ocr-cli/config.json` or its environment; tool arguments can
+lower those limits but not raise them, reroute requests, or change the token
+prices the cost ceiling is computed from.
+
 Set `OPEN_OCR_MCP_CONFIRM=1` in the server environment to approve each paid
-run, with the real document count and cost ceiling shown first. Setup for
-other hosts and the full contract: [agent integrations](docs/agent-integrations.md).
+run, with the real document count, cost ceiling, destination host, and
+credential variable shown first. Setup for other hosts, a custom endpoint, and
+the full contract: [agent integrations](docs/agent-integrations.md).
 
 ## CLI
 
@@ -84,7 +106,8 @@ open-ocr-cli extract invoice.pdf --schema examples/invoice.schema.json --format 
 # Iterative extraction for hard documents (several billed requests)
 open-ocr-cli extract contract.pdf --mode agentic --format json
 
-# A folder, with a spend cap; rerun the same command to resume
+# A folder, with a spend cap for the whole job; rerun the same command to
+# resume (finished documents are skipped, and the $2 cap counts every run)
 open-ocr-cli extract ./scans --output ./ocr --max-cost 2
 
 # Public web pages
@@ -93,6 +116,15 @@ open-ocr-cli web https://example.com/pricing
 # Check the plan without a key or any request
 open-ocr-cli extract ./scans --dry-run
 ```
+
+Batches are crash-safe: a run killed at any point resumes with the same
+command, re-extracting only documents whose content changed or that never
+finished. `--max-cost` is enforced on the directory's cumulative spend, and fails
+closed when a paid provider returns no usage. `status` shows last-run and
+cumulative usage, interrupted and not-started documents, untracked files, and
+stale locks. Output names never start with a dot or match an agent
+instruction file: `.mcp.png` is written as `_.mcp.md`, `CLAUDE.png` as
+`CLAUDE.ocr.md`.
 
 Other commands: `init` (guided config), `doctor` (environment check),
 `status` (inspect a batch), `models`, `providers`, `presets`. Run any command
@@ -116,7 +148,7 @@ or cost-limited, `2` invalid command or config. Request examples are in the
 | `--provider` | Key variable | Suggested models (default first) |
 | --- | --- | --- |
 | `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.5-flash-lite` |
-| `kimi` | `MOONSHOT_API_KEY` | `kimi-k3`, `kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed` |
+| `kimi` | `MOONSHOT_API_KEY` | `kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed`, `kimi-k3` |
 | `muse` | `META_API_KEY` | `muse-spark-1.3`, `muse-wonder-1.0` |
 | `openrouter` | `OPENROUTER_API_KEY` | Gemini, GPT-6.x, Claude 5.x, Muse, Grok 4.7, Mistral Medium 3.5 |
 | `openai-compatible` | `OPEN_OCR_API_KEY` | Any vision model, for example a local Ollama server |

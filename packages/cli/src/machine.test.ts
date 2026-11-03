@@ -31,6 +31,34 @@ afterEach(async () => {
 });
 
 describe('machine request execution', () => {
+  it('keeps the run surface unconfined: its caller is the person at the terminal', async () => {
+    const elsewhere = await mkdtemp(path.join(tmpdir(), 'open-ocr-machine-elsewhere-'));
+    try {
+      await writeFile(path.join(elsewhere, 'invoice.jpg'), JPEG_BYTES);
+      const execution = await executeOcrJobRequest({
+        protocolVersion: 2,
+        operation: 'extract',
+        noConfig: true,
+        inputs: [{ type: 'path', path: path.join(elsewhere, 'invoice.jpg') }],
+        delivery: { mode: 'reference', outputDirectory: path.join(elsewhere, 'out') },
+        dryRun: true,
+      }, { cwd: directory, runId: 'run-unconfined', abortController: new AbortController() });
+      expect(execution.result).toMatchObject({ ok: true, status: 'validated' });
+
+      // The same request marked as coming from MCP is confined.
+      await expect(executeOcrJobRequest({
+        protocolVersion: 2,
+        operation: 'extract',
+        noConfig: true,
+        inputs: [{ type: 'path', path: path.join(elsewhere, 'invoice.jpg') }],
+        dryRun: true,
+      }, { cwd: directory, runId: 'run-confined', abortController: new AbortController(), boundary: 'mcp' }))
+        .rejects.toMatchObject({ code: 'INPUT_INVALID' });
+    } finally {
+      await rm(elsewhere, { recursive: true, force: true });
+    }
+  });
+
   it('destroys a blocked request stdin stream when aborted', async () => {
     const input = new PassThrough();
     const abortController = new AbortController();
@@ -261,7 +289,7 @@ describe('machine request execution', () => {
     // Reported on the host channel as it happens, and carried in the result so
     // a caller that only reads the machine payload still sees it.
     expect(warnings).toEqual([
-      'ignoring option(s) that template mode does not use: extraction.detectMath, extraction.maxTokens',
+      'ignoring option(s) that template mode does not use: extraction.detectMath',
     ]);
     expect(execution.result.status).toBe('validated');
     expect(execution.result.warnings).toEqual(warnings);

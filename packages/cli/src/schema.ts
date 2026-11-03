@@ -1,13 +1,13 @@
 import { Buffer } from 'node:buffer';
-import { open } from 'node:fs/promises';
 import path from 'node:path';
 
-import Ajv2020, { type ValidateFunction } from 'ajv/dist/2020.js';
+import Ajv2020, { type ErrorObject, type ValidateFunction } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 
 import { findSchemaCompatibilityIssues } from '@open-ocr/engine/gemini/schemaCompat';
 import type { JsonValue } from '@open-ocr/engine/gemini/types';
 import { CliExitError } from './errors';
+import { jsonSyntaxLocation, openRegularFile } from './fileBoundary';
 
 const MAX_SCHEMA_BYTES = 1024 * 1024;
 const MAX_LISTED_SCHEMA_ISSUES = 3;
@@ -133,7 +133,7 @@ function schemaFileError(message: string, cause: unknown): CliExitError {
 function unreadableSchemaError(error: unknown, schemaPath: string): CliExitError | undefined {
   const code = (error as NodeJS.ErrnoException).code;
   if (code === 'ENOENT') return schemaFileError(`Schema file not found: ${schemaPath}`, error);
-  if (code === 'EISDIR') return schemaFileError(`Schema path is not a file: ${schemaPath}`, error);
+  if (code === 'EISDIR' || code === 'ENOTREG') return schemaFileError(`Schema path is not a file: ${schemaPath}`, error);
   if (code === 'EACCES' || code === 'EPERM') {
     return schemaFileError(`Schema file is not readable: ${schemaPath}`, error);
   }
@@ -172,7 +172,8 @@ export async function loadCustomSchema(schemaPath: string, cwd: string): Promise
   // check here applies to the exact bytes we go on to parse.
   let handle;
   try {
-    handle = await open(absolutePath, 'r');
+    // Non-blocking, regular files only: a FIFO or device would hang the read.
+    handle = await openRegularFile(absolutePath, schemaPath);
   } catch (error) {
     throw unreadableSchemaError(error, schemaPath) ?? error;
   }
@@ -185,7 +186,8 @@ export async function loadCustomSchema(schemaPath: string, cwd: string): Promise
       parsed = JSON.parse(await handle.readFile('utf8')) as unknown;
     } catch (error) {
       if (error instanceof SyntaxError) {
-        throw new Error(`Invalid JSON in schema ${schemaPath}: ${error.message}`, { cause: error });
+        // The parser message quotes the file's opening bytes; report the position only.
+        throw new Error(`Invalid JSON in schema ${schemaPath}${jsonSyntaxLocation(error)}`, { cause: error });
       }
       throw unreadableSchemaError(error, schemaPath) ?? error;
     }
@@ -199,8 +201,42 @@ export function assertCustomSchemaOutput(
   schema: Record<string, unknown>,
   value: unknown,
 ): asserts value is JsonValue {
-  const { ajv, validate } = compileSchema(schema);
+  const { validate } = compileSchema(schema);
   if (validate(value)) return;
-  const details = ajv.errorsText(validate.errors, { separator: '; ' });
-  throw new Error(`Schema output validation failed: ${details}`);
+  const details = (validate.errors ?? []).slice(0, MAX_LISTED_OUTPUT_ERRORS).map(describeOutputError);
+  const remainder = (validate.errors?.length ?? 0) > MAX_LISTED_OUTPUT_ERRORS
+    ? `; and ${(validate.errors?.length ?? 0) - MAX_LISTED_OUTPUT_ERRORS} more`
+    : '';
+  // The schema compiled, so it is not what is wrong: the model's answer is.
+  // Typed as OUTPUT_INVALID (retryable) rather than SCHEMA_INVALID, whose hint
+  // tells the caller to go and fix a schema that is fine.
+  throw new CliExitError(
+    `Model output did not conform to the requested JSON Schema: ${details.join('; ')}${remainder}`,
+    1,
+    {
+      code: 'OUTPUT_INVALID',
+      category: 'output',
+      retryable: true,
+      hint: 'The model returned JSON that the schema rejects at the path named above; retry (--retries), '
+        + 'describe that field in an --instruction, or use a more capable model. The schema itself is valid.',
+    },
+  );
+}
+
+const MAX_LISTED_OUTPUT_ERRORS = 5;
+
+/** One Ajv error as "<path> <problem>", naming the offending key where Ajv knows it. */
+function describeOutputError(error: ErrorObject): string {
+  const path = error.instancePath || '/';
+  const params = error.params as Record<string, unknown>;
+  if (error.keyword === 'additionalProperties' && typeof params.additionalProperty === 'string') {
+    return `${path} has unexpected property "${params.additionalProperty}"`;
+  }
+  if (error.keyword === 'required' && typeof params.missingProperty === 'string') {
+    return `${path} is missing required property "${params.missingProperty}"`;
+  }
+  if (error.keyword === 'enum' && Array.isArray(params.allowedValues)) {
+    return `${path} must be one of ${params.allowedValues.map((entry) => JSON.stringify(entry)).join(', ')}`;
+  }
+  return `${path} ${error.message ?? `fails "${error.keyword}"`}`;
 }

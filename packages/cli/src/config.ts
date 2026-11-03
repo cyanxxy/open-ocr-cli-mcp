@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { readFile, realpath } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { parseEnv } from 'node:util';
 
 import type { ThinkingLevel } from '@open-ocr/engine/gemini';
+import { registerSecretForRedaction } from '@open-ocr/engine/gemini/errorPayload';
 import {
   GATEWAY_IDS,
   GEMINI_MODELS,
@@ -21,8 +22,14 @@ import {
   type GatewayId,
   type ProviderId,
 } from '@open-ocr/engine/providers';
-import { getExtractionPreset, listExtractionPresets } from '@open-ocr/engine/templates';
+import { DEFAULT_TEMPLATE_MAX_TOKENS, getExtractionPreset, listExtractionPresets } from '@open-ocr/engine/templates';
 import { CliExitError } from './errors';
+import {
+  confineCallerPath,
+  jsonSyntaxLocation,
+  openRegularFile,
+  realpathOfNearestAncestor,
+} from './fileBoundary';
 import { asRecord } from './jsonValidation';
 import { OCR_REQUEST_LIMITS, PRICE_PER_MILLION_LIMIT } from './limits';
 import {
@@ -132,6 +139,7 @@ function configFileError(error: unknown, displayPath: string): CliExitError | un
   const code = (error as NodeJS.ErrnoException).code;
   if (code === 'ENOENT') return configurationError(`Configuration file not found: ${displayPath}`);
   if (code === 'EISDIR') return configurationError(`Configuration path is not a file: ${displayPath}`);
+  if (code === 'ENOTREG') return configurationError(`Configuration path is not a regular file: ${displayPath}`);
   if (code === 'EACCES' || code === 'EPERM') {
     return configurationError(`Configuration file is not readable: ${displayPath}`);
   }
@@ -197,19 +205,41 @@ function pickConfig(value: Record<string, unknown>, label: string): CliConfigFil
   return allowlisted;
 }
 
+/** Far above any real configuration file; bounds what a misdirected path can make the process read. */
+const MAX_CONFIG_BYTES = 1024 * 1024;
+
 async function readConfigFile(
   filePath: string,
   required: boolean,
   displayPath = filePath,
+  regularFileOnly = false,
 ): Promise<CliConfigFile> {
   try {
-    const raw = await readFile(filePath, 'utf8');
+    // The MCP server reads regular files only, non-blocking: a FIFO or device
+    // named as the configuration would otherwise hang the long-lived server or
+    // never reach EOF. The CLI keeps accepting a pipe (`--config <(...)`).
+    const handle = regularFileOnly
+      ? await openRegularFile(filePath, displayPath)
+      : await open(filePath, 'r');
+    let raw: string;
+    try {
+      if ((await handle.stat()).size > MAX_CONFIG_BYTES) {
+        throw configurationError(`Configuration file exceeds the 1 MB limit: ${displayPath}`);
+      }
+      raw = await handle.readFile('utf8');
+    } finally {
+      await handle.close();
+    }
     return pickConfig(asRecord(JSON.parse(raw) as unknown, displayPath), displayPath);
   } catch (error) {
     if (error instanceof CliExitError) throw error;
     const code = (error as NodeJS.ErrnoException).code;
     if (!required && code === 'ENOENT') return {};
-    if (error instanceof SyntaxError) throw configurationError(`Invalid JSON in ${displayPath}: ${error.message}`);
+    // The parser's own message quotes the start of the file; a misdirected
+    // path (`/etc/passwd`, a key file) must not be echoed back that way.
+    if (error instanceof SyntaxError) {
+      throw configurationError(`Invalid JSON in ${displayPath}${jsonSyntaxLocation(error)}`);
+    }
     // An explicitly requested config file that cannot be read is a request
     // error; reporting the raw errno would leak the resolved absolute path.
     const typed = configFileError(error, displayPath);
@@ -270,20 +300,198 @@ export async function loadCliConfig(
   return { ...user, ...project, ...explicit };
 }
 
-/** Resolve symbolic links in the longest existing prefix of a path that may not exist yet. */
-async function realpathOfNearestAncestor(target: string): Promise<string> {
-  const missing: string[] = [];
-  let current = target;
-  for (;;) {
-    try {
-      return path.join(await realpath(current), ...missing.reverse());
-    } catch (error) {
-      const parent = path.dirname(current);
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === current) throw error;
-      missing.push(path.basename(current));
-      current = parent;
+/**
+ * Execution limits an operator can set in the user configuration that an MCP
+ * caller may lower but never raise. `requestsPerMinute` 0 and an absent
+ * `maxCostUsd` both mean "unlimited", so either from the caller is a raise.
+ */
+export const OPERATOR_CEILING_KEYS = [
+  'maxFiles', 'maxTotalMb', 'maxCostUsd', 'requestsPerMinute', 'concurrency',
+] as const;
+
+export type OperatorCeilingKey = (typeof OPERATOR_CEILING_KEYS)[number];
+export type OperatorCeilings = Partial<Record<OperatorCeilingKey, number>>;
+
+/** The request flag each ceiling clamps, and the request field it is reported as. */
+const CEILING_FLAGS: Record<OperatorCeilingKey, { flag: keyof ExtractCommandFlags; field: string }> = {
+  maxFiles: { flag: 'maxFiles', field: 'execution.maxFiles' },
+  maxTotalMb: { flag: 'maxTotalMb', field: 'execution.maxTotalMb' },
+  maxCostUsd: { flag: 'maxCost', field: 'execution.maxCostUsd' },
+  requestsPerMinute: { flag: 'requestsPerMinute', field: 'execution.requestsPerMinute' },
+  concurrency: { flag: 'concurrency', field: 'execution.concurrency' },
+};
+
+function pickCeilings(config: CliConfigFile): OperatorCeilings {
+  const ceilings: OperatorCeilings = {};
+  for (const key of OPERATOR_CEILING_KEYS) {
+    const value = config[key];
+    // A requests-per-minute of 0 disables the limit; it caps nothing.
+    if (typeof value === 'number' && !(key === 'requestsPerMinute' && value === 0)) ceilings[key] = value;
+  }
+  return ceilings;
+}
+
+/**
+ * Apply operator ceilings to an MCP request's flags before option resolution.
+ *
+ * The caller's effective value is whatever would otherwise win (its argument,
+ * else its `configPath` or the project file); a missing or unlimited value
+ * becomes the ceiling and a larger one is lowered to it. Returns the clamped
+ * flags and a warning per lowered field, so the caller learns why its number
+ * was not used.
+ */
+export function applyOperatorCeilings(
+  flags: ExtractCommandFlags,
+  fileConfig: CliConfigFile,
+  ceilings: OperatorCeilings,
+): { flags: ExtractCommandFlags; warnings: string[] } {
+  const clamped: ExtractCommandFlags = { ...flags };
+  const warnings: string[] = [];
+  for (const key of OPERATOR_CEILING_KEYS) {
+    const ceiling = ceilings[key];
+    if (ceiling === undefined) continue;
+    const { flag, field } = CEILING_FLAGS[key];
+    const raw = (flags[flag] as string | number | undefined) ?? fileConfig[key];
+    const requested = raw === undefined ? undefined : Number(raw);
+    const unlimited = requested === undefined || (key === 'requestsPerMinute' && requested === 0);
+    if (!unlimited && Number.isFinite(requested) && requested <= ceiling) {
+      (clamped as Record<string, unknown>)[flag] = requested;
+      continue;
+    }
+    (clamped as Record<string, unknown>)[flag] = ceiling;
+    if (raw !== undefined) {
+      warnings.push(
+        `${field} ${String(raw)} exceeds the operator's limit of ${ceiling} (~/.config/open-ocr-cli/config.json); using ${ceiling}`,
+      );
     }
   }
+  return { flags: clamped, warnings };
+}
+
+export interface McpCallerConfig {
+  /** Merged configuration for option resolution. */
+  fileConfig: CliConfigFile;
+  /** Limits from the operator's user configuration; see {@link applyOperatorCeilings}. */
+  ceilings: OperatorCeilings;
+  /**
+   * True when `fileConfig.schema` came from the operator's user configuration,
+   * whose paths are the operator's own and are not confined to the working
+   * directory.
+   */
+  operatorSchema: boolean;
+}
+
+/**
+ * Configuration for one MCP tool call.
+ *
+ * The caller (an agent, possibly steered by document content) is untrusted
+ * relative to the operator who started the server, so the layers are kept
+ * apart rather than merged blindly:
+ *
+ * - The operator's user configuration and the server environment may route
+ *   requests (provider, baseUrl, apiKeyEnv, gateway) and set limits.
+ * - The caller's `configPath` must be a regular file inside the working
+ *   directory and, like `.open-ocr-cli.json`, may not route; its `output` must
+ *   stay inside the working directory and out of hidden directories.
+ * - Neither the caller's `configPath` nor `.open-ocr-cli.json` may set token
+ *   prices, which decide whether the cost ceiling can trip; the operator's
+ *   prices apply only while the caller keeps the operator's provider and model.
+ * - The operator's `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`
+ *   and `concurrency` are ceilings, and `noConfig` does not remove them: it
+ *   drops the configuration's settings, never the operator's limits.
+ *
+ * Ambient `OPEN_OCR_NO_CONFIG` is the operator's own choice and still disables
+ * the user configuration, exactly as for the CLI.
+ */
+export async function loadMcpCallerConfig(
+  cwd: string,
+  configPath?: string,
+  callerNoConfig = false,
+): Promise<McpCallerConfig> {
+  const operatorDisabled = environmentDisablesConfig();
+  const userPath = path.join(homedir(), '.config', 'open-ocr-cli', 'config.json');
+  const user = operatorDisabled ? {} : await readConfigFile(userPath, false, userPath, true);
+  const ceilings = pickCeilings(user);
+  if (callerNoConfig) return { fileConfig: {}, ceilings, operatorSchema: false };
+
+  let explicit: CliConfigFile = {};
+  if (configPath) {
+    const absolute = await confineCallerPath(cwd, configPath, 'configPath');
+    explicit = await readConfigFile(absolute, true, configPath, true);
+    assertConfigDoesNotRoute(explicit, 'mcp');
+    assertMcpConfigDoesNotPrice(explicit, 'configPath');
+    if (explicit.output !== undefined) await confineCallerPath(cwd, explicit.output, 'output', 'write');
+  }
+  if (operatorDisabled) return { fileConfig: explicit, ceilings, operatorSchema: false };
+
+  const projectPath = path.join(cwd, '.open-ocr-cli.json');
+  const project = await readConfigFile(projectPath, false, projectPath, true);
+  assertProjectConfigDoesNotRoute(project);
+  // The caller's agent can usually edit the project file as easily as its own
+  // configPath, so over MCP the same price rule applies to it.
+  assertMcpConfigDoesNotPrice(project, '.open-ocr-cli.json');
+  await assertProjectOutputStaysInProject(project, cwd);
+  const fileConfig = withOperatorPricesOnlyForOperatorModel({ ...user, ...project, ...explicit }, user);
+  return {
+    fileConfig,
+    ceilings,
+    operatorSchema: user.schema !== undefined && project.schema === undefined && explicit.schema === undefined,
+  };
+}
+
+/**
+ * Keys that feed the cost estimate behind `maxCostUsd` and the fail-closed
+ * "paid response without usage" gate. A per-million price of 0 makes every
+ * request free on paper, so the operator's cost ceiling never trips and a
+ * response without usage is no longer treated as paid.
+ */
+const PRICE_CONFIG_KEYS = [
+  'inputPricePerMillionUsd', 'outputPricePerMillionUsd',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+/**
+ * Over MCP, prices come only from the operator's user configuration (or the
+ * verified price table). A caller-chosen `configPath` or the project file that
+ * could set them would turn the operator's `maxCostUsd` ceiling into a number
+ * the caller controls. Refused rather than ignored, like routing keys, so a
+ * setup that relied on them fails visibly instead of being billed differently.
+ */
+function assertMcpConfigDoesNotPrice(config: CliConfigFile, source: 'configPath' | '.open-ocr-cli.json'): void {
+  const pricing = PRICE_CONFIG_KEYS.filter((key) => config[key] !== undefined);
+  if (pricing.length === 0) return;
+  throw new CliExitError(
+    `${source} cannot set ${pricing.join(', ')} over MCP: prices decide whether the operator's maxCostUsd ceiling and the usage-unknown cost gate can trip`,
+    2,
+    {
+      code: 'CONFIG_INVALID',
+      category: 'configuration',
+      retryable: false,
+      hint: 'Prices belong to the operator who starts the MCP server: set inputPricePerMillionUsd and '
+        + 'outputPricePerMillionUsd in ~/.config/open-ocr-cli/config.json, or rely on the verified price table.',
+    },
+  );
+}
+
+/**
+ * The operator's prices describe the operator's provider and model. If the
+ * caller's configuration switches either, those prices would be applied to a
+ * model they were never meant for (a cheap model's prices on an expensive one
+ * under-counts spend), so they are dropped and resolution falls back to the
+ * verified price table, or refuses a cost ceiling it cannot account for.
+ * (A provider or model switched through tool arguments is already handled by
+ * `resolveCliOptions`, which keeps file prices only for the file's model.)
+ */
+function withOperatorPricesOnlyForOperatorModel(merged: CliConfigFile, user: CliConfigFile): CliConfigFile {
+  if (PRICE_CONFIG_KEYS.every((key) => merged[key] === undefined)) return merged;
+  const provider = (config: CliConfigFile): string => config.provider ?? DEFAULT_CONFIG.provider;
+  const model = (config: CliConfigFile): string | undefined => {
+    const id = provider(config);
+    // An unknown provider is reported by option resolution; it has no default here.
+    return config.model ?? (PROVIDER_IDS.includes(id as ProviderId) ? providerDefaultModel(id as ProviderId) : undefined);
+  };
+  if (provider(merged) === provider(user) && model(merged) === model(user)) return merged;
+  const { inputPricePerMillionUsd: _input, outputPricePerMillionUsd: _output, ...rest } = merged;
+  return rest;
 }
 
 /**
@@ -334,17 +542,45 @@ const ROUTING_CONFIG_KEYS = [
  * on it from silently sending documents somewhere else.
  */
 function assertProjectConfigDoesNotRoute(project: CliConfigFile): void {
-  const routing: string[] = ROUTING_CONFIG_KEYS.filter((key) => project[key] !== undefined);
-  if (project.gateway !== undefined && project.gateway !== 'direct') routing.unshift('gateway');
+  assertConfigDoesNotRoute(project, 'project');
+}
+
+function routingKeysIn(config: CliConfigFile): string[] {
+  const routing: string[] = ROUTING_CONFIG_KEYS.filter((key) => config[key] !== undefined);
+  if (config.gateway !== undefined && config.gateway !== 'direct') routing.unshift('gateway');
+  return routing;
+}
+
+/**
+ * The same rule for a configuration the MCP caller chose (`configPath`). The
+ * caller is an agent that may be acting on instructions planted in a document;
+ * if its file could set `baseUrl` and `apiKeyEnv`, one tool call would send any
+ * environment variable of the server, as a bearer token, to any host.
+ */
+function assertConfigDoesNotRoute(config: CliConfigFile, source: 'project' | 'mcp'): void {
+  const routing = routingKeysIn(config);
   if (routing.length === 0) return;
+  if (source === 'project') {
+    throw new CliExitError(
+      `.open-ocr-cli.json cannot set ${routing.join(', ')}: a project configuration may not choose where requests or credentials are sent`,
+      2,
+      {
+        code: 'CONFIG_INVALID',
+        category: 'configuration',
+        retryable: false,
+        hint: 'Move these keys to ~/.config/open-ocr-cli/config.json or a file passed with --config, pass them as flags, or run with --no-config.',
+      },
+    );
+  }
   throw new CliExitError(
-    `.open-ocr-cli.json cannot set ${routing.join(', ')}: a project configuration may not choose where requests or credentials are sent`,
+    `configPath cannot set ${routing.join(', ')}: a configuration supplied by the MCP caller may not choose where requests or credentials are sent`,
     2,
     {
       code: 'CONFIG_INVALID',
       category: 'configuration',
       retryable: false,
-      hint: 'Move these keys to ~/.config/open-ocr-cli/config.json or a file passed with --config, pass them as flags, or run with --no-config.',
+      hint: 'Routing belongs to the operator who starts the MCP server: set it in ~/.config/open-ocr-cli/config.json '
+        + 'or the server environment (OPEN_OCR_PROVIDER, OPEN_OCR_GATEWAY, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_AI_GATEWAY_ID).',
     },
   );
 }
@@ -601,13 +837,20 @@ export function resolveCliOptions(
   }
   if (hasSchema && effectiveMode !== 'simple') throw configurationError(`${name('schema')} is only available in simple mode`);
   if (hasSchema && format !== 'json') throw configurationError(`${name('schema')} requires ${name('format')} json`);
-  const defaultMaxTokens = isKimiK3
+  // A preset answer is one bounded JSON record, so template mode keeps its
+  // historical 16,384-token default. Only an explicit --max-tokens (or a run
+  // request's extraction.maxTokens) changes it: a config-file maxTokens was
+  // written for simple/agentic runs, and through 4.3.0 template mode ignored it,
+  // so honouring it here would silently cap template runs (4096, say).
+  const defaultMaxTokens = effectiveMode === 'template'
+    ? DEFAULT_TEMPLATE_MAX_TOKENS
+    : isKimiK3
     // Agentic K3 can issue many continuations; keep a safer default budget
     // unless the operator opts into the full protocol ceiling.
-    ? (effectiveMode === 'agentic' ? 32_768 : 131_072)
-    : DEFAULT_CONFIG.maxTokens;
+      ? (effectiveMode === 'agentic' ? 32_768 : 131_072)
+      : DEFAULT_CONFIG.maxTokens;
   const maxTokens = integer(
-    flags.maxTokens ?? (modelContextMatches ? fileConfig.maxTokens : undefined),
+    flags.maxTokens ?? (modelContextMatches && effectiveMode !== 'template' ? fileConfig.maxTokens : undefined),
     defaultMaxTokens,
     name('maxTokens'),
     OCR_REQUEST_LIMITS.maxTokens.min,
@@ -634,10 +877,12 @@ export function resolveCliOptions(
   const apiKeyEnv = flags.apiKeyEnv
     ?? (providerContextMatches ? fileConfig.apiKeyEnv : undefined)
     ?? providerDefaultApiKeyEnv(provider);
-  const apiKey = env[apiKeyEnv]?.trim() || '';
   const cloudflareByok = flags.cloudflareByok
     ?? (providerContextMatches && gatewayContextMatches ? fileConfig.cloudflareByok : undefined)
     ?? false;
+  // Under BYOK the gateway supplies the stored provider key, and only when the
+  // request carries no provider key of its own: never read or send ours.
+  const apiKey = cloudflareByok ? '' : env[apiKeyEnv]?.trim() || '';
   const cloudflareByokAlias = flags.cloudflareByokAlias
     ?? (providerContextMatches && gatewayContextMatches ? fileConfig.cloudflareByokAlias : undefined);
   if (cloudflareByok && gateway !== 'cloudflare') {
@@ -650,6 +895,12 @@ export function resolveCliOptions(
     ?? fileConfig.cloudflareTokenEnv
     ?? 'CLOUDFLARE_AI_GATEWAY_TOKEN';
   const gatewayToken = gateway === 'cloudflare' ? env[gatewayTokenEnv]?.trim() : undefined;
+  // Error text that echoes a credential verbatim is scrubbed by value, not only
+  // by shape: register the values this run may send, plus every well-known
+  // credential variable, before anything can fail and render a message.
+  for (const name of new Set([apiKeyEnv, gatewayTokenEnv, ...PROJECT_ENV_CREDENTIALS])) {
+    registerSecretForRedaction(env[name]);
+  }
   const hasFlagPrice = flags.inputPrice !== undefined || flags.outputPrice !== undefined;
   const inputPricePerMillionUsd = optionalNumberInRange(
     hasFlagPrice
@@ -751,6 +1002,7 @@ export function resolveCliOptions(
       OCR_REQUEST_LIMITS.maxTotalMb.max,
     ),
     excludes: [...(fileConfig.exclude ?? []), ...(flags.exclude ?? [])],
+    configExcludes: (fileConfig.exclude ?? []).filter((pattern) => !(flags.exclude ?? []).includes(pattern)),
     instructions: [...(fileConfig.instructions ?? []), ...(flags.instruction ?? [])],
     hidden: flags.hidden ?? fileConfig.hidden ?? DEFAULT_CONFIG.hidden,
     defaultExcludes: flags.defaultExcludes ?? fileConfig.defaultExcludes ?? DEFAULT_CONFIG.defaultExcludes,
@@ -846,7 +1098,7 @@ const MODE_SCOPED_OPTIONS = {
   detectImages: { flag: '--detect-images', field: 'extraction.detectImages', modes: ['simple'] },
   detectMath: { flag: '--detect-math', field: 'extraction.detectMath', modes: ['simple'] },
   instructions: { flag: '--instruction', field: 'extraction.instructions', modes: ['simple'] },
-  maxTokens: { flag: '--max-tokens', field: 'extraction.maxTokens', modes: ['simple', 'agentic'] },
+  maxTokens: { flag: '--max-tokens', field: 'extraction.maxTokens', modes: ['simple', 'template', 'agentic'] },
   maxIterations: { flag: '--max-iterations', field: 'extraction.maxIterations', modes: ['agentic'] },
   confidenceThreshold: {
     flag: '--confidence-threshold',

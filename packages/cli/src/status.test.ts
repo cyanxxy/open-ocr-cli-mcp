@@ -1,12 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { CliExitError } from './errors';
-import { inspectBatchStatus, renderBatchStatus } from './status';
-import { BatchOutputLock } from './output';
+import { inspectBatchStatus, MAX_STATUS_SCAN_DIRECTORIES, renderBatchStatus } from './status';
+import { BatchOutputLock, processStartIdentity } from './output';
 
 let directory: string;
 
@@ -59,6 +59,26 @@ afterEach(async () => {
 });
 
 describe('CLI batch status', () => {
+  it('reports an audit cut short by the directory limit instead of calling the batch healthy', async () => {
+    const entries: Record<string, unknown> = {};
+    for (let index = 0; index <= MAX_STATUS_SCAN_DIRECTORIES; index += 1) {
+      const folder = path.join(directory, 'docs', `d${index}`);
+      await mkdir(folder, { recursive: true });
+      const artifact = path.join(folder, 'page.md');
+      await writeFile(artifact, '# page');
+      entries[path.join(directory, 'src', `d${index}.png`)] = {
+        fingerprint: `f${index}`, status: 'succeeded', outputFiles: [artifact], completedAt: '2026-07-15T00:00:00.000Z',
+      };
+    }
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({ version: 1, entries }));
+    const report = await inspectBatchStatus(directory, directory);
+    // The output directory (batch metadata) is audited too, so two of the
+    // MAX + 2 candidate directories fall past the limit.
+    expect(report.unscannedDirectories).toBe(2);
+    expect(report.healthy).toBe(false);
+    expect(renderBatchStatus(report)).toContain('Audit incomplete: 2 artifact directories');
+  }, 60_000);
+
   it('audits manifest artifacts and renders actionable failures', async () => {
     const source = path.join(directory, 'invoice.pdf');
     const presentOutput = path.join(directory, 'invoice.md');
@@ -216,7 +236,155 @@ describe('CLI batch status', () => {
         healthy: false,
         activeLock: { ownerValid: true, pid: process.pid },
       });
-      expect(renderBatchStatus(report)).toContain('Status: batch in progress or stale lock');
+      expect(report.activeLock?.state).toBe('live');
+      expect(renderBatchStatus(report)).toContain('Status: batch in progress');
+    } finally {
+      await lock.release();
+    }
+  });
+
+  it('tells a stale lock (dead or reused PID) apart from a live one', async () => {
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(batchSummary([
+      { status: 'succeeded' },
+    ])));
+    // PID 1 is always alive; a mismatched start identity marks it as reused.
+    await writeFile(path.join(directory, '.open-ocr.lock'), JSON.stringify({
+      version: 1,
+      token: 'stale',
+      pid: 1,
+      hostname: hostname(),
+      startedAt: '2026-07-15T00:00:00.000Z',
+      processStart: 'linux:not-this-boot:1',
+    }));
+    const report = await inspectBatchStatus('.', directory);
+    if (processStartIdentity(1) !== undefined) {
+      expect(report.activeLock?.state).toBe('stale');
+      expect(renderBatchStatus(report)).toContain('Status: interrupted (stale lock)');
+    }
+    expect(report.healthy).toBe(false);
+  });
+
+  it('reports interrupted claims, untracked artifacts, stray temp files, and cumulative usage', async () => {
+    const source = path.join(directory, 'a.png');
+    await writeFile(source, 'x');
+    const owned = path.join(directory, 'a.md');
+    const previous = path.join(directory, 'a.json');
+    await writeFile(owned, '# a');
+    await writeFile(previous, '{}');
+    // A sibling the batch could have written (a format switch) that no entry owns.
+    await writeFile(path.join(directory, 'a.csv'), 'x');
+    // Unrelated files beside the batch are not this batch's business.
+    await writeFile(path.join(directory, 'stray.md'), '# not ours');
+    await writeFile(path.join(directory, 'a.md.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'), 'partial');
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [source]: {
+          fingerprint: 'abc',
+          fingerprintVersion: 2,
+          status: 'pending',
+          outputFiles: [],
+          ownedFiles: [owned, previous],
+          completedAt: '2026-07-15T00:00:00.000Z',
+        },
+      },
+      usage: { ...usage, requests: 5, estimatedCostUsd: 0.25 },
+    }));
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(batchSummary([
+      { status: 'succeeded' },
+    ])));
+
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.untrackedArtifacts).toEqual([path.join(directory, 'a.csv')]);
+    expect(report.strayTempFiles).toEqual([
+      path.join(directory, 'a.md.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'),
+    ]);
+    expect(report.counts).toMatchObject({ interrupted: 1, untrackedArtifacts: 1, strayTempFiles: 1 });
+    expect(report.cumulativeUsage).toMatchObject({ requests: 5, estimatedCostUsd: 0.25 });
+    expect(report.healthy).toBe(false);
+    const rendered = renderBatchStatus(report);
+    expect(rendered).toContain('Interrupted: 1 document(s)');
+    expect(rendered).toContain('Untracked files: 1');
+    expect(rendered).toContain('Leftover temp files: 1');
+    expect(rendered).toContain('Usage (last run): 120 tokens, 2 requests');
+    expect(rendered).toContain('Usage (all runs): 120 tokens, 5 requests, estimated $0.250000');
+  });
+
+  it('ignores unrelated files in a shared output directory (-o .) and never walks node_modules or .git', async () => {
+    const source = path.join(directory, 'scans', 'a.png');
+    await mkdir(path.dirname(source), { recursive: true });
+    await writeFile(source, 'x');
+    const artifact = path.join(directory, 'scans', 'a.md');
+    await writeFile(artifact, '# a');
+    await writeFile(path.join(directory, 'README.md'), '# project');
+    await writeFile(path.join(directory, 'package.json'), '{}');
+    await writeFile(path.join(directory, 'scans', 'notes.csv'), 'x');
+    await writeFile(path.join(directory, 'scans', 'other.md.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'), 'x');
+    for (const tree of ['node_modules/pkg', '.git/info', 'docs/deep/er']) {
+      await mkdir(path.join(directory, tree), { recursive: true });
+      await writeFile(path.join(directory, tree, 'readme.md'), '# x');
+      await writeFile(path.join(directory, tree, 'a.json'), '{}');
+    }
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [source]: {
+          fingerprint: 'abc',
+          fingerprintVersion: 2,
+          status: 'succeeded',
+          outputFiles: [artifact],
+          ownedFiles: [artifact, path.join(directory, 'scans', 'a.json'), path.join(directory, 'scans', 'a.csv')],
+          completedAt: '2026-07-15T00:00:00.000Z',
+        },
+      },
+    }));
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(batchSummary([{ status: 'succeeded' }])));
+
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.untrackedArtifacts).toEqual([]);
+    expect(report.strayTempFiles).toEqual([]);
+    expect(report.healthy).toBe(true);
+    expect(renderBatchStatus(report)).toContain('Status: healthy');
+  });
+
+  it('still reports leftovers of the batch metadata and of recorded artifacts in nested directories', async () => {
+    const source = path.join(directory, 'a.png');
+    await writeFile(source, 'x');
+    const artifact = path.join(directory, 'nested', 'deeper', 'a.md');
+    await mkdir(path.dirname(artifact), { recursive: true });
+    await writeFile(artifact, '# a');
+    const tx = '123-0f8fad5b-d9cb-469f-a165-70867728950e';
+    await writeFile(`${artifact}.${tx}.bak`, '# old');
+    await writeFile(path.join(directory, 'nested', 'deeper', `a.json.${tx}.tmp`), '{');
+    await writeFile(path.join(directory, `batch-summary.json.${tx}.tmp`), '{');
+    await writeFile(path.join(directory, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [source]: {
+          fingerprint: 'abc',
+          fingerprintVersion: 2,
+          status: 'succeeded',
+          outputFiles: [artifact],
+          completedAt: '2026-07-15T00:00:00.000Z',
+        },
+      },
+    }));
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.strayTempFiles).toEqual([
+      path.join(directory, `batch-summary.json.${tx}.tmp`),
+      path.join(directory, 'nested', 'deeper', `a.json.${tx}.tmp`),
+      `${artifact}.${tx}.bak`,
+    ].sort((left, right) => left.localeCompare(right)));
+    expect(report.healthy).toBe(false);
+  });
+
+  it('does not promise cleanup of leftovers while a batch holds the lock', async () => {
+    const lock = await BatchOutputLock.acquire(directory);
+    try {
+      await writeFile(path.join(directory, '.open-ocr-manifest.json.123-0f8fad5b-d9cb-469f-a165-70867728950e.tmp'), '{');
+      const rendered = renderBatchStatus(await inspectBatchStatus('.', directory));
+      expect(rendered).toContain('Leftover temp files: 1 (a batch is running here; they may be its in-progress writes)');
+      expect(rendered).not.toContain('cleans them up');
     } finally {
       await lock.release();
     }

@@ -4,8 +4,10 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { clearRegisteredSecretsForRedaction } from '@open-ocr/engine/gemini/errorPayload';
 import { listExtractionPresets } from '@open-ocr/engine/templates';
 import {
+  applyOperatorCeilings,
   assertCredentialsAvailable,
   credentialSetupGuidance,
   ignoredModeScopedOptionWarning,
@@ -15,7 +17,7 @@ import {
   resolveCliOptions,
   suppliedModeScopedFlags,
 } from './config';
-import { ocrErrorPayload } from './errors';
+import { ocrErrorPayload, redactSensitiveErrorText } from './errors';
 import { modeFingerprint } from './ocrJobService';
 import { ocrExtractionSemanticError } from './protocol';
 import type { ExtractCommandFlags } from './types';
@@ -38,6 +40,60 @@ afterEach(() => {
 });
 
 describe('CLI configuration', () => {
+  it('reports malformed configuration JSON without quoting the file, and still reads an explicit file anywhere', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-config-json-'));
+    const elsewhere = await mkdtemp(path.join(tmpdir(), 'open-ocr-config-elsewhere-'));
+    try {
+      await writeFile(path.join(elsewhere, 'passwd'), 'root:x:0:0:root:/root:/bin/bash\n');
+      let thrown = new Error('expected a rejection');
+      await loadCliConfig(directory, path.join(elsewhere, 'passwd')).catch((error: unknown) => { thrown = error as Error; });
+      expect(thrown.message).toBe(`Invalid JSON in ${path.join(elsewhere, 'passwd')}`);
+      expect(thrown.message).not.toContain('root:x');
+      // The CLI user is trusted: an explicit --config outside the project still loads.
+      await writeFile(path.join(elsewhere, 'ok.json'), JSON.stringify({ baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'X' }));
+      await expect(loadCliConfig(directory, path.join(elsewhere, 'ok.json'), true))
+        .resolves.toMatchObject({ baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'X' });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+      await rm(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it('applies operator ceilings: a caller may lower, never raise or unset, a limit', () => {
+    const ceilings = { maxFiles: 5, maxCostUsd: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 };
+    const lowered = applyOperatorCeilings({ maxFiles: 3, maxCost: 0.5, requestsPerMinute: 4, concurrency: 1, maxTotalMb: 10 }, {}, ceilings);
+    expect(lowered.flags).toMatchObject({ maxFiles: 3, maxCost: 0.5, requestsPerMinute: 4, concurrency: 1, maxTotalMb: 10 });
+    expect(lowered.warnings).toEqual([]);
+
+    const raised = applyOperatorCeilings({ maxFiles: 100_000, maxCost: 1_000_000, requestsPerMinute: 0 }, { concurrency: 16 }, ceilings);
+    expect(raised.flags).toMatchObject({ maxFiles: 5, maxCost: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 });
+    expect(raised.warnings).toHaveLength(4);
+
+    // Nothing supplied: the ceiling is the value, silently.
+    expect(applyOperatorCeilings({}, {}, ceilings)).toEqual({
+      flags: { maxFiles: 5, maxCost: 1, requestsPerMinute: 10, concurrency: 2, maxTotalMb: 50 },
+      warnings: [],
+    });
+    // No ceilings: flags pass through untouched.
+    expect(applyOperatorCeilings({ maxFiles: 9 }, {}, {})).toEqual({ flags: { maxFiles: 9 }, warnings: [] });
+  });
+
+  it('registers the credential values a run resolves so errors echoing them are scrubbed', () => {
+    const secret = 'customOpaqueKey-5f3a9c';
+    const gatewaySecret = 'gatewayOpaqueToken-77aa';
+    try {
+      resolveCliOptions({
+        provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', model: 'm', apiKeyEnv: 'CUSTOM_KEY_ENV',
+      }, {}, '/workspace', 'flag', { CUSTOM_KEY_ENV: secret, CLOUDFLARE_AI_GATEWAY_TOKEN: gatewaySecret });
+      const payload = ocrErrorPayload(new Error(`provider said: bad key ${secret}; gateway ${gatewaySecret}`));
+      expect(payload.message).not.toContain(secret);
+      expect(payload.message).not.toContain(gatewaySecret);
+      expect(redactSensitiveErrorText(secret)).toBe('[REDACTED_KEY]');
+    } finally {
+      clearRegisteredSecretsForRedaction();
+    }
+  });
+
   it('uses safe defaults and environment credentials', () => {
     process.env.GEMINI_API_KEY = 'test-key';
     const options = resolveCliOptions({}, {}, '/workspace');
@@ -86,7 +142,7 @@ describe('CLI configuration', () => {
 
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       thinking: 'MAX',
     });
     // The same provider keeps them, whether named by flag or left ambient.
@@ -121,7 +177,7 @@ describe('CLI configuration', () => {
     process.env.MOONSHOT_API_KEY = 'kimi-key';
     expect(resolveCliOptions({ provider: 'kimi' }, {}, '/workspace')).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',
@@ -263,7 +319,7 @@ describe('CLI configuration', () => {
     }, '/workspace');
     expect(options).toMatchObject({
       provider: 'kimi',
-      model: 'kimi-k3',
+      model: 'kimi-k3.1-pro',
       apiKeyEnv: 'MOONSHOT_API_KEY',
       baseUrl: 'https://api.moonshot.ai/v1',
       thinking: 'MAX',
@@ -389,6 +445,34 @@ describe('CLI configuration', () => {
       cloudflareByok: true,
     }, {}, '/workspace');
     expect(kimi.baseUrl).toBe('https://gateway.ai.cloudflare.com/v1/account/gateway/custom-moonshot/v1');
+  });
+
+  it('never reads the provider key under Cloudflare BYOK, so the stored key is used', () => {
+    // Cloudflare substitutes the stored key only when the provider auth header
+    // is absent; a key read from GEMINI_API_KEY would be forwarded instead.
+    process.env.CLOUDFLARE_AI_GATEWAY_TOKEN = 'gateway-token';
+    process.env.GEMINI_API_KEY = 'users-own-gemini-key';
+    try {
+      const byok = resolveCliOptions({
+        provider: 'gemini',
+        gateway: 'cloudflare',
+        cloudflareAccountId: 'account',
+        cloudflareGatewayId: 'gateway',
+        cloudflareByok: true,
+      }, {}, '/workspace');
+      expect(byok.apiKey).toBe('');
+      expect(byok.gatewayToken).toBe('gateway-token');
+      expect(() => assertCredentialsAvailable(byok)).not.toThrow();
+      const keyed = resolveCliOptions({
+        provider: 'gemini',
+        gateway: 'cloudflare',
+        cloudflareAccountId: 'account',
+        cloudflareGatewayId: 'gateway',
+      }, {}, '/workspace');
+      expect(keyed.apiKey).toBe('users-own-gemini-key');
+    } finally {
+      delete process.env.GEMINI_API_KEY;
+    }
   });
 
   it('rejects Cloudflare stored-key flags outside a Cloudflare BYOK route', () => {
@@ -524,8 +608,8 @@ describe('CLI configuration', () => {
 
     expect(ignoredModeScopedOptions(['detectMath', 'maxIterations'], 'simple')).toEqual(['maxIterations']);
     expect(ignoredModeScopedOptions(['detectMath', 'maxIterations'], 'agentic')).toEqual(['detectMath']);
-    // --max-tokens reaches simple and agentic extraction but never the preset path.
-    expect(ignoredModeScopedOptions(['maxTokens'], 'template')).toEqual(['maxTokens']);
+    // --max-tokens reaches every extraction path, preset extraction included.
+    expect(ignoredModeScopedOptions(['maxTokens'], 'template')).toEqual([]);
     expect(ignoredModeScopedOptions(['maxTokens'], 'simple')).toEqual([]);
     expect(ignoredModeScopedOptions(['progress'], 'simple')).toEqual(['progress']);
 
@@ -598,6 +682,19 @@ describe('CLI configuration', () => {
       {},
       '/workspace',
     )).toThrow('xhigh is supported by Muse and model-dependent OpenRouter routes');
+  });
+
+  it('applies a config-file maxTokens to simple and agentic runs but never caps template mode', () => {
+    const config = { maxTokens: 4096 };
+    const resolve = (flags: Partial<ExtractCommandFlags>) => resolveCliOptions({ dryRun: true, ...flags }, config, '/workspace');
+    expect(resolve({}).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'agentic' }).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'template', preset: 'invoice' }).maxTokens).toBe(16_384);
+    expect(resolveCliOptions({ dryRun: true, mode: 'template', preset: 'invoice' }, { ...config, mode: 'template' }, '/workspace').maxTokens)
+      .toBe(16_384);
+    // An explicit flag still sets it.
+    expect(resolve({ mode: 'template', preset: 'invoice', maxTokens: '4096' }).maxTokens).toBe(4096);
+    expect(resolve({ mode: 'template', preset: 'invoice', maxTokens: '32768' }).maxTokens).toBe(32_768);
   });
 
   it('uses a lower default max-tokens budget for agentic Kimi K3', () => {

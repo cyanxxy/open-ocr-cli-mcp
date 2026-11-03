@@ -27,7 +27,11 @@ interface UsageMeasurement {
   usesOpenAITokenAccounting: boolean;
 }
 
-function emptyUsage(): ProviderUsageSnapshot {
+interface MutableUsage extends ProviderUsageSnapshot {
+  unreportedUsageRequests: number;
+}
+
+function emptyUsage(): MutableUsage {
   return {
     requests: 0,
     inputTokens: 0,
@@ -37,6 +41,7 @@ function emptyUsage(): ProviderUsageSnapshot {
     cachedTokens: 0,
     totalTokens: 0,
     estimatedCostUsd: 0,
+    unreportedUsageRequests: 0,
   };
 }
 
@@ -188,9 +193,24 @@ function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
 }
 
 export class ProviderCostLimitError extends Error {
-  constructor(readonly limitUsd: number) {
-    super(`Estimated provider cost reached the configured limit of $${limitUsd.toFixed(6)}`);
+  constructor(
+    readonly limitUsd: number,
+    /** The cap tripped because a paid response carried no usage, not on spend. */
+    readonly usageUnknown = false,
+  ) {
+    super(usageUnknown
+      ? `A paid provider response reported no token usage, so spend against --max-cost $${limitUsd.toFixed(6)} cannot be verified; no further paid requests will be sent`
+      : `Estimated provider cost reached the configured limit of $${limitUsd.toFixed(6)}`);
     this.name = 'ProviderCostLimitError';
+  }
+}
+
+function isPaidPricing(pricing: UsagePricingConfig | undefined): boolean {
+  if (!pricing) return false;
+  try {
+    return estimateProviderRequestCostUsd(pricing, 1_000_000, 1_000_000, 0, 0) > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -200,6 +220,14 @@ export class ProviderCostLimitError extends Error {
  */
 export class ProviderExecutionContext {
   private usage = emptyUsage();
+  /** Request slots granted: every HTTP attempt that passed the gate. */
+  private attempts = 0;
+  /** Requests whose usage was measured (direct library callers may skip the gate). */
+  private measuredRequests = 0;
+  /** Spend already recorded by earlier runs of the same resumable job. */
+  private priorCostUsd = 0;
+  /** A paid, cost-capped response arrived without usage: the cap cannot be verified. */
+  private usageUnknownUnderCap = false;
   private intervalMs = 0;
   private maxCostUsd: number | undefined;
   private previousRequestAt = 0;
@@ -219,6 +247,16 @@ export class ProviderExecutionContext {
     this.queue = Promise.resolve();
     this.costLimitDenied = false;
     this.usagePricing = undefined;
+    this.priorCostUsd = 0;
+    this.usageUnknownUnderCap = false;
+  }
+
+  /**
+   * Spend a resumed job already recorded. `--max-cost` bounds the job, not each
+   * rerun, so the cap compares against prior plus current spend.
+   */
+  setPriorCostUsd(costUsd: number): void {
+    this.priorCostUsd = Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0;
   }
 
   /** Per-job prices for transports that report usage with only provider/model. */
@@ -233,12 +271,18 @@ export class ProviderExecutionContext {
 
   resetUsage(): void {
     this.usage = emptyUsage();
+    this.attempts = 0;
+    this.measuredRequests = 0;
+    this.usageUnknownUnderCap = false;
   }
 
   getUsage(): ProviderUsageSnapshot {
+    const { unreportedUsageRequests, ...usage } = this.usage;
     return {
-      ...this.usage,
+      ...usage,
+      requests: Math.max(this.attempts, this.measuredRequests),
       estimatedCostUsd: Number(this.usage.estimatedCostUsd.toFixed(8)),
+      ...(unreportedUsageRequests > 0 ? { unreportedUsageRequests } : {}),
     };
   }
 
@@ -246,19 +290,52 @@ export class ProviderExecutionContext {
     return this.costLimitDenied;
   }
 
+  /** True once a capped, paid response arrived with no usage (see {@link recordUsage}). */
+  wasUsageUnknownUnderCostLimit(): boolean {
+    return this.usageUnknownUnderCap;
+  }
+
   /** Compare against unrounded internal cost; public snapshots are display-rounded. */
   hasReachedCostLimit(): boolean {
     return this.maxCostUsd !== undefined
-      && this.usage.estimatedCostUsd >= this.maxCostUsd;
+      && (this.usageUnknownUnderCap || this.priorCostUsd + this.usage.estimatedCostUsd >= this.maxCostUsd);
   }
 
+  /**
+   * Record one completed response's usage. A response without usage telemetry
+   * is counted as unreported; under `--max-cost` with non-zero prices it also
+   * closes the gate, because spend can no longer be bounded. Free (zero-price)
+   * routes only lose their token totals.
+   */
   recordUsage(
     response: unknown,
     config?: UsagePricingConfig,
   ): void {
     const measurement = usageMeasurement(response);
-    if (!measurement) return;
+    if (!measurement) {
+      this.recordUnreportedUsage(config);
+      return;
+    }
     this.accumulateUsage(measurement, config);
+  }
+
+  private recordUnreportedUsage(config?: UsagePricingConfig): void {
+    this.usage.unreportedUsageRequests += 1;
+    if (this.maxCostUsd !== undefined && isPaidPricing(this.effectivePricing(config))) {
+      this.usageUnknownUnderCap = true;
+    }
+  }
+
+  private effectivePricing(config?: UsagePricingConfig): UsagePricingConfig | undefined {
+    const contextPricing = this.usagePricing;
+    return config && contextPricing
+      && config.provider === contextPricing.provider && config.model === contextPricing.model
+      ? {
+          ...config,
+          inputPricePerMillionUsd: config.inputPricePerMillionUsd ?? contextPricing.inputPricePerMillionUsd,
+          outputPricePerMillionUsd: config.outputPricePerMillionUsd ?? contextPricing.outputPricePerMillionUsd,
+        }
+      : config ?? contextPricing;
   }
 
   /**
@@ -271,27 +348,22 @@ export class ProviderExecutionContext {
     config?: UsagePricingConfig,
   ): void {
     const current = combineUsageMeasurements(responses);
-    if (!current) return;
+    if (!current) {
+      this.recordUnreportedUsage(config);
+      return;
+    }
     this.accumulateUsage(current, config);
   }
 
   private accumulateUsage(measurement: UsageMeasurement, config?: UsagePricingConfig): void {
-    this.usage.requests += 1;
+    this.measuredRequests += 1;
     this.usage.inputTokens += measurement.inputTokens;
     this.usage.outputTokens += measurement.outputTokens;
     this.usage.thoughtTokens += measurement.thoughtTokens;
     this.usage.toolTokens += measurement.toolTokens;
     this.usage.cachedTokens += measurement.cachedTokens;
     this.usage.totalTokens += measurement.totalTokens;
-    const contextPricing = this.usagePricing;
-    const effectivePricing = config && contextPricing
-      && config.provider === contextPricing.provider && config.model === contextPricing.model
-      ? {
-          ...config,
-          inputPricePerMillionUsd: config.inputPricePerMillionUsd ?? contextPricing.inputPricePerMillionUsd,
-          outputPricePerMillionUsd: config.outputPricePerMillionUsd ?? contextPricing.outputPricePerMillionUsd,
-        }
-      : config ?? contextPricing;
+    const effectivePricing = this.effectivePricing(config);
     const localEstimate = effectivePricing
       ? estimateProviderRequestCostUsd(
         effectivePricing,
@@ -326,10 +398,10 @@ export class ProviderExecutionContext {
     if (
       !options.ignoreCostLimit
       && maxCostUsd !== undefined
-      && this.usage.estimatedCostUsd >= maxCostUsd
+      && this.hasReachedCostLimit()
     ) {
       this.costLimitDenied = true;
-      throw new ProviderCostLimitError(maxCostUsd);
+      throw new ProviderCostLimitError(maxCostUsd, this.usageUnknownUnderCap);
     }
   }
 
@@ -338,7 +410,10 @@ export class ProviderExecutionContext {
     options: ProviderRequestSlotOptions = {},
   ): Promise<void> {
     this.assertRequestAllowed(signal, options);
-    if (this.intervalMs === 0) return;
+    if (this.intervalMs === 0) {
+      this.attempts += 1;
+      return;
+    }
 
     let release: () => void = () => undefined;
     const previous = this.queue;
@@ -354,6 +429,7 @@ export class ProviderExecutionContext {
       await wait(delayMs, signal);
       this.assertRequestAllowed(signal, options);
       this.previousRequestAt = Date.now();
+      this.attempts += 1;
     } finally {
       if (acquired) release();
       else void previous.finally(release);

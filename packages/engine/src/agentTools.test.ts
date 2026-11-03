@@ -82,6 +82,21 @@ describe('agentTools', () => {
     });
   });
 
+  it('names the batch entry and field that made a batch invalid', async () => {
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'invoice_number', field_value: 'INV-1', confidence: 0.9 },
+        { field_name: 'total_amount', field_value: '$27.00', confidence: 95 },
+      ],
+    }, '', '', createMemory('invoice'));
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toBe(
+      'Invalid field entry fields[1] ("total_amount"): Expected a finite confidence between 0 and 1 for "confidence", got 95',
+    );
+    const unnamed = await executeExtractFieldsBatch({ fields: [{ field_value: 'x', confidence: 0.5 }] }, '', '', createMemory('invoice'));
+    expect(unnamed.error).toMatch(/^Invalid field entry fields\[0\]: Expected non-empty string for "field_name"/);
+  });
+
   it('normalizes extracted alias field names to canonical schema names in a batch', async () => {
     const result = await executeExtractFieldsBatch(
       {

@@ -44,7 +44,7 @@ export interface ProviderErrorPayload {
  */
 export type ProviderErrorSubject = 'input-media' | 'response-schema' | 'request-field' | 'model';
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
@@ -145,6 +145,58 @@ export function providerErrorPayloadOf(error: unknown): ProviderErrorPayload | u
 }
 
 /**
+ * Shortest credential value scrubbed verbatim. Below this a "secret" is more
+ * likely to be a placeholder such as `test` whose removal would mangle ordinary
+ * prose than a real key.
+ */
+const MIN_REGISTERED_SECRET_LENGTH = 8;
+/** Bounded so a long-lived MCP server cannot accumulate values without limit. */
+const MAX_REGISTERED_SECRETS = 64;
+const REDACTED_SECRET = '[REDACTED_KEY]';
+
+/** Credential values in use by this process, scrubbed wherever they appear. */
+const registeredSecrets = new Set<string>();
+
+/**
+ * Register a credential value this process sends, so error text that echoes it
+ * verbatim is scrubbed even when the value matches none of the key patterns
+ * below. A provider that answers `invalid key: <the key>` with a key format the
+ * patterns do not know would otherwise reach stderr, JSONL records, and MCP
+ * error envelopes intact.
+ */
+export function registerSecretForRedaction(value: string | undefined): void {
+  if (typeof value !== 'string') return;
+  for (const candidate of new Set([value, value.trim()])) {
+    if (candidate.length < MIN_REGISTERED_SECRET_LENGTH || candidate.includes(REDACTED_SECRET)) continue;
+    registeredSecrets.delete(candidate);
+    registeredSecrets.add(candidate);
+  }
+  while (registeredSecrets.size > MAX_REGISTERED_SECRETS) {
+    const oldest = registeredSecrets.values().next().value;
+    if (oldest === undefined) break;
+    registeredSecrets.delete(oldest);
+  }
+}
+
+/** Forget every registered credential value. Intended for tests. */
+export function clearRegisteredSecretsForRedaction(): void {
+  registeredSecrets.clear();
+}
+
+function redactRegisteredSecrets(message: string): string {
+  if (registeredSecrets.size === 0) return message;
+  let result = message;
+  // Longest first, so a key that contains a shorter registered key is removed whole.
+  const secrets = [...registeredSecrets].sort((left, right) => right.length - left.length);
+  for (const secret of secrets) {
+    for (const spelling of new Set([secret, encodeURIComponent(secret)])) {
+      if (result.includes(spelling)) result = result.split(spelling).join(REDACTED_SECRET);
+    }
+  }
+  return result;
+}
+
+/**
  * Strip credential-like fragments from provider/CLI error text.
  *
  * Lives beside the payload reader because rendering is where a provider's body
@@ -152,9 +204,13 @@ export function providerErrorPayloadOf(error: unknown): ProviderErrorPayload | u
  * provider that echoes a request header or key into its own error body would
  * otherwise put that credential on every one of those surfaces. Applying it
  * twice is safe: each replacement's output no longer matches its own pattern.
+ *
+ * Patterns only catch credential *shapes*. The values this process actually
+ * sends are registered with {@link registerSecretForRedaction} and removed
+ * verbatim first, whatever they look like.
  */
 export function redactSensitiveErrorText(message: string): string {
-  return message
+  return redactRegisteredSecrets(message)
     .replace(/\bBearer\s+[A-Za-z0-9._+=/-]+/giu, 'Bearer [REDACTED]')
     .replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{8,}/gu, '[REDACTED_KEY]')
     .replace(/\bAIza[0-9A-Za-z_-]{10,}/gu, '[REDACTED_KEY]')

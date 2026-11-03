@@ -1,11 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
+  clearRegisteredSecretsForRedaction,
   parseProviderErrorPayload,
   providerErrorMessage,
   providerErrorPayloadOf,
   providerErrorSubject,
   readableProviderError,
   redactSensitiveErrorText,
+  registerSecretForRedaction,
   renderProviderErrorPayload,
 } from './errorPayload';
 
@@ -136,6 +138,37 @@ describe('redactSensitiveErrorText', () => {
     // recognise a request-field rejection after rendering.
     const message = '* GenerateContentRequest.generation_config.max_output_tokens: max_output_tokens must be positive.';
     expect(redactSensitiveErrorText(message)).toBe(message);
+  });
+
+  describe('registered credential values', () => {
+    afterEach(() => clearRegisteredSecretsForRedaction());
+
+    // A bare key in a format no pattern knows used to pass straight through.
+    const BARE_KEY = 'opaque9Q2xLmW7vKp3';
+
+    it('scrubs a registered value that matches no credential pattern', () => {
+      expect(redactSensitiveErrorText(`invalid key ${BARE_KEY}`)).toContain(BARE_KEY);
+      registerSecretForRedaction(BARE_KEY);
+      const redacted = redactSensitiveErrorText(`invalid key ${BARE_KEY} (was ${encodeURIComponent(BARE_KEY)})`);
+      expect(redacted).not.toContain(BARE_KEY);
+      expect(redacted).toBe('invalid key [REDACTED_KEY] (was [REDACTED_KEY])');
+      expect(redactSensitiveErrorText(redacted)).toBe(redacted);
+    });
+
+    it('scrubs the untrimmed and trimmed spellings and through provider rendering', () => {
+      registerSecretForRedaction(`  ${BARE_KEY}\n`);
+      expect(providerErrorMessage(JSON.stringify({ error: { message: `API key ${BARE_KEY} not valid` } })))
+        .toBe('API key [REDACTED_KEY] not valid');
+      const restated = readableProviderError(new Error(`rejected ${BARE_KEY}`)) as Error;
+      expect(restated.message).toBe('rejected [REDACTED_KEY]');
+    });
+
+    it('ignores values too short to be a credential', () => {
+      registerSecretForRedaction('test');
+      registerSecretForRedaction('');
+      registerSecretForRedaction(undefined);
+      expect(redactSensitiveErrorText('a test message')).toBe('a test message');
+    });
   });
 });
 

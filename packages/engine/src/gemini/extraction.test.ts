@@ -51,6 +51,16 @@ describe('extractTextFromFile — output contract', () => {
     }));
   });
 
+  it('disables SDK automatic continuation and reports a CONTINUATION stop as truncated', async () => {
+    const generateContent = mockGenerate({ text: 'partial', candidates: [{ finishReason: 'CONTINUATION' }] });
+    await expect(extractTextFromFile(FILE_DATA, 'image/png', CLIENT)).rejects.toThrow(/output token limit/i);
+    expect(generateContent.mock.calls[0][0].config.automaticContinuation).toBe(false);
+
+    const schemaCall = mockGenerate({ text: '{"a":1}', candidates: [{ finishReason: 'STOP' }] });
+    await extractStructuredDataFromFile(FILE_DATA, 'image/png', CLIENT, { type: 'object' }).catch(() => undefined);
+    expect(schemaCall.mock.calls[0]?.[0].config.automaticContinuation).toBe(false);
+  });
+
   it('H-02: invalid JSON throws when JSON was requested (no silent Markdown downgrade)', async () => {
     mockGenerate({ text: 'this is not json', candidates: [{ finishReason: 'STOP' }] });
     await expect(

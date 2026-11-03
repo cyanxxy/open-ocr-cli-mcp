@@ -4,6 +4,13 @@ export interface BatchLockOwner {
   pid: number;
   hostname: string;
   startedAt: string;
+  /**
+   * Identity of the owning process's start (Linux: boot ID plus start time in
+   * clock ticks; elsewhere `ps` lstart). A live PID whose identity differs is a
+   * reused PID, so the lock is stale. Absent on locks from older releases and
+   * where the platform offers no way to read it.
+   */
+  processStart?: string;
 }
 
 /** A non-null, non-array object: the only JSON shape with readable properties. */
@@ -52,6 +59,7 @@ export function parseBatchLockOwner(value: unknown): BatchLockOwner | undefined 
     || typeof owner.hostname !== 'string'
     || owner.hostname.length === 0
     || !isIsoTimestamp(owner.startedAt)
+    || (owner.processStart !== undefined && (typeof owner.processStart !== 'string' || owner.processStart.length === 0))
   ) return undefined;
   return {
     version: 1,
@@ -59,5 +67,6 @@ export function parseBatchLockOwner(value: unknown): BatchLockOwner | undefined 
     pid: owner.pid,
     hostname: owner.hostname,
     startedAt: owner.startedAt,
+    ...(typeof owner.processStart === 'string' ? { processStart: owner.processStart } : {}),
   };
 }

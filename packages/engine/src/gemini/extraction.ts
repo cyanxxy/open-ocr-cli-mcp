@@ -31,87 +31,30 @@ import {
   readableProviderError,
 } from './errorPayload';
 import { findSchemaCompatibilityIssues, type SchemaCompatibilityIssue } from './schemaCompat';
+import { markdownToSections, normalizeModelMarkdown } from './markdown';
+import { parseJsonPayload } from './structured';
 
 /**
- * Helper function to process markdown text into ExtractedContent structure
+ * Join prompt parts so each stays its own sentence. Caller instructions often
+ * lack terminal punctuation ("Only the header"), and a bare space join ran them
+ * into the next directive ("Only the header Detect and describe…").
  */
-function processMarkdownIntoExtractedContent(
-  text: string
-): ExtractedContent {
-  const lines = text.split('\n');
-  const sections: ExtractedContent['sections'] = [];
-  let currentSection: { heading?: string; content: string[] } = { content: [] };
-  let title: string | undefined;
-  let inCodeFence = false;
-  let codeFenceMarker: string | null = null;
+export function joinPromptParts(parts: readonly string[]): string {
+  return parts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => (/[.!?:;)\]"'`]$/u.test(part) ? part : `${part}.`))
+    .join('\n');
+}
 
-  const trimTrailingBlankLines = (content: string[]) => {
-    let endIndex = content.length;
-    while (endIndex > 0 && content[endIndex - 1].trim() === '') {
-      endIndex -= 1;
-    }
-    return content.slice(0, endIndex);
-  };
-
-  const commitSection = () => {
-    const cleanedContent = trimTrailingBlankLines(currentSection.content);
-    const hasContent = cleanedContent.some((line) => line.trim() !== '');
-    if (currentSection.heading || hasContent) {
-      sections.push({
-        heading: currentSection.heading,
-        content: cleanedContent,
-      });
-    }
-  };
-
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-    const fenceMatch = trimmedLine.match(/^(```|~~~)/);
-
-    if (fenceMatch) {
-      if (!inCodeFence) {
-        inCodeFence = true;
-        codeFenceMarker = fenceMatch[1];
-      } else if (codeFenceMarker && trimmedLine.startsWith(codeFenceMarker)) {
-        inCodeFence = false;
-        codeFenceMarker = null;
-      }
-      currentSection.content.push(line);
-      continue;
-    }
-
-    if (!inCodeFence) {
-      const headingMatch = trimmedLine.match(/^(#{1,6})\s+(.*)$/);
-      if (headingMatch) {
-        const level = headingMatch[1].length;
-        const headingText = headingMatch[2].trim();
-
-        if (
-          level === 1 &&
-          !title &&
-          sections.length === 0 &&
-          currentSection.content.every((contentLine) => contentLine.trim() === '')
-        ) {
-          title = headingText;
-          continue;
-        }
-
-        commitSection();
-        currentSection = {
-          heading: headingText,
-          content: []
-        };
-        continue;
-      }
-    }
-
-    currentSection.content.push(line);
-  }
-  
-  // Don't forget the last section
-  commitSection();
-
-  return { title, sections };
+/**
+ * Simple Markdown mode: the model's Markdown is the artifact, preserved as
+ * written (see {@link normalizeModelMarkdown}); the sections are an index over
+ * that same text, never a lossy re-rendering of it.
+ */
+function processMarkdownIntoExtractedContent(text: string): ExtractedContent {
+  const markdown = normalizeModelMarkdown(text);
+  return { ...markdownToSections(markdown), markdown };
 }
 
 /** How many advisory constructs to name before summarizing the rest. */
@@ -220,17 +163,20 @@ export async function extractStructuredDataFromFile(
   const { apiKey, model, thinkingConfig, baseUrl, headers, runtime } = clientConfig;
   if (!apiKey) throw new Error('Please configure your Gemini API key in settings');
 
-  const prompt = [
+  const prompt = joinPromptParts([
     'Extract the document into the exact JSON structure described by the response schema.',
     'Use only information visible in the document. Do not invent missing values.',
     'Return JSON only, without Markdown fences or commentary.',
     ...(instructions?.map((instruction) => instruction.prompt) ?? []),
     ...(options?.detectImages ? ['Include relevant information visible in charts, diagrams, or images.'] : []),
     ...(options?.detectMathEquations ? ['Represent mathematical expressions accurately.'] : []),
-  ].join(' ');
+  ]);
   const base64Data = fileData.split(',')[1] || fileData;
   let generationConfig: Record<string, unknown> = {
     maxOutputTokens: options?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    // Each continuation hop re-bills the input and runs inside one SDK call,
+    // past --max-cost; a CONTINUATION stop is reported as truncated output.
+    automaticContinuation: false,
     responseMimeType: 'application/json',
     responseJsonSchema,
     mediaResolution: generateContentMediaResolution(mimeType),
@@ -258,13 +204,7 @@ export async function extractStructuredDataFromFile(
   }
   recordGeminiUsage(response, model, runtime);
   assertCompleteGeminiResponse(response, 'Schema extraction');
-  const text = response.text?.trim() ?? '';
-  if (!text) throw new Error('Schema extraction returned an empty response');
-  try {
-    return JSON.parse(text) as JsonValue;
-  } catch {
-    throw new Error('Schema extraction returned invalid JSON');
-  }
+  return parseJsonPayload<JsonValue>(response.text ?? '', 'Schema extraction');
 }
 
 /**
@@ -296,6 +236,7 @@ export const EXTRACTED_CONTENT_RESPONSE_SCHEMA: Record<string, unknown> = {
         required: ['content'],
         properties: {
           heading: { type: 'string' },
+          level: { type: 'integer', minimum: 1, maximum: 6 },
           content: { type: 'array', items: { type: 'string' } },
         },
       },
@@ -343,6 +284,9 @@ function buildGenerationConfig(
   let config: Record<string, unknown> = {
     ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
     maxOutputTokens: options?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    // Each continuation hop re-bills the input and runs inside one SDK call,
+    // past --max-cost; a CONTINUATION stop is reported as truncated output.
+    automaticContinuation: false,
   };
 
   if (wantsJsonOutput(options)) {
@@ -367,105 +311,133 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+const CONTENT_KEYS = ['title', 'sections', 'content', 'headings', 'tables', 'code', 'lists', 'markdown'] as const;
+
+function unexpectedKey(value: Record<string, unknown>, allowed: readonly string[], path: string): string | undefined {
   const allowedKeys = new Set(allowed);
-  return Object.keys(value).every((key) => allowedKeys.has(key));
+  const extra = Object.keys(value).find((key) => !allowedKeys.has(key));
+  return extra === undefined ? undefined : `${path || 'the response'} has unexpected property "${extra}"`;
 }
 
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+function stringArrayProblem(value: unknown, path: string): string | undefined {
+  if (!Array.isArray(value)) return `${path} must be an array of strings`;
+  const index = value.findIndex((entry) => typeof entry !== 'string');
+  return index < 0 ? undefined : `${path}[${index}] must be a string`;
 }
 
-function isExtractedContent(value: unknown): value is ExtractedContent {
-  if (!isRecord(value) || !hasOnlyKeys(value, [
-    'title',
-    'sections',
-    'content',
-    'headings',
-    'tables',
-    'code',
-    'lists',
-    'markdown',
-  ])) {
-    return false;
-  }
-
-  if (!Array.isArray(value.sections) || !value.sections.every((section) => (
-    isRecord(section)
-    && hasOnlyKeys(section, ['heading', 'content'])
-    && (section.heading === undefined || typeof section.heading === 'string')
-    && isStringArray(section.content)
-  ))) {
-    return false;
-  }
-
-  if (
-    (value.title !== undefined && typeof value.title !== 'string')
-    || (value.content !== undefined && typeof value.content !== 'string')
-    || (value.headings !== undefined && !isStringArray(value.headings))
-    || (value.code !== undefined && !isStringArray(value.code))
-    || (value.markdown !== undefined && typeof value.markdown !== 'string')
-  ) {
-    return false;
-  }
-
-  if (value.tables !== undefined && (
-    !Array.isArray(value.tables)
-    || !value.tables.every((table) => (
-      isRecord(table)
-      && hasOnlyKeys(table, ['headers', 'rows', 'content'])
-      && isStringArray(table.headers)
-      && Array.isArray(table.rows)
-      && table.rows.every(isStringArray)
-      && typeof table.content === 'string'
-    ))
-  )) {
-    return false;
-  }
-
-  if (value.lists !== undefined && (
-    !Array.isArray(value.lists)
-    || !value.lists.every((list) => (
-      isRecord(list)
-      && hasOnlyKeys(list, ['type', 'items'])
-      && (list.type === 'ordered' || list.type === 'unordered')
-      && isStringArray(list.items)
-    ))
-  )) {
-    return false;
-  }
-
-  return true;
+function optionalStringProblem(value: unknown, path: string): string | undefined {
+  return value === undefined || typeof value === 'string' ? undefined : `${path} must be a string`;
 }
 
-function parseExtractedContentFromJson(text: string): ExtractedContent | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return isExtractedContent(parsed) ? parsed : null;
-  } catch {
-    return null;
+/**
+ * Explain the first way `value` departs from the OCR content schema, naming
+ * the JSON path ("sections[2].content[0] must be a string"), or return
+ * undefined when it conforms.
+ */
+export function describeExtractedContentMismatch(value: unknown): string | undefined {
+  if (!isRecord(value)) return 'the response must be a JSON object';
+  const topLevel = unexpectedKey(value, CONTENT_KEYS, '');
+  if (topLevel) return topLevel;
+  if (!Array.isArray(value.sections)) return 'sections must be an array';
+  for (const [index, section] of value.sections.entries()) {
+    const path = `sections[${index}]`;
+    if (!isRecord(section)) return `${path} must be an object`;
+    const problem = unexpectedKey(section, ['heading', 'level', 'content'], path)
+      ?? optionalStringProblem(section.heading, `${path}.heading`)
+      ?? (section.level !== undefined
+        && !(Number.isInteger(section.level) && (section.level as number) >= 1 && (section.level as number) <= 6)
+        ? `${path}.level must be an integer from 1 to 6`
+        : undefined)
+      ?? stringArrayProblem(section.content, `${path}.content`);
+    if (problem) return problem;
   }
+  const scalar = optionalStringProblem(value.title, 'title')
+    ?? optionalStringProblem(value.content, 'content')
+    ?? optionalStringProblem(value.markdown, 'markdown')
+    ?? (value.headings !== undefined ? stringArrayProblem(value.headings, 'headings') : undefined)
+    ?? (value.code !== undefined ? stringArrayProblem(value.code, 'code') : undefined);
+  if (scalar) return scalar;
+  if (value.tables !== undefined) {
+    if (!Array.isArray(value.tables)) return 'tables must be an array';
+    for (const [index, table] of value.tables.entries()) {
+      const path = `tables[${index}]`;
+      if (!isRecord(table)) return `${path} must be an object`;
+      const problem = unexpectedKey(table, ['headers', 'rows', 'content'], path)
+        ?? stringArrayProblem(table.headers, `${path}.headers`)
+        ?? (Array.isArray(table.rows)
+          ? table.rows.map((row, rowIndex) => stringArrayProblem(row, `${path}.rows[${rowIndex}]`)).find(Boolean)
+          : `${path}.rows must be an array of string arrays`)
+        ?? (typeof table.content === 'string' ? undefined : `${path}.content must be a string`);
+      if (problem) return problem;
+    }
+  }
+  if (value.lists !== undefined) {
+    if (!Array.isArray(value.lists)) return 'lists must be an array';
+    for (const [index, list] of value.lists.entries()) {
+      const path = `lists[${index}]`;
+      if (!isRecord(list)) return `${path} must be an object`;
+      const problem = unexpectedKey(list, ['type', 'items'], path)
+        ?? (list.type === 'ordered' || list.type === 'unordered'
+          ? undefined
+          : `${path}.type must be "ordered" or "unordered"`)
+        ?? stringArrayProblem(list.items, `${path}.items`);
+      if (problem) return problem;
+    }
+  }
+  return undefined;
+}
+
+function hasText(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim() !== '';
+  if (Array.isArray(value)) return value.some(hasText);
+  if (isRecord(value)) return Object.entries(value).some(([key, entry]) => key !== 'type' && key !== 'level' && hasText(entry));
+  return false;
+}
+
+function outputInvalid(message: string, cause?: unknown): OcrError {
+  return new OcrError(OcrErrorType.OUTPUT_INVALID, message, undefined, cause === undefined ? undefined : { cause });
 }
 
 /**
  * Turn raw model output into an ExtractedContent according to the requested
  * contract. When JSON was explicitly requested, an unparseable response is a
  * contract violation that throws — it is never silently downgraded to Markdown
- * (audit H-02). An empty response always throws (audit G-02/H-03).
+ * (audit H-02). An empty response always throws (audit G-02/H-03), and so does
+ * a well-formed JSON answer that carries no text at all (`{"sections":[]}`):
+ * reporting that as a successful OCR would hide a model that read nothing.
+ *
+ * JSON is located with the same tolerance as template and `--schema` mode
+ * (fences, prose, inline reasoning), and a failure says whether the response
+ * was not JSON or was JSON of the wrong shape, naming the offending path.
  */
 export function coerceExtractionResult(text: string, wantsJson: boolean): ExtractedContent {
   const trimmed = text.trim();
   if (!trimmed) {
-    throw new Error('Extraction returned an empty response');
+    throw outputInvalid('Extraction returned an empty response');
   }
   if (wantsJson) {
-    const parsed = parseExtractedContentFromJson(trimmed);
-    if (!parsed) {
-      throw new Error('Extraction requested JSON but the response was invalid JSON or did not match the OCR schema');
+    let parsed: unknown;
+    try {
+      parsed = parseJsonPayload<unknown>(trimmed, 'Extraction');
+    } catch (error) {
+      const reason = (error instanceof Error ? error.message : String(error))
+        .replace(/^Extraction returned invalid JSON: /u, '');
+      throw outputInvalid(`Extraction requested JSON but the response was invalid JSON (${reason})`, error);
     }
-    return parsed;
+    const mismatch = describeExtractedContentMismatch(parsed);
+    if (mismatch) {
+      throw outputInvalid(`Extraction requested JSON but the response did not match the OCR schema: ${mismatch}`);
+    }
+    if (!hasText(parsed)) {
+      throw outputInvalid('Extraction returned JSON with no text content (no title, headings, or section text)');
+    }
+    return parsed as ExtractedContent;
   }
-  return processMarkdownIntoExtractedContent(trimmed);
+  const content = processMarkdownIntoExtractedContent(text);
+  if (!content.markdown) {
+    throw outputInvalid('Extraction returned an empty response');
+  }
+  return content;
 }
 
 /**
@@ -536,7 +508,7 @@ export async function extractTextFromFile(
       promptParts.push('Format the output as clean markdown with proper headings and structure.');
     }
 
-    const prompt = promptParts.join(' ');
+    const prompt = joinPromptParts(promptParts);
 
     // Prepare contents for the API
     const contents = [{

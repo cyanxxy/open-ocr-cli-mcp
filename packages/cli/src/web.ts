@@ -13,6 +13,7 @@ import type { GeminiModel, JsonValue } from '@open-ocr/engine/gemini/types';
 import {
   createChatCompletion,
   documentContentParts,
+  geminiRequestApiKey,
   providerDefaultBaseUrl,
   providerRequestHeaders,
   type OpenAIContentPart,
@@ -86,11 +87,11 @@ export async function runWebJob(
       const extraction = await runWithProviderRetries(
         resolvedOptions,
         signal,
-        () => runWebExtraction(
+        (attemptSignal) => runWebExtraction(
           urls,
           analysis,
           resolvedOptions,
-          signal,
+          attemptSignal,
           providerRuntime,
         ),
       );
@@ -426,7 +427,7 @@ export async function runWebExtraction(
   const config = providerRuntimeConfig(options, runtime);
   return extractTextFromUrls(
     urls,
-    options.apiKey || (options.cloudflareByok ? options.gatewayToken || 'cloudflare-byok' : ''),
+    geminiRequestApiKey(options),
     analysis,
     options.model as GeminiModel,
     { level: options.thinking, includeThoughts: options.includeThoughts },

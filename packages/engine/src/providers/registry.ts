@@ -30,11 +30,15 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
   kimi: {
     id: 'kimi',
     label: 'Moonshot Kimi',
-    defaultModel: 'kimi-k3',
+    // https://platform.kimi.ai/docs/models.md (2026-11-01): K3.1 Pro is the
+    // flagship; K3 is the "previous-generation flagship" and costs more.
+    defaultModel: 'kimi-k3.1-pro',
     defaultBaseUrl: 'https://api.moonshot.ai/v1',
     defaultApiKeyEnv: 'MOONSHOT_API_KEY',
-    models: ['kimi-k3', 'kimi-k3.1-pro', 'kimi-k3.1-pro-highspeed'],
-    inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+    models: ['kimi-k3.1-pro', 'kimi-k3.1-pro-highspeed', 'kimi-k3'],
+    // https://platform.kimi.ai/docs/guide/use-kimi-vision-model.md also lists
+    // image/bmp, which this CLI does not ingest for any provider.
+    inputImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/heic', 'image/heif'],
     capabilities: {
       images: true,
       pdfs: true,
@@ -232,13 +236,33 @@ export function resolveProviderBaseUrl(input: {
   return `${root}/custom-${encodeURIComponent(input.cloudflareProvider)}/v1`;
 }
 
+/**
+ * The key a Gemini client sends as `x-goog-api-key`.
+ *
+ * Under Cloudflare BYOK the gateway substitutes the stored provider key "only
+ * when the provider authorization header is absent"; a real key in that header
+ * is forwarded instead and a placeholder causes a provider authentication error
+ * (developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys).
+ * Cloudflare's @google/genai BYOK example therefore passes the gateway token as
+ * `apiKey` (developers.cloudflare.com/ai-gateway/usage/providers/google-ai-studio).
+ * The user's own Gemini key is never sent in BYOK mode — the same rule as the
+ * omitted `Authorization` header on OpenAI-compatible routes.
+ */
+export function geminiRequestApiKey(
+  config: Pick<ProviderRuntimeConfig, 'apiKey' | 'cloudflareByok' | 'gatewayToken'>,
+): string {
+  return config.cloudflareByok ? config.gatewayToken ?? '' : config.apiKey;
+}
+
 export function providerRequestHeaders(config: ProviderRuntimeConfig): Record<string, string> {
   const headers: Record<string, string> = {};
   if (config.gatewayToken) headers['cf-aig-authorization'] = `Bearer ${config.gatewayToken}`;
   if (config.cloudflareByokAlias) headers['cf-aig-byok-alias'] = config.cloudflareByokAlias;
   if (config.provider === 'openrouter') {
+    // App attribution: https://openrouter.ai/docs/app-attribution.
+    // `X-OpenRouter-Title` is the current header; `X-Title` remains an alias.
     headers['HTTP-Referer'] = 'https://github.com/cyanxxy/open-ocr-cli-mcp';
-    headers['X-Title'] = 'Open OCR CLI & MCP';
+    headers['X-OpenRouter-Title'] = 'Open OCR CLI & MCP';
   }
   return headers;
 }
@@ -265,6 +289,17 @@ export function providerTokenPrice(
   const model = config.provider === 'openrouter'
     ? config.model.replace(/^google\//, '').replace(/^moonshotai\//, '').replace(/^meta\//, '')
     : config.model;
+  // OpenRouter's catalog headline for google/gemini-3.8-flash
+  // (https://openrouter.ai/api/v1/models, 2026-11-01) is $0.825 / $0.0825
+  // cached / $4.125, 10% above Google's list price; its other routes match the
+  // upstream list prices below. This estimate is only a fallback: OpenRouter's
+  // per-response `usage.cost` takes precedence. After Google's 2027 change the
+  // same 10% uplift is applied until the catalog says otherwise.
+  if (config.provider === 'openrouter' && model === 'gemini-3.8-flash') {
+    return now < Date.UTC(2027, 0, 1)
+      ? { inputPerMillionUsd: 0.825, cachedInputPerMillionUsd: 0.0825, outputPerMillionUsd: 4.125 }
+      : { inputPerMillionUsd: 1.65, cachedInputPerMillionUsd: 0.165, outputPerMillionUsd: 8.25 };
+  }
   switch (model) {
     // Verified against https://platform.kimi.ai/docs/pricing/chat on 2026-10-28.
     // Cached input is billed at the cache-hit price only. OpenRouter routes use

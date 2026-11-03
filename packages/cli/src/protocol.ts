@@ -195,6 +195,11 @@ export interface OcrProtocolDocument {
     csv?: string;
     agentSteps?: OcrProtocolStep[];
   };
+  /**
+   * Findings about this document's output: failed validation checks (which make
+   * it `partial`) and non-fatal warnings. Present only when non-empty.
+   */
+  warnings?: string[];
   error?: OcrErrorPayload;
 }
 
@@ -1120,6 +1125,7 @@ export function toProtocolDocument(
     ...(content
       ? { content }
       : {}),
+    ...(result.warnings?.length ? { warnings: [...result.warnings] } : {}),
     ...(result.errorDetails ? { error: result.errorDetails } : {}),
   };
 }
@@ -1236,6 +1242,7 @@ export function createOcrCapabilities(cliVersion: string): OcrCapabilities {
       'hermetic-config',
       'mcp-stdio',
       'result-warnings',
+      'document-warnings',
     ],
     errorCodes: [...OCR_ERROR_CODES],
     exitCodes: {

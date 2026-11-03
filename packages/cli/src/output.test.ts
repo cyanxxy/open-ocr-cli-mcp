@@ -51,7 +51,18 @@ describe('CLI output', () => {
     expect(primaryArtifact(artifacts, 'markdown')).toBe('# Invoice\n');
     expect(primaryArtifact(artifacts, 'json')).toContain('"title": "Invoice"');
     expect(primaryArtifact(artifacts, 'csv')).toBe('name,total\nAcme,12.00\n');
-    expect(() => primaryArtifact({ markdown: '# Only' }, 'csv')).toThrow('tabular CSV');
+    expect(() => primaryArtifact({ markdown: '# Only' }, 'csv')).toThrow('no CSV could be produced');
+  });
+
+  it('types a missing CSV as an output-contract failure, not a provider failure', () => {
+    let thrown: unknown;
+    try {
+      primaryArtifact({ markdown: '# Only' }, 'csv');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ code: 'OUTPUT_INVALID', category: 'output', retryable: false, exitCode: 1 });
+    expect((thrown as { hint: string }).hint).toMatch(/--format json/);
   });
 
   it('writes all artifacts while preserving input directories', async () => {
@@ -208,12 +219,14 @@ describe('CLI output', () => {
   });
 
   it('can reserve job metadata for a reference-first single-document run', async () => {
+    // `.open-ocr-manifest.jpg` can no longer collide: hidden names lose their
+    // leading dot (`_.open-ocr-manifest.json`). The summary is still reserved.
     const metadataCollision = {
       ...input,
-      absolutePath: '/workspace/.open-ocr-manifest.jpg',
-      relativePath: '.open-ocr-manifest.jpg',
-      displayPath: '.open-ocr-manifest.jpg',
-      name: '.open-ocr-manifest.jpg',
+      absolutePath: '/workspace/batch-summary.jpg',
+      relativePath: 'batch-summary.jpg',
+      displayPath: 'batch-summary.jpg',
+      name: 'batch-summary.jpg',
     };
     await expect(assertNoOutputCollisions(
       [metadataCollision],
@@ -586,5 +599,135 @@ describe('CLI output', () => {
     } finally {
       rename.mockRestore();
     }
+  });
+});
+
+describe('artifact path hardening', () => {
+  it('rewrites names coding agents load as instructions', async () => {
+    const { neutralizeAgentInstructionPath } = await import('./output');
+    expect(neutralizeAgentInstructionPath([], 'CLAUDE')).toEqual(['CLAUDE.ocr']);
+    expect(neutralizeAgentInstructionPath([], 'agents')).toEqual(['agents.ocr']);
+    expect(neutralizeAgentInstructionPath(['.claude', 'commands'], 'deploy')).toEqual(['_.claude', 'commands', 'deploy']);
+    expect(neutralizeAgentInstructionPath(['docs', '.GitHub'], 'copilot-instructions'))
+      .toEqual(['docs', '_.GitHub', 'copilot-instructions.ocr']);
+    expect(neutralizeAgentInstructionPath(['scans'], 'invoice')).toEqual(['scans', 'invoice']);
+  });
+
+  it('never starts a directory or file segment with a dot', async () => {
+    const { neutralizeAgentInstructionPath } = await import('./output');
+    expect(neutralizeAgentInstructionPath([], '.mcp')).toEqual(['_.mcp']);
+    expect(neutralizeAgentInstructionPath(['.devcontainer'], 'devcontainer')).toEqual(['_.devcontainer', 'devcontainer']);
+    expect(neutralizeAgentInstructionPath(['docs', '.vscode', '.config'], '.env')).toEqual(['docs', '_.vscode', '_.config', '_.env']);
+    // Both rules apply: the instruction name gains `.ocr`, then loses its dot.
+    expect(neutralizeAgentInstructionPath([], '.cursorrules')).toEqual(['_.cursorrules.ocr']);
+    expect(neutralizeAgentInstructionPath(['a..b'], 'x.y')).toEqual(['a..b', 'x.y']);
+  });
+
+  it('keeps a hidden input and its underscore-named sibling apart', async () => {
+    const { assertNoOutputCollisions } = await import('./output');
+    const sibling = (relativePath: string): ResolvedInput => ({
+      ...input, absolutePath: `/workspace/${relativePath}`, relativePath, displayPath: relativePath, name: relativePath,
+    });
+    await expect(assertNoOutputCollisions([sibling('.mcp.png'), sibling('_mcp.png'), sibling('ok.png')], options))
+      .resolves.toBeUndefined();
+  });
+
+  it.each([
+    ['.mcp.png', '_.mcp'],
+    ['.devcontainer/devcontainer.png', path.join('_.devcontainer', 'devcontainer')],
+    ['.github/workflows/ci.png', path.join('_.github', 'workflows', 'ci')],
+    ['scans/.hidden/.page.png', path.join('scans', '_.hidden', '_.page')],
+  ])('writes %s without a hidden segment, consistently with planning', async (relativePath, expected) => {
+    const hidden: ResolvedInput = {
+      ...input, absolutePath: `/workspace/${relativePath}`, relativePath, displayPath: relativePath, name: path.basename(relativePath),
+    };
+    const planned = await plannedArtifactTargets(hidden, options, 2);
+    const written = await writeArtifacts(hidden, artifacts, options, 2);
+    // Planning lists the guaranteed artifacts; the optional CSV comes on top.
+    expect(written.map((target) => target.path)).toEqual(expect.arrayContaining(planned.map((target) => target.path)));
+    expect(planned.length).toBeGreaterThan(0);
+    expect(written.map((target) => path.relative(directory, target.path))).toEqual(
+      expect.arrayContaining([`${expected}.md`, `${expected}.json`]),
+    );
+    for (const target of written) {
+      expect(path.relative(directory, target.path).split(path.sep).some((segment) => segment.startsWith('.'))).toBe(false);
+    }
+    await expect(fs.lstat(path.join(directory, '.mcp.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.lstat(path.join(directory, '.devcontainer'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('re-extracts a resumed entry whose recorded artifact has a hidden name from the old layout', async () => {
+    const legacy = path.join(directory, '.mcp.json');
+    const current = path.join(directory, '_.mcp.json');
+    await writeFile(legacy, '{}\n');
+    await writeFile(current, '{}\n');
+    const manifest = new ManifestStore(directory);
+    await manifest.load();
+    await manifest.update('/workspace/.mcp.png', {
+      fingerprint: 'abc', status: 'succeeded', outputFiles: [legacy], completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry('/workspace/.mcp.png', 'abc')).resolves.toBeUndefined();
+    // The old path stays owned, so the new write is not blocked by it.
+    expect(manifest.recordedArtifactPaths('/workspace/.mcp.png').has(legacy)).toBe(true);
+
+    await manifest.update('/workspace/.mcp.png', {
+      fingerprint: 'abc', status: 'succeeded', outputFiles: [current], completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry('/workspace/.mcp.png', 'abc')).resolves.toMatchObject({ outputFiles: [current] });
+  });
+});
+
+describe('artifact write containment', () => {
+  it('refuses a write whose directory was swapped for a symbolic link out of the output directory', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'open-ocr-outside-'));
+    try {
+      const { symlink } = await import('node:fs/promises');
+      await symlink(outside, path.join(directory, 'nested'));
+      await expect(writeArtifacts(input, artifacts, options, 2)).rejects.toMatchObject({ code: 'OUTPUT_CONFLICT' });
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('creates nothing outside the output directory through a symlinked intermediate directory', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'open-ocr-outside-'));
+    try {
+      const { symlink } = await import('node:fs/promises');
+      await symlink(outside, path.join(directory, 'nested'));
+      const deep: ResolvedInput = {
+        ...input,
+        absolutePath: '/workspace/nested/deeper/still/invoice.pdf',
+        relativePath: 'nested/deeper/still/invoice.pdf',
+        displayPath: 'nested/deeper/still/invoice.pdf',
+      };
+      const failure = await writeArtifacts(deep, artifacts, options, 2).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: 'OUTPUT_CONFLICT' });
+      expect((failure as Error).message).toContain('resolves outside the output directory');
+      // A recursive mkdir would have created outside/deeper/still before refusing.
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a path component that is a file, and follows a symlink that stays inside', async () => {
+    const { symlink } = await import('node:fs/promises');
+    await writeFile(path.join(directory, 'nested'), 'not a directory');
+    const failure = await writeArtifacts(input, artifacts, options, 2).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: 'OUTPUT_CONFLICT' });
+    expect((failure as Error).message).toContain('is not a directory');
+    await rm(path.join(directory, 'nested'));
+    await fs.mkdir(path.join(directory, 'real'));
+    await symlink(path.join(directory, 'real'), path.join(directory, 'nested'));
+    await writeArtifacts(input, artifacts, options, 2);
+    expect((await fs.readdir(path.join(directory, 'real'))).sort()).toEqual(['invoice.csv', 'invoice.json', 'invoice.md']);
+  });
+
+  it('writes an input named CLAUDE.png as CLAUDE.ocr.md', async () => {
+    const claude = { ...input, absolutePath: '/workspace/CLAUDE.png', relativePath: 'CLAUDE.png', displayPath: 'CLAUDE.png', name: 'CLAUDE.png' };
+    const written = await writeArtifacts(claude, artifacts, options, 2);
+    expect(written.map((target) => path.basename(target.path))).toContain('CLAUDE.ocr.md');
+    expect(await fs.readdir(directory)).not.toContain('CLAUDE.md');
   });
 });

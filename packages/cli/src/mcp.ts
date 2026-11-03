@@ -5,8 +5,11 @@ import { pathToFileURL } from 'node:url';
 
 import {
   McpServer,
+  PROTOCOL_VERSION_META_KEY,
   ProtocolError,
+  ProtocolErrorCode,
   ResourceTemplate,
+  UnsupportedProtocolVersionError,
   createRequestStateCodec,
   fromJsonSchema,
   inputRequired,
@@ -27,7 +30,14 @@ import { GATEWAY_IDS, PROVIDER_IDS } from '@open-ocr/engine/providers';
 import capabilitiesV2Schema from '../schemas/capabilities-v2.schema.json';
 import errorV2Schema from '../schemas/error-v2.schema.json';
 import resultV2Schema from '../schemas/result-v2.schema.json';
-import { CliExitError, cliExitCode, cliSignalExitCode, ocrErrorPayload } from './errors';
+import {
+  CliExitError,
+  cliExitCode,
+  cliSignalExitCode,
+  ocrErrorPayload,
+  redactSensitiveErrorText,
+} from './errors';
+import { isRecord } from './jsonValidation';
 import { OCR_REQUEST_LIMITS } from './limits';
 import { executeOcrJobRequest } from './machine';
 import { MCP_ARTIFACT_CHUNK_BYTES, MCP_ARTIFACT_REGISTRY_LIMIT, McpArtifactRegistry } from './mcpArtifacts';
@@ -43,6 +53,7 @@ import {
   type OcrMachineResult,
   type OcrRunResult,
 } from './protocol';
+import type { ResolvedCliOptions } from './types';
 
 const thinkingLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const contentFormats = ['markdown', 'json', 'csv', 'all'] as const;
@@ -133,11 +144,95 @@ interface McpCapabilitiesResult {
 const ocrResultOutputSchema = fromJsonSchema<OcrMachineResult>(selfContainedResultSchema());
 const ocrCapabilitiesOutputSchema = fromJsonSchema<McpCapabilitiesResult>(selfContainedCapabilitiesToolSchema());
 
+/** The one protocol revision this server serves. */
+export const SERVED_PROTOCOL_VERSIONS: readonly string[] = ['2026-07-28'];
+
+// Discovery contains the process working directory; static catalogs may be shared.
+const STATIC_CACHE_HINT: CacheHint = { ttlMs: 3_600_000, cacheScope: 'public' };
+
+// Elicited confirmation before a billed run. Opt-in through the environment
+// rather than a tool argument: a safety gate the model can switch off by
+// omitting a field is not a safety gate.
+const CONFIRM_ENV = 'OPEN_OCR_MCP_CONFIRM';
+const CONFIRM_KEY = 'proceed';
+const CONFIRM_TTL_MS = 600_000;
+
+
+type JsonRpcErrorBody = { code: number; message: string; data?: unknown };
+
+/**
+ * The `UnsupportedProtocolVersionError` (-32022) for a request whose declared
+ * protocol version this server does not serve, in the SDK's own shape: data
+ * lists `supported` and echoes `requested`, which is omitted (not invented)
+ * when the request named no version at all.
+ */
+function unsupportedProtocolVersion(message: { params?: unknown }): JsonRpcErrorBody | undefined {
+  const meta = isRecord(message.params) ? message.params._meta : undefined;
+  const requested = isRecord(meta) ? meta[PROTOCOL_VERSION_META_KEY] : undefined;
+  const supported = [...SERVED_PROTOCOL_VERSIONS];
+  if (typeof requested === 'string' && supported.includes(requested)) return undefined;
+  const error = typeof requested === 'string'
+    ? new UnsupportedProtocolVersionError({ supported, requested })
+    : new ProtocolError(
+        ProtocolErrorCode.UnsupportedProtocolVersion,
+        'Unsupported protocol version: the request did not name a protocol version',
+        { supported },
+      );
+  return { code: error.code, message: error.message, data: error.data };
+}
+
+/**
+ * A JSON-RPC error for a confirmation answer that is present but cannot be
+ * read as the `ElicitResult` this server asked for.
+ *
+ * The MRTR rules make a malformed `inputResponses` a protocol error that
+ * SHOULD be answered with a JSON-RPC error, and only a missing answer is
+ * re-asked. The SDK either drops such an entry (a wrapped `{ method, result }`
+ * or a non-object) or hands it on unrecognised (`{ action: "yes" }`), and the
+ * tool handler can only return results, so it is answered here, before
+ * dispatch. Only the key this server requests is judged, and only while
+ * confirmation is on; anything else in `inputResponses` is ignored, as the
+ * specification asks.
+ */
+function malformedConfirmationAnswer(message: { method: string; params?: unknown }): JsonRpcErrorBody | undefined {
+  if (message.method !== 'tools/call' || process.env[CONFIRM_ENV] !== '1') return undefined;
+  if (!isRecord(message.params) || !('inputResponses' in message.params)) return undefined;
+  const responses = message.params.inputResponses;
+  const invalid = (detail: string): JsonRpcErrorBody => ({
+    code: ProtocolErrorCode.InvalidParams,
+    message: `Invalid inputResponses: ${detail}. Answer the confirmation with the bare ElicitResult it requested `
+      + `({ "action": "accept" | "decline" | "cancel", "content": { "${CONFIRM_KEY}": true } }), or re-run the tool call to be asked again.`,
+    data: { reason: 'malformed_input_response', key: CONFIRM_KEY },
+  });
+  if (responses === undefined) return undefined;
+  if (!isRecord(responses)) return invalid('expected an object keyed by input request');
+  if (!Object.hasOwn(responses, CONFIRM_KEY)) return undefined;
+  const answer = responses[CONFIRM_KEY];
+  if (!isRecord(answer)) return invalid(`"${CONFIRM_KEY}" is not an object`);
+  if ('method' in answer || 'result' in answer) {
+    return invalid(`"${CONFIRM_KEY}" is a wrapped { method, result } envelope, not a bare ElicitResult`);
+  }
+  if (answer.action !== 'accept' && answer.action !== 'decline' && answer.action !== 'cancel') {
+    return invalid(`"${CONFIRM_KEY}".action must be "accept", "decline", or "cancel"`);
+  }
+  if (answer.content !== undefined && !isRecord(answer.content)) {
+    return invalid(`"${CONFIRM_KEY}".content must be an object`);
+  }
+  return undefined;
+}
+
 /**
  * Keep the modern-only stdio architecture while giving legacy clients an
  * actionable diagnosis. The SDK's strict rejection currently reports an
  * `initialize` request naming 2026-07-28 as both unsupported and supported;
  * the method itself is the legacy-era signal, regardless of that string.
+ *
+ * Every request is also held to the revision it declares. The SDK checks the
+ * declared version only on the first request of a stdio connection; after one
+ * modern request, later ones naming `2025-11-25` or `1900-01-01` were served,
+ * although the versioning rules say a server MUST answer each request whose
+ * version it does not implement with -32022. A malformed confirmation answer
+ * is refused here too (see {@link malformedConfirmationAnswer}).
  */
 export class ModernMcpDiagnosticTransport implements Transport {
   readonly hasPerRequestStream: boolean | undefined;
@@ -153,15 +248,19 @@ export class ModernMcpDiagnosticTransport implements Transport {
     return this.inner.sessionId;
   }
 
+  private reject(id: string | number, error: JsonRpcErrorBody): void {
+    void this.inner.send({ jsonrpc: '2.0', id, error }).catch((sendError: unknown) => {
+      this.onerror?.(sendError instanceof Error ? sendError : new Error(String(sendError)));
+    });
+  }
+
   async start(): Promise<void> {
     this.inner.onclose = () => this.onclose?.();
     this.inner.onerror = (error) => this.onerror?.(error);
     this.inner.onmessage = <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo): void => {
-      if (isJSONRPCRequest(message) && message.method === 'initialize') {
-        void this.inner.send({
-          jsonrpc: '2.0',
-          id: message.id,
-          error: {
+      if (isJSONRPCRequest(message)) {
+        if (message.method === 'initialize') {
+          this.reject(message.id, {
             code: -32600,
             message: 'Legacy initialize handshake removed in MCP 2026-07-28; use server/discover or include the modern per-request _meta envelope.',
             data: {
@@ -172,11 +271,14 @@ export class ModernMcpDiagnosticTransport implements Transport {
                 'io.modelcontextprotocol/clientCapabilities',
               ],
             },
-          },
-        }).catch((error: unknown) => {
-          this.onerror?.(error instanceof Error ? error : new Error(String(error)));
-        });
-        return;
+          });
+          return;
+        }
+        const rejection = unsupportedProtocolVersion(message) ?? malformedConfirmationAnswer(message);
+        if (rejection) {
+          this.reject(message.id, rejection);
+          return;
+        }
       }
       this.onmessage?.(message, extra);
     };
@@ -199,16 +301,6 @@ export class ModernMcpDiagnosticTransport implements Transport {
     this.inner.setSupportedProtocolVersions?.(versions);
   }
 }
-
-// Discovery contains the process working directory; static catalogs may be shared.
-const STATIC_CACHE_HINT: CacheHint = { ttlMs: 3_600_000, cacheScope: 'public' };
-
-// Elicited confirmation before a billed run. Opt-in through the environment
-// rather than a tool argument: a safety gate the model can switch off by
-// omitting a field is not a safety gate.
-const CONFIRM_ENV = 'OPEN_OCR_MCP_CONFIRM';
-const CONFIRM_KEY = 'proceed';
-const CONFIRM_TTL_MS = 600_000;
 
 interface ConfirmationState {
   nonce: string;
@@ -234,7 +326,8 @@ const documentPath = z.string().min(1)
   .regex(/^(?!-$).+$/u, 'stdin ("-") is unavailable over MCP; pass a file path');
 
 const PATH_RESOLUTION_NOTE = 'Relative paths resolve against the server working directory, which ocr_capabilities '
-  + 'and the server instructions report; prefer absolute paths.';
+  + 'and the server instructions report; prefer absolute paths. Every path must resolve, with symbolic links '
+  + 'followed, inside that directory.';
 
 const pathInput = z.strictObject({
   type: z.literal('path'),
@@ -248,9 +341,9 @@ const limits = OCR_REQUEST_LIMITS;
 
 const sharedFields = {
   configPath: z.string().min(1).optional()
-    .describe(`Explicit CLI configuration file. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Explicit CLI configuration file. It may not set baseUrl, apiKeyEnv, gateway, or other routing keys, or token prices; routing, prices, and limits belong to the operator's user configuration and server environment. ${PATH_RESOLUTION_NOTE}`),
   noConfig: z.boolean().optional()
-    .describe('Ignore all configuration files and the project .env. Cannot be combined with configPath. Environment overrides still apply; pass explicit provider/model/options for reproducibility.'),
+    .describe('Ignore configuration files and the project .env. Cannot be combined with configPath. The operator\'s limits still apply, as do environment overrides; pass explicit provider/model/options for reproducibility.'),
   provider: z.enum(PROVIDER_IDS).optional()
     .describe('Model provider. Defaults to the configured provider, otherwise gemini.'),
   gateway: z.enum(GATEWAY_IDS).optional()
@@ -260,7 +353,7 @@ const sharedFields = {
   thinking: z.enum(thinkingLevels).optional()
     .describe('Reasoning effort. Supported levels are provider- and model-specific; read them from ocr_capabilities.'),
   outputDirectory: z.string().min(1).optional()
-    .describe(`Where reference artifacts are written. Defaults to .open-ocr-results/<runId>. Reference delivery only. ${PATH_RESOLUTION_NOTE}`),
+    .describe(`Where reference artifacts are written. Defaults to .open-ocr-results/<runId>. Reference delivery only. May not be inside a hidden directory other than .open-ocr-results. ${PATH_RESOLUTION_NOTE}`),
   delivery: z.enum(['inline', 'reference']).optional()
     .describe('reference (default) writes artifact files and returns their paths; inline returns content in the response and writes nothing.'),
   resume: z.boolean().optional()
@@ -268,11 +361,11 @@ const sharedFields = {
   timeoutSeconds: z.number().int().min(limits.timeoutSeconds.min).max(limits.timeoutSeconds.max).optional()
     .describe('Per-document time limit.'),
   maxFiles: z.number().int().min(limits.maxFiles.min).max(limits.maxFiles.max).optional()
-    .describe('Refuse the run before any provider call if discovery matches more than this many documents.'),
+    .describe('Refuse the run before any provider call if discovery matches more than this many documents. An operator-configured value is a ceiling; a larger one is lowered to it.'),
   maxTotalMb: z.number().min(limits.maxTotalMb.min).max(limits.maxTotalMb.max).optional()
     .describe('Refuse the run before any provider call if the matched documents exceed this combined size in MB.'),
   maxCostUsd: z.number().min(limits.maxCostUsd.min).max(limits.maxCostUsd.max).optional()
-    .describe('Stop scheduling new requests once estimated paid-tier cost reaches this value.'),
+    .describe('Stop scheduling new requests once estimated paid-tier cost reaches this value. An operator-configured value is a ceiling; a larger one is lowered to it.'),
   requestsPerMinute: z.number().int().min(limits.requestsPerMinute.min).max(limits.requestsPerMinute.max).optional()
     .describe('Cap provider request starts per minute; 0 disables the limit.'),
   dryRun: z.boolean().optional()
@@ -606,9 +699,51 @@ interface ConfirmationPlan {
   gateway: string;
   model: string;
   costLimitUsd?: number;
+  /** Where the documents and credentials go: the endpoint host, scheme-qualified unless https. */
+  destination: string;
+  /** Environment variables whose values travel with the requests. */
+  credentialEnvs: string[];
+  /**
+   * Digest of every resolved option (credential values excluded), so a change
+   * to anything that shapes the run between approval and execution — a config
+   * file edited, an environment variable changed — is detected, not only the
+   * fields the message names.
+   */
+  optionsDigest: string;
 }
 
-function confirmationPlan(result: OcrRunResult): ConfirmationPlan {
+/** The endpoint host a person can recognise; a non-TLS scheme is spelled out. */
+function destinationOf(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' ? url.host : `${url.protocol}//${url.host}`;
+  } catch {
+    return baseUrl;
+  }
+}
+
+function credentialEnvsOf(options: ResolvedCliOptions): string[] {
+  const names: string[] = [];
+  if (!options.cloudflareByok) names.push(options.apiKeyEnv);
+  if (options.gateway === 'cloudflare' && options.gatewayTokenEnv) names.push(options.gatewayTokenEnv);
+  return [...new Set(names)];
+}
+
+function optionsDigest(options: ResolvedCliOptions): string {
+  // Credential values are never hashed into state the client holds; `output`
+  // carries the planning run's own id when the default directory is used, and
+  // the request hash already binds the caller's outputDirectory.
+  const {
+    apiKey: _apiKey,
+    gatewayToken: _gatewayToken,
+    output: _output,
+    dryRun: _dryRun,
+    ...stable
+  } = options;
+  return createHash('sha256').update(JSON.stringify(stable)).digest('base64url');
+}
+
+function confirmationPlan(result: OcrRunResult, options: ResolvedCliOptions): ConfirmationPlan {
   return {
     sources: result.documents.filter((document) => !document.error).map((document) => document.source),
     rejected: result.documents.filter((document) => document.error).length,
@@ -616,6 +751,9 @@ function confirmationPlan(result: OcrRunResult): ConfirmationPlan {
     gateway: result.gateway,
     model: result.model,
     ...(result.costLimitUsd !== undefined ? { costLimitUsd: result.costLimitUsd } : {}),
+    destination: destinationOf(options.baseUrl),
+    credentialEnvs: credentialEnvsOf(options),
+    optionsDigest: optionsDigest(options),
   };
 }
 
@@ -632,8 +770,14 @@ function confirmationMessage(plan: ConfirmationPlan): string {
   // Deliberately not "this calls a paid API": free tiers, local
   // OpenAI-compatible endpoints and preflight failures all exist, and a prompt
   // that overstates what it knows trains people to click through it.
+  const credentials = plan.credentialEnvs.length > 0
+    ? ` with the credential in ${plan.credentialEnvs.join(' and ')}`
+    : '';
+  // Names a person can check against what they expect: the host the documents
+  // and the credential go to, and which environment variable is sent. A
+  // redirected endpoint or a borrowed secret is visible here before approval.
   return `Run OCR on ${documents} ${noun} with ${plan.provider}/${plan.model}${route} (${ceiling})? `
-    + `This sends them to the provider and may incur charges.${rejected}`;
+    + `This sends them to ${oneLine(plan.destination)}${credentials} and may incur charges.${rejected}`;
 }
 
 function confirmationRequestHash(request: OcrJobRequest): string {
@@ -649,11 +793,12 @@ async function planMcpRequest(
   request: OcrJobRequest,
   context: McpRequestContext,
   cwd: string,
-): Promise<OcrMachineResult> {
+): Promise<{ result: OcrMachineResult; options?: ResolvedCliOptions }> {
   const abortController = new AbortController();
   const relayAbort = (): void => abortController.abort(context.mcpReq.signal.reason);
   if (context.mcpReq.signal.aborted) relayAbort();
   else context.mcpReq.signal.addEventListener('abort', relayAbort, { once: true });
+  let options: ResolvedCliOptions | undefined;
   try {
     const execution = await executeOcrJobRequest({ ...request, dryRun: true }, {
       cwd,
@@ -662,10 +807,12 @@ async function planMcpRequest(
       // The live run that follows reports its own warnings.
       onWarning: () => undefined,
       noConfig: request.noConfig,
+      boundary: 'mcp',
+      onResolvedOptions: (resolved) => { options = resolved; },
     });
-    return execution.result;
+    return { result: execution.result, options };
   } catch (error) {
-    return toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error)));
+    return { result: toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error))) };
   } finally {
     context.mcpReq.signal.removeEventListener('abort', relayAbort);
   }
@@ -695,9 +842,11 @@ async function confirmationGate(
   if (request.dryRun) return undefined;
   if (process.env[CONFIRM_ENV] !== '1') return undefined;
 
-  // The client answered but the SDK could not read the answer. Asking again
-  // would produce the same unreadable reply every round until the shim gives
-  // up, so this refuses once instead of looping.
+  // The client answered but the SDK could not read the answer. Over stdio the
+  // transport has already answered that with a JSON-RPC -32602 (see
+  // malformedConfirmationAnswer); this covers a server driven over another
+  // transport. Asking again would produce the same unreadable reply every
+  // round, so this refuses once instead of looping.
   if (context.mcpReq.droppedInputResponseKeys?.includes(CONFIRM_KEY)) {
     return ocrFailure(
       'The confirmation answer could not be read.',
@@ -709,11 +858,11 @@ async function confirmationGate(
   // A request that fails before any document could be sent (bad config, no
   // inputs) or whose every document fails local validation bills nothing:
   // return that outcome instead of asking a person to approve it.
-  const planned = await planMcpRequest(request, context, cwd);
-  if (!('documents' in planned) || planned.documents.every((document) => document.error)) {
+  const { result: planned, options: plannedOptions } = await planMcpRequest(request, context, cwd);
+  if (!('documents' in planned) || planned.documents.every((document) => document.error) || !plannedOptions) {
     return mcpResult(planned);
   }
-  const plan = confirmationPlan(planned);
+  const plan = confirmationPlan(planned, plannedOptions);
   const ask = async (): Promise<InputRequiredResult> => inputRequired({
     inputRequests: {
       [CONFIRM_KEY]: inputRequired.elicit({
@@ -834,6 +983,28 @@ function truncateText(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
 }
 
+/**
+ * Line breaks, other C0/C1 controls, and bidirectional overrides, which would
+ * let a document name or a provider message start a line of its own (forging a
+ * `Produced:` entry or a fake hint) or reorder what a terminal displays.
+ */
+// eslint-disable-next-line no-control-regex
+const LINE_FORGING_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+
+/**
+ * Render untrusted text (a source name, a provider message) as part of one
+ * line of {@link errorText}: control characters are escaped visibly rather
+ * than dropped, so the reader can still tell two names apart.
+ */
+function oneLine(text: string): string {
+  return text.replace(LINE_FORGING_CHARACTERS, (character) => {
+    if (character === '\n') return '\\n';
+    if (character === '\r') return '\\r';
+    if (character === '\t') return '\\t';
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`;
+  });
+}
+
 function runCounts(result: OcrRunResult): string {
   return `${result.succeeded} succeeded, ${result.partial} partial, ${result.failed} failed, `
     + `${result.skipped} skipped of ${result.total}`;
@@ -849,9 +1020,9 @@ function runCounts(result: OcrRunResult): string {
 function errorText(result: OcrMachineResult): string {
   if (!('documents' in result)) {
     const { error } = result;
-    const lines = [`Run ${result.runId} failed: [${error.code}] ${error.message}`];
-    if (error.hint) lines.push(`Hint: ${error.hint}`);
-    for (const warning of result.warnings ?? []) lines.push(`Warning: ${warning}`);
+    const lines = [`Run ${result.runId} failed: [${error.code}] ${oneLine(error.message)}`];
+    if (error.hint) lines.push(`Hint: ${oneLine(error.hint)}`);
+    for (const warning of result.warnings ?? []) lines.push(`Warning: ${oneLine(warning)}`);
     return truncateText(lines.join('\n'), MCP_ERROR_TEXT_MAX_CHARS);
   }
   const lines = [
@@ -879,12 +1050,12 @@ function errorText(result: OcrMachineResult): string {
   };
   addSection('Failed:', result.documents.flatMap((document) => (
     document.error
-      ? [`- ${document.source}: [${document.error.code}] ${document.error.message}${document.error.hint ? ` Hint: ${document.error.hint}` : ''}`]
+      ? [`- ${oneLine(document.source)}: [${document.error.code}] ${oneLine(document.error.message)}${document.error.hint ? ` Hint: ${oneLine(document.error.hint)}` : ''}`]
       : []
   )), 'failed document(s)');
   addSection('Produced (keep these; do not re-run them):', result.documents.flatMap((document) => (
     document.artifacts.length > 0
-      ? [`- ${document.source} (${document.status}${document.partialReason ? `: ${document.partialReason}` : ''}): ${document.artifacts.map((artifact) => artifact.path).join(', ')}`]
+      ? [`- ${oneLine(document.source)} (${document.status}${document.partialReason ? `: ${oneLine(document.partialReason)}` : ''}): ${document.artifacts.map((artifact) => oneLine(artifact.path)).join(', ')}`]
       : []
   )), 'document(s) with artifacts');
   return lines.join('\n');
@@ -926,11 +1097,36 @@ function resultTextBlock(result: OcrMachineResult): McpTextBlock {
   return { type: 'text', text: `${result.status} run ${result.runId}: ${runCounts(result)}. ${where}` };
 }
 
+/**
+ * Last-line credential scrub at the MCP boundary.
+ *
+ * Every error is redacted where it is typed, but this is the one place all of
+ * them leave the process for a possibly prompt-injected caller, so the error
+ * texts and warnings are passed through the redactor (which also removes the
+ * credential values registered for this process) once more here. In place:
+ * the envelope is this module's own, and callers rely on its identity.
+ */
+function scrubCredentials(result: OcrMachineResult): void {
+  const scrubError = (error: { message: string; hint?: string }): void => {
+    error.message = redactSensitiveErrorText(error.message);
+    if (error.hint !== undefined) error.hint = redactSensitiveErrorText(error.hint);
+  };
+  if (result.warnings) result.warnings = result.warnings.map(redactSensitiveErrorText);
+  if (!('documents' in result)) {
+    scrubError(result.error);
+    return;
+  }
+  for (const document of result.documents) {
+    if (document.error) scrubError(document.error);
+  }
+}
+
 export function mcpResult(result: OcrMachineResult): {
   content: Array<McpTextBlock | McpResourceLinkBlock>;
   structuredContent: Record<string, unknown>;
   isError?: boolean;
 } {
+  scrubCredentials(result);
   return {
     content: [
       resultTextBlock(result),
@@ -1009,6 +1205,9 @@ async function executeMcpRequest(
         process.stderr.write(`${message}\n`);
       },
       noConfig: request.noConfig,
+      // The MCP caller is untrusted relative to the operator: confine its
+      // paths, refuse routing from its configPath, and cap it by the operator.
+      boundary: 'mcp',
     });
     const artifactWarnings = await artifacts.remember(execution.result);
     if (artifactWarnings.length > 0) {
@@ -1070,13 +1269,14 @@ export function createOcrMcpServer(version: string, cwd = process.cwd()): McpSer
   const server = new McpServer(
     { name: 'open-ocr-cli-mcp', version },
     {
-      supportedProtocolVersions: ['2026-07-28'],
+      supportedProtocolVersions: [...SERVED_PROTOCOL_VERSIONS],
       maxToolInputElements: 100_000,
       // Roots is deprecated in this revision; its stated replacement is to
       // pass paths via tool parameters or server configuration. Publishing the
       // working directory here is what lets a relative path be a choice
       // rather than a guess.
       instructions: `Working directory: ${cwd}. Relative paths in tool arguments resolve against it; prefer absolute paths. `
+        + 'Inputs, configPath, schemaPath, and outputDirectory must stay inside it; operator limits are ceilings. '
         + 'Call ocr_capabilities first for presets, per-model thinking levels, accepted MIME types, and limits. '
         + 'Tool calls block until the whole batch finishes, so bound work with maxFiles, maxTotalMb, maxCostUsd, and timeoutSeconds. '
         + 'Use dryRun for local validation, prefer reference delivery, read warnings[] in every result, '

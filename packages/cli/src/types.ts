@@ -194,6 +194,12 @@ export interface ResolvedCliOptions {
   maxFiles: number;
   maxTotalMb: number;
   excludes: string[];
+  /**
+   * The `excludes` that came only from configuration files. They are ambient,
+   * so discovery never reports them as having matched nothing; only patterns
+   * supplied on the command line or in a request are. Absent means none.
+   */
+  configExcludes?: string[];
   instructions: string[];
   hidden: boolean;
   /** Whether directory scans prune well-known dependency and build-output trees. */
@@ -235,6 +241,13 @@ export interface OcrArtifacts {
   json?: ExtractedContent | PresetStructuredOutput | AgenticExtractionResult | JsonValue;
   csv?: string;
   agentSteps?: AgentStep[];
+  /**
+   * Failed validation checks (a required field left empty, a value that breaks
+   * its pattern). Any entry makes the document `partial`, never `succeeded`.
+   */
+  validationErrors?: string[];
+  /** Non-fatal findings the caller should see beside the artifacts. */
+  warnings?: string[];
 }
 
 export type OcrPartialReason =
@@ -242,7 +255,8 @@ export type OcrPartialReason =
   | 'max_iterations'
   | 'tool_limit_reached'
   | 'time_budget_reached'
-  | 'cost_limit_reached';
+  | 'cost_limit_reached'
+  | 'validation_failed';
 
 export type OcrNextAction =
   | 'review_partial_output'
@@ -278,6 +292,8 @@ export interface OcrJobResult {
   nextAction?: OcrNextAction;
   error?: string;
   errorDetails?: OcrErrorPayload;
+  /** Validation errors, then warnings, raised while producing this document. */
+  warnings?: string[];
   attempts: number;
 }
 
@@ -298,13 +314,39 @@ export interface BatchSummary {
   usage: ProviderUsageSnapshot;
   costLimitUsd?: number;
   costLimitReached: boolean;
+  /**
+   * Spend recorded for this output directory across every resumed run,
+   * including this one. `--max-cost` is enforced against this total.
+   */
+  cumulativeUsage?: ProviderUsageSnapshot;
   results: OcrJobResult[];
 }
 
 export interface ManifestEntry {
   fingerprint: string;
-  status: 'succeeded' | 'partial' | 'failed';
+  /**
+   * 2 = content-hash fingerprint (path, size, SHA-256, options). Absent on
+   * entries written by releases that fingerprinted path, size, and mtime.
+   */
+  fingerprintVersion?: 2;
+  /**
+   * `pending` is an in-progress claim written before artifacts are committed,
+   * so a process killed between the artifact commit and the final manifest
+   * update leaves files resume recognises as its own and re-extracts.
+   */
+  status: 'succeeded' | 'partial' | 'failed' | 'pending';
+  /**
+   * On a `pending` claim only: the run claimed the document up front but had
+   * not started it yet. A crash then leaves it queued rather than interrupted,
+   * and `error` still holds the previous run's failure, if any.
+   */
+  queued?: true;
   outputFiles: string[];
+  /**
+   * Every artifact path this entry has written or claimed, across format
+   * changes and interrupted attempts. Resume may replace any of them.
+   */
+  ownedFiles?: string[];
   completedAt: string;
   error?: string;
 }
@@ -312,4 +354,6 @@ export interface ManifestEntry {
 export interface CliManifest {
   version: 1;
   entries: Record<string, ManifestEntry>;
+  /** Cumulative provider usage of every run recorded in this output directory. */
+  usage?: ProviderUsageSnapshot;
 }

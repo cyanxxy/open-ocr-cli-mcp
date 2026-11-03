@@ -7,6 +7,8 @@ import {
   type ProviderErrorPayload,
   type ProviderErrorSubject,
 } from '@open-ocr/engine/gemini/errorPayload';
+import { isTransientBudgetProviderError } from '@open-ocr/engine/providers/openaiCompatible';
+import { isQuotaExhaustedError } from '@open-ocr/engine/providers/retry';
 
 /**
  * Redaction is defined beside the provider-body reader so the engine renders
@@ -28,6 +30,7 @@ export const OCR_ERROR_CODES = [
   'PERMISSION_DENIED',
   'SCHEMA_INVALID',
   'OUTPUT_CONFLICT',
+  'OUTPUT_INVALID',
   'RATE_LIMITED',
   'TIMEOUT',
   'COST_LIMIT',
@@ -86,6 +89,7 @@ const DEFAULT_ERROR_HINTS: Record<OcrErrorCode, string> = {
   PERMISSION_DENIED: 'Verify that the credential and project are allowed to use this model or operation.',
   SCHEMA_INVALID: 'Validate the JSON Schema against the supported structured-output subset.',
   OUTPUT_CONFLICT: 'Choose a new output path or resume a matching job.',
+  OUTPUT_INVALID: 'The model answered, but not in the requested shape; retry (--retries), simplify the schema or instructions, or use a more capable model.',
   RATE_LIMITED: 'Retry later or lower request concurrency/rate.',
   TIMEOUT: 'Retry with a longer timeout or a smaller document.',
   COST_LIMIT: 'Review partial output or explicitly raise the cost ceiling.',
@@ -145,11 +149,16 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
     || normalized.startsWith('schema path is not a file')
     || normalized.startsWith('schema exceeds')
     || normalized.startsWith('schema nesting exceeds')
-    || normalized.startsWith('schema output validation failed')
     || normalized.includes('json schema keyword')
     || normalized.includes('"$ref" must reference this schema document')
   ) {
     return { code: 'SCHEMA_INVALID', category: 'schema', retryable: false, hint: 'Validate the JSON Schema against the supported structured-output subset.' };
+  }
+  // Output-token truncation, as the Gemini client words it. The request was
+  // valid and the provider did not fail: it ran out of the token budget, so the
+  // fix is a larger budget, never an identical retry.
+  if (normalized.includes('reached the output token limit')) {
+    return OUTPUT_TRUNCATED_DETAILS;
   }
   if (normalized.includes('input does not exist')) {
     return { code: 'INPUT_NOT_FOUND', category: 'input', retryable: false, hint: 'Check the input path and working directory.' };
@@ -186,6 +195,28 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
   }
   return undefined;
 }
+
+const OUTPUT_TRUNCATED_DETAILS: OcrErrorDetails = {
+  code: 'PROVIDER_FAILURE',
+  category: 'provider',
+  retryable: false,
+  hint: 'The response hit the output-token limit and is incomplete; rerun with a higher --max-tokens '
+    + '(maxTokens in a run request), a lower --thinking level, or a smaller document.',
+};
+
+/**
+ * The model answered, but its answer broke the requested contract: not JSON,
+ * the wrong shape, or a value the caller's JSON Schema rejects. Distinct from
+ * SCHEMA_INVALID, which means the caller's schema itself is unusable — telling
+ * a caller with a valid schema to "validate the JSON Schema" sends them to fix
+ * the one thing that is not broken. Retryable: sampling again often conforms.
+ */
+const OUTPUT_INVALID_DETAILS: OcrErrorDetails = {
+  code: 'OUTPUT_INVALID',
+  category: 'output',
+  retryable: true,
+  hint: DEFAULT_ERROR_HINTS.OUTPUT_INVALID,
+};
 
 function recordValue(value: unknown, key: string): unknown {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : undefined;
@@ -315,6 +346,25 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     if (name === 'OcrError' && ocrType === 'SCHEMA_INVALID') {
       return classifyProviderSubject('response-schema');
     }
+    if (name === 'OcrError' && ocrType === 'OUTPUT_INVALID') {
+      return OUTPUT_INVALID_DETAILS;
+    }
+    // OpenRouter reports a provider-side refusal, or a separate content filter
+    // (e.g. Gemini SAFETY), as HTTP 403 with `metadata.error_type` `refusal` /
+    // `content_policy_violation` (openrouter.ai/docs/api_reference/
+    // errors-and-debugging). The credential is fine; the document was declined.
+    if (
+      structuredCode === 'MODEL_REFUSAL'
+      || structuredCode === 'REFUSAL'
+      || structuredCode === 'CONTENT_POLICY_VIOLATION'
+    ) {
+      return {
+        code: 'PROVIDER_FAILURE',
+        category: 'provider',
+        retryable: false,
+        hint: 'The model declined to process this document; review its refusal message, then adjust the instructions or use a different model.',
+      };
+    }
     if (
       structuredCode === 'API_KEY_INVALID'
       || structuredCode === 'UNAUTHENTICATED'
@@ -326,6 +376,28 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
     if (structuredCode === 'PERMISSION_DENIED' || structuredCode === 'PERMISSION_DENIED_ERROR') {
       return { code: 'PERMISSION_DENIED', category: 'authorization', retryable: false, hint: 'Verify that the credential and project are allowed to use this model or operation.' };
     }
+    // Account-level quota/credit exhaustion (OpenAI `insufficient_quota`, HTTP
+    // 402, a Gemini per-day / `limit: 0` / spending-cap quota) arrives as a 429
+    // or RESOURCE_EXHAUSTED, but no retry can clear it: say so instead of
+    // "retry later". This is the same verdict the engine's retry loop uses, so
+    // `retryable` here never contradicts what the CLI actually did. A Gemini
+    // per-minute 429 falls through to the retryable branches below.
+    if (isTransientBudgetProviderError(current)) {
+      return {
+        code: 'RATE_LIMITED',
+        category: 'provider',
+        retryable: true,
+        hint: 'Retry after the provider\'s Retry-After delay, once in-flight requests settle, or lower request concurrency.',
+      };
+    }
+    if (isQuotaExhaustedError(current)) {
+      return {
+        code: 'RATE_LIMITED',
+        category: 'provider',
+        retryable: false,
+        hint: 'Check the provider account balance and quota before retrying.',
+      };
+    }
     if (
       structuredCode === 'RESOURCE_EXHAUSTED'
       || structuredCode === 'RATE_LIMITED'
@@ -333,6 +405,7 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       || structuredCode === 'ENGINE_OVERLOADED_ERROR'
       || structuredCode === 'RATE_LIMIT_REACHED_ERROR'
       || structuredCode === 'PROVIDER_OVERLOADED'
+      || structuredCode === 'TOO_MANY_REQUESTS'
     ) {
       return { code: 'RATE_LIMITED', category: 'provider', retryable: true, hint: 'Retry later or lower request concurrency/rate.' };
     }
@@ -352,6 +425,8 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       || structuredCode === 'SERVER_ERROR'
       || structuredCode === 'SERVER'
       || structuredCode === 'SERVER_UNAVAILABLE'
+      || structuredCode === 'SERVICE_UNAVAILABLE'
+      || structuredCode === 'API_ERROR'
       || structuredCode === 'UNEXPECTED_OUTPUT'
       || structuredCode === 'CLIENT_CLOSED_REQUEST'
       || structuredCode === 'UNMAPPED'
@@ -395,6 +470,10 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       const payload = providerPayloadOf(current);
       const subject = payload ? providerErrorSubject(payload) : undefined;
       if (subject) return classifyProviderSubject(subject);
+      if (providerError && recordValue(current, 'message') !== undefined
+        && String(recordValue(current, 'message')).includes('reached the output token limit')) {
+        return OUTPUT_TRUNCATED_DETAILS;
+      }
       if (providerError) {
         return {
           code: 'PROVIDER_FAILURE',

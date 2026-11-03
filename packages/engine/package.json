@@ -1,6 +1,6 @@
 {
   "name": "@open-ocr/engine",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "description": "Shared provider-neutral multimodal OCR engine consumed by the open-ocr-cli package and the evals harness.",
   "license": "MIT",
   "private": true,
@@ -27,7 +27,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@google/genai": "^2.17.1",
+    "@google/genai": "^2.32.0",
     "ipaddr.js": "^2.4.0"
   }
 }

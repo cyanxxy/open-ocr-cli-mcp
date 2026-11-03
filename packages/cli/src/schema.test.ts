@@ -93,6 +93,17 @@ describe('custom JSON schemas', () => {
       .rejects.toThrow('Invalid JSON in schema');
   });
 
+  it('reports where schema JSON is malformed without quoting the file', async () => {
+    const schemaPath = path.join(directory, 'passwd');
+    await writeFile(schemaPath, 'root:x:0:0:root:/root:/bin/bash\n');
+    const thrown = await loadCustomSchema(schemaPath, directory).catch((error: unknown) => error as Error);
+    expect(thrown.message).toBe(`Invalid JSON in schema ${schemaPath}`);
+    await writeFile(schemaPath, '{"private_key": 1,}');
+    const positioned = await loadCustomSchema(schemaPath, directory).catch((error: unknown) => error as Error);
+    expect(positioned.message).toMatch(/^Invalid JSON in schema \S+ \(at position \d+/u);
+    expect(positioned.message).not.toContain('private_key');
+  });
+
   it('validates and clones inline schemas for machine requests', () => {
     const input = {
       $schema: 'https://json-schema.org/draft/2020-12/schema',

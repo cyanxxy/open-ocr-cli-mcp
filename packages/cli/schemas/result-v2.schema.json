@@ -16,7 +16,8 @@
         "toolTokens": { "type": "integer", "minimum": 0 },
         "cachedTokens": { "type": "integer", "minimum": 0 },
         "totalTokens": { "type": "integer", "minimum": 0 },
-        "estimatedCostUsd": { "type": "number", "minimum": 0 }
+        "estimatedCostUsd": { "type": "number", "minimum": 0 },
+        "unreportedUsageRequests": { "type": "integer", "minimum": 1 }
       }
     },
     "artifact": {
@@ -150,11 +151,12 @@
         "durationMs": { "type": "number", "minimum": 0 },
         "attempts": { "type": "integer", "minimum": 0 },
         "skipReason": { "enum": ["validated", "resumed", "cancelled", "cost-limit", "fail-fast"] },
-        "partialReason": { "enum": ["readiness_not_met", "max_iterations", "tool_limit_reached", "time_budget_reached", "cost_limit_reached"] },
+        "partialReason": { "enum": ["readiness_not_met", "max_iterations", "tool_limit_reached", "time_budget_reached", "cost_limit_reached", "validation_failed"] },
         "nextAction": { "enum": ["review_partial_output", "increase_max_iterations", "retry_document", "increase_timeout", "increase_max_cost"] },
         "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
         "plannedArtifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
         "content": { "$ref": "#/$defs/content" },
+        "warnings": { "$ref": "#/$defs/warnings" },
         "error": { "$ref": "error-v2.schema.json" }
       },
       "allOf": [

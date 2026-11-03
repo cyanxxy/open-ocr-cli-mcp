@@ -29,6 +29,8 @@ interface ResponseFixture {
   headers?: Record<string, string>;
   body?: string | Buffer;
   defer?: boolean;
+  /** Send headers and part of the body, then never finish it. */
+  trickle?: boolean;
 }
 
 const fixtures: ResponseFixture[] = [];
@@ -64,6 +66,10 @@ beforeEach(() => {
         response.statusCode = fixture.status;
         response.headers = fixture.headers ?? {};
         callback(response);
+        if (fixture.trickle) {
+          response.write(fixture.body ?? 'x');
+          return;
+        }
         response.end(fixture.body ?? '');
       });
     };
@@ -132,6 +138,33 @@ describe('secure public URL fetching', () => {
     timeoutCallbacks[0]();
 
     await expect(pending).rejects.toThrow('idle for 30 seconds');
+  });
+
+  it('enforces a total wall-clock deadline on a peer that trickles bytes', async () => {
+    // Each byte resets the idle timer, so only a total deadline ends this fetch.
+    fixtures.push({ status: 200, trickle: true, body: '%PDF-' });
+
+    const pending = secureFetchPublicUrl('http://documents.example/trickle', undefined, { totalTimeoutMs: 25 });
+    await expect(pending).rejects.toThrow('total time limit');
+    await expect(pending).rejects.toMatchObject({ code: 'INPUT_INVALID', retryable: true });
+  });
+
+  it('applies the deadline across redirects and before the response arrives', async () => {
+    fixtures.push({ status: 302, headers: { location: 'http://documents.example/next' } });
+    fixtures.push({ status: 200, defer: true });
+
+    await expect(secureFetchPublicUrl('http://documents.example/start', undefined, { totalTimeoutMs: 25 }))
+      .rejects.toThrow('total time limit');
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+  });
+
+  it('still reports a caller cancellation as the caller\'s own abort', async () => {
+    fixtures.push({ status: 200, defer: true });
+    const controller = new AbortController();
+    const pending = secureFetchPublicUrl('http://documents.example/stalled', controller.signal);
+    await vi.waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(1));
+    controller.abort(new Error('caller cancelled'));
+    await expect(pending).rejects.toThrow('caller cancelled');
   });
 
   it('rejects hexadecimal IPv4-mapped DNS answers before opening a socket', async () => {

@@ -1,5 +1,172 @@
 # Changelog
 
+## 4.4.0 - 2026-11-01
+
+A security and correctness release. The MCP server now treats its caller as
+untrusted relative to the operator who launched it. Although this is a minor
+version, some changes below can break existing setups: MCP calls that read or
+write outside the server's working directory, or that set routing or prices
+through a caller-supplied `configPath`, are now refused. Review the first
+section before upgrading. CLI flags behave as before except where noted.
+
+### Changed (review before upgrading)
+
+- MCP: inputs, globs, `schemaPath`, `configPath`, and `outputDirectory` must
+  resolve inside the server working directory (real paths, so symbolic links
+  pointing out are refused). Launch the server in the documents folder.
+  `outputDirectory` may not be inside a hidden directory other than
+  `.open-ocr-results`.
+- MCP: a `configPath` file may not set `baseUrl`, `apiKeyEnv`, a non-direct
+  `gateway`, `cloudflare*` keys, or BYOK settings (`CONFIG_INVALID`). Set a
+  custom endpoint in `~/.config/open-ocr-cli/config.json` instead.
+- MCP: `maxFiles`, `maxTotalMb`, `maxCostUsd`, `requestsPerMinute`, and
+  `concurrency` from the operator's configuration are ceilings; larger caller
+  values are lowered with a warning, and `noConfig` no longer removes them.
+- Template results with required-field validation errors are `partial`
+  (`partialReason: "validation_failed"`, exit 1) instead of succeeded.
+- `--max-cost` is enforced on cumulative spend across resumed runs of the same
+  output directory. `--overwrite` and `--no-resume` start a new total.
+- MCP: a caller's `configPath` or project `.open-ocr-cli.json` may not set
+  token prices (`CONFIG_INVALID`), so the operator's cost ceiling cannot be
+  defeated by declaring a model free.
+- Inputs named like agent instruction files (`CLAUDE`, `AGENTS`, `GEMINI`,
+  `copilot-instructions`, and similar) are written as `<name>.ocr.<ext>`, and
+  no artifact path segment starts with a dot: `.mcp.png` becomes `_.mcp.json`
+  and `.claude/x.png` becomes `_.claude/x.md`, for CLI and MCP runs.
+- Kimi defaults to `kimi-k3.1-pro`, Moonshot's current flagship (cheaper than
+  `kimi-k3`, which stays available).
+- Template mode uses 16384 output tokens unless `--max-tokens` or a request's
+  `extraction.maxTokens` says otherwise; a config-file `maxTokens` applies to
+  simple and agentic runs only.
+- URL fields keep only http(s) URLs or a plain host; anything else, including
+  non-URL text, becomes null with a warning.
+
+### Security
+
+- An MCP caller could send any server environment variable as a credential to
+  any host by pointing `configPath` at a file that set `baseUrl` and
+  `apiKeyEnv`, even with `OPEN_OCR_NO_CONFIG=1`. That is now refused.
+- An MCP caller could write artifacts anywhere, for example a new
+  `~/.config/open-ocr-cli/config.json` or `~/.claude/CLAUDE.md`.
+- The `OPEN_OCR_MCP_CONFIRM` prompt names the destination host and credential
+  variable, and the plan hash covers them and the resolved options, so a
+  change between approval and run asks again.
+- Resolved key values are redacted verbatim (and URL-encoded) from error text,
+  hints, and warnings, not only by pattern. Plain-text MCP errors escape
+  newlines, control, and bidi characters.
+- Config and schema file errors give a position, never file content. Schema
+  and MCP config files must be regular files, so a FIFO cannot hang the server.
+  Config files over 1 MB are refused.
+- Artifact directories are re-resolved right before each write and must stay
+  inside the output directory, narrowing symbolic-link swap races.
+- Public URL fetches have a 120-second total deadline.
+- `glob` 14.0.3 (patched `minimatch`); caller glob length and brace groups are
+  bounded under MCP.
+- MCP: every request's declared protocol version is checked, not only the
+  first (`-32022` otherwise). A malformed confirmation answer gets a JSON-RPC
+  `-32602` error.
+- Artifact directories are created one level at a time inside the output root,
+  so a swapped symbolic link cannot create directories outside it.
+- Gemini through Cloudflare BYOK sends the gateway token, never a local
+  `GEMINI_API_KEY`, so the stored key is used as configured.
+
+### Fixed
+
+- Markdown output keeps the model's Markdown: heading levels are no longer
+  flattened to `##`, blank lines are not doubled, an H1 after leading text is
+  not demoted, indented code and nested fences are not read as headings.
+  CRLF becomes LF and leading or trailing `<think>` blocks are removed. JSON
+  sections carry an optional heading `level`.
+- Money values keep their sign after a currency code, as a trailing minus, in
+  accounting parentheses, and with U+2212. One separator before exactly three
+  digits is read as grouping (`€1.234` is 1234.00, not 1.23) except for
+  three-decimal currencies, with a warning either way.
+- A preset with fixed columns and no rows gives a header-only CSV with a
+  warning instead of failing.
+- New `OUTPUT_INVALID` error code (category `output`, retryable) for model
+  output that breaks the requested schema, instead of `SCHEMA_INVALID` or
+  `PROVIDER_FAILURE`; messages name the failing path or key.
+- One tolerant JSON extractor (fenced blocks, surrounding prose, balanced and
+  string-aware) serves template, `--schema`, and simple JSON modes.
+- Template mode honours `--max-tokens` (default 16384). Truncation hints say to
+  raise it. Provider refusals are reported as refusals. `{"sections":[]}` is
+  no longer a success.
+- Typed preset fields warn on non-ISO dates and bad emails; non-http(s) URLs
+  are nulled. Unknown field keys and dropped row columns are listed in
+  warnings. Agentic Markdown escapes field values.
+- A SIGKILL mid-batch no longer leaves an unresumable directory: entries are
+  claimed as `pending` before artifacts are written, manifest writes are
+  atomic, and resume cleans stale temp and backup files.
+- Resume fingerprints inputs by SHA-256, so same-size, same-mtime edits are
+  re-extracted. Entries from 4.3.0 are trusted once and upgraded.
+- Resume recognises every artifact a batch wrote, so switching `--format`
+  between runs no longer conflicts with the tool's own files.
+- `Retry-After` (seconds, HTTP-date, `retry-after-ms`, Gemini retry delay) is
+  honoured on 429/503, capped at 60 s. OpenAI `insufficient_quota`, billing
+  and credit errors, HTTP 402, and Gemini daily or zero-limit quotas are not
+  retried.
+- `usage.requests` counts every attempt. Responses without usage are counted
+  in `unreportedUsageRequests`; with `--max-cost` and non-zero prices the run
+  stops new paid work instead of spending without a measure.
+- `--exclude` matches relative to the working directory for directory and glob
+  inputs alike and warns when a pattern matches nothing. A symbolic link and
+  its target are processed once.
+- Batch locks record the process start time, so a reused PID is stale, and
+  racing reclaims get `OUTPUT_CONFLICT` instead of `ENOENT`. `status` reports
+  lock state, interrupted entries, untracked artifacts, stray temp files, and
+  cumulative usage.
+
+- Gemini 429s are classified with the rule Google's gemini-cli uses: per-day
+  quotas, `limit: 0`, spending caps, and retry delays over 300 s are terminal;
+  per-minute limits are retried. Interactions `quota_exceeded` is terminal.
+- OpenAI billing 429s (`credit_balance_exhausted`, organization and project
+  spend or usage limits) are not retried; `error.type` is kept.
+- OpenRouter tool calls are routable again: `parallel_tool_calls` is no longer
+  sent to OpenRouter (no endpoint supports it, so `require_parameters`
+  excluded every route) or to Kimi. An OpenRouter in-flight-budget 402 with
+  `Retry-After` is retried, and 403 refusals get the refusal hint.
+- Strict-schema detection follows OpenAI's and Meta's documented keyword
+  rules (`$ref` is allowed for OpenAI; `allOf`, `oneOf`, root composition
+  are not for Meta).
+- Meta Muse requests send `max_completion_tokens` and image `detail`. Kimi
+  accepts HEIC/HEIF images. OpenRouter Gemini 3.8 Flash fallback price is
+  OpenRouter's ($0.825 / $4.125). OpenRouter attribution uses
+  `X-OpenRouter-Title`.
+- `@google/genai` 2.32.0. The SDK's automatic continuation is disabled on
+  every Gemini request (generateContent and Interactions), since
+  each hop re-bills the input and runs past `--max-cost`; a
+  `requires_continuation` stop is reported as truncated output.
+- MCP: absolute paths and file names containing `( ) [ ] { } ! ?` are read
+  literally; absolute globs are allowed inside the working directory.
+- `Rs.500`, `Fr.25`, and `S/.100` keep their magnitude; other separators after
+  letters keep the text with a warning. `javascript:1;...` URLs are nulled.
+- Tolerant JSON extraction never returns an object nested inside an unclosed
+  outer object.
+- Batch locks use a locale- and time-zone-independent process start time on
+  macOS and BSD; an identity that cannot be read counts as a live lock.
+  Leftover temp and backup files older than the lock are cleaned up even when
+  their PID was reused.
+- `status` audits only paths the batch could have produced, so unrelated
+  files in the output directory no longer make it unhealthy.
+- Excludes match working-directory-relative paths, so a working directory
+  containing braces no longer breaks them. "Matched nothing" warnings apply
+  only to command-line or request patterns after a walk ran.
+- A batch writes its manifest a handful of times instead of twice per
+  document (2000 documents: 4001 writes and 2.6 GB before, 6 writes and 7 MB
+  after) with the same crash safety; documents finished in the last second
+  before a SIGKILL are extracted again.
+- `status` separates documents a killed run had not started ("Not started",
+  previous error kept) from those it was writing ("Interrupted"), and says
+  when its directory limit left part of the batch unaudited instead of
+  reporting it healthy.
+- `@modelcontextprotocol/server` and `/client` 2.4.0.
+- Docs: Codex needs `CODEX_MCP_PROTOCOL_VERSION` and the `mcp_2026_07_28`
+  feature for this server (from Codex source; not yet in its docs); Claude
+  Code's 30-minute stdio idle timeout; the full Claude Code runtime list;
+  elicitation without an interactive dialog.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.3.0...v4.4.0)
+
 ## 4.3.0 - 2026-10-29
 
 The 4.2.0 tag was created, but its release run failed before publishing, so

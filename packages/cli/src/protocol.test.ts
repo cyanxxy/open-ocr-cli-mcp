@@ -602,7 +602,7 @@ describe('agent protocols', () => {
       .toEqual(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH']);
     expect(geminiProvider?.reasoning?.byModel).toHaveProperty('gemini-3.8-flash');
     expect(kimiProvider?.inputImageMimeTypes)
-      .toEqual(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+      .toEqual(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/heic', 'image/heif']);
     expect(museProvider?.inputImageMimeTypes)
       .toEqual(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
     expect(museProvider?.capabilities.pdfs).toBe(true);

@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { promises as fs, type Stats } from 'node:fs';
+import { createReadStream, promises as fs, type Stats } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import type { Readable } from 'node:stream';
@@ -9,6 +9,7 @@ import { globIterate, Ignore, type IgnoreLike } from 'glob';
 
 import { EXTENSION_TO_MIME, FILE_CONSTRAINTS, maxFileSizeForMime } from '@open-ocr/engine/constants';
 import { CliExitError, type OcrErrorCode } from './errors';
+import { GLOB_SYNTAX } from './fileBoundary';
 import type { ResolvedCliOptions, ResolvedInput } from './types';
 
 const SUPPORTED_EXTENSIONS: ReadonlySet<string> = new Set(Object.keys(EXTENSION_TO_MIME));
@@ -35,14 +36,101 @@ const DEFAULT_EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set([
   'target',
 ]);
 
+type DiscoveryPath = Parameters<NonNullable<IgnoreLike['ignored']>>[0];
+
+/**
+ * The `--exclude` patterns of one discovery, each tracked for whether it matched
+ * anything so an exclude that silently excluded nothing (and therefore let
+ * every file it was meant to drop be processed and billed) can be reported.
+ *
+ * Each pattern is matched two ways: relative to the walk root (a scanned
+ * folder, or the working directory for a glob), which is how directory scans
+ * have always read it, and relative to the working directory, which is how a
+ * glob input reads it. The same `--exclude 'docs/drafts/**'` therefore works
+ * whether the input was `docs` or a `docs/**` glob.
+ */
+export class ExcludeMatcher {
+  private readonly patterns: Array<{ pattern: string; root: Ignore; fromCwd?: Ignore; matched: boolean }>;
+  private readonly ambient: ReadonlySet<string>;
+  private walked = false;
+
+  /**
+   * @param ambientPatterns patterns that came from configuration files rather
+   *   than the command line or request; they are applied but never reported
+   *   by {@link unmatched}.
+   */
+  constructor(patterns: readonly string[], private readonly cwd: string, ambientPatterns: readonly string[] = []) {
+    this.ambient = new Set(ambientPatterns);
+    // The working-directory reading matches the pattern against each entry's
+    // path relative to the working directory, never against an absolute
+    // pattern built from it: glob re-parses an Ignore pattern's literal
+    // segments, so even an escaped cwd such as /work/scans{a,b} brace-expanded
+    // into paths that never exist and the exclude silently matched nothing
+    // (billing every file it was meant to drop).
+    this.patterns = patterns.map((pattern) => {
+      const posixPattern = pattern.replaceAll('\\', '/');
+      const fromCwd = !path.isAbsolute(pattern) && !posixPattern.startsWith('**')
+        ? new Ignore([posixPattern.replace(/^\.\//u, '')], {})
+        : undefined;
+      return { pattern, root: new Ignore([pattern], {}), ...(fromCwd ? { fromCwd } : {}), matched: false };
+    });
+  }
+
+  /** The entry as seen from the working directory, for the cwd-relative reading. */
+  private fromCwdView(entry: DiscoveryPath): DiscoveryPath {
+    const fullpath = entry.fullpath();
+    const relative = path.relative(this.cwd, fullpath).split(path.sep).join('/');
+    // Ignore reads only these two accessors.
+    return { relative: () => relative, fullpath: () => fullpath } as unknown as DiscoveryPath;
+  }
+
+  private test(entry: DiscoveryPath, check: (ignore: Ignore, candidate: DiscoveryPath) => boolean): boolean {
+    let ignored = false;
+    let view: DiscoveryPath | undefined;
+    for (const candidate of this.patterns) {
+      const hit = check(candidate.root, entry)
+        || (candidate.fromCwd !== undefined && check(candidate.fromCwd, view ??= this.fromCwdView(entry)));
+      if (hit) {
+        candidate.matched = true;
+        ignored = true;
+      }
+    }
+    return ignored;
+  }
+
+  ignored(entry: DiscoveryPath): boolean {
+    return this.test(entry, (ignore, candidate) => ignore.ignored(candidate));
+  }
+
+  childrenIgnored(entry: DiscoveryPath): boolean {
+    return this.test(entry, (ignore, candidate) => ignore.childrenIgnored(candidate));
+  }
+
+  /** Record that a directory scan or glob walk consulted these patterns. */
+  markWalked(): void {
+    this.walked = true;
+  }
+
+  /**
+   * Command-line/request patterns that excluded nothing. Empty unless a walk
+   * ran: a run naming only files never consults excludes, so reporting them
+   * there would warn on every run.
+   */
+  unmatched(): string[] {
+    if (!this.walked) return [];
+    return [...new Set(this.patterns
+      .filter((candidate) => !candidate.matched && !this.ambient.has(candidate.pattern))
+      .map((candidate) => candidate.pattern))];
+  }
+}
+
 // Prune excluded children while retaining the directory entry for skip reports.
 // Explicitly naming an excluded directory still scans that directory itself.
-function discoveryIgnore(options: ResolvedCliOptions, applyDefaults: boolean): IgnoreLike {
-  const patterns = new Ignore(options.excludes, {});
+function discoveryIgnore(excludes: ExcludeMatcher, applyDefaults: boolean): IgnoreLike {
   return {
-    ignored: (entry) => entry.isSymbolicLink() || patterns.ignored(entry),
+    ignored: (entry) => entry.isSymbolicLink() || excludes.ignored(entry),
     childrenIgnored: (entry) => entry.isSymbolicLink()
-      || patterns.childrenIgnored(entry)
+      || excludes.childrenIgnored(entry)
       || (applyDefaults && entry.relative() !== '' && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)),
   };
 }
@@ -100,6 +188,17 @@ export interface InputDiscoverySkips {
     count: number;
     names: string[];
   };
+  /**
+   * Inputs that resolve to the same file as another input (a symlink and its
+   * target, or two links to one file). Only the first path, by name, is kept,
+   * so one document is never extracted and billed twice.
+   */
+  duplicates?: {
+    count: number;
+    names: string[];
+  };
+  /** `--exclude` patterns that matched no scanned path. */
+  unmatchedExcludes?: string[];
 }
 
 export interface InputDiscovery {
@@ -185,7 +284,7 @@ async function detectLocalMimeType(absolutePath: string): Promise<string> {
 }
 
 function isGlobPattern(value: string): boolean {
-  return /[*?{}[\]()!]/.test(value);
+  return GLOB_SYNTAX.test(value);
 }
 
 /**
@@ -231,16 +330,18 @@ function appendDiscoveredFile(files: string[], absolutePath: string, maxFiles: n
 async function scanDirectory(
   absolute: string,
   options: ResolvedCliOptions,
+  excludes: ExcludeMatcher,
   signal?: AbortSignal,
 ): Promise<ExpandedInput> {
   const applyDefaults = options.defaultExcludes;
+  excludes.markWalked();
   const entries = globIterate('**/*', {
     cwd: absolute,
     withFileTypes: true,
     dot: options.hidden,
     follow: false,
     signal,
-    ignore: discoveryIgnore(options, applyDefaults),
+    ignore: discoveryIgnore(excludes, applyDefaults),
   });
   const files: string[] = [];
   const unsupportedSample: string[] = [];
@@ -273,6 +374,7 @@ async function scanDirectory(
 async function expandInput(
   value: string,
   options: ResolvedCliOptions,
+  excludes: ExcludeMatcher,
   signal?: AbortSignal,
 ): Promise<ExpandedInput> {
   signal?.throwIfAborted();
@@ -287,7 +389,7 @@ async function expandInput(
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   if (entry?.isFile()) return { files: [absolute], ...noExpansionSkips() };
-  if (entry?.isDirectory()) return scanDirectory(absolute, options, signal);
+  if (entry?.isDirectory()) return scanDirectory(absolute, options, excludes, signal);
   if (entry) return { files: [], ...noExpansionSkips() };
 
   if (!isGlobPattern(value)) throw inputError(`Input does not exist: ${value}`, 'INPUT_NOT_FOUND');
@@ -295,6 +397,7 @@ async function expandInput(
   // the set and fail loudly by MIME detection rather than disappearing here, and
   // the default directory excludes never apply — `dist/**/*.pdf` means `dist`.
   const files: string[] = [];
+  excludes.markWalked();
   for await (const match of globIterate(value, {
     cwd: options.cwd,
     withFileTypes: true,
@@ -302,7 +405,7 @@ async function expandInput(
     dot: options.hidden,
     follow: false,
     signal,
-    ignore: discoveryIgnore(options, false),
+    ignore: discoveryIgnore(excludes, false),
   })) {
     signal?.throwIfAborted();
     if (match.isFile()) appendDiscoveredFile(files, match.fullpath(), options.maxFiles);
@@ -390,6 +493,38 @@ export function stdinDisplayPath(stdinName: string): string {
   return stdinName === DEFAULT_STDIN_NAME ? '<stdin>' : stdinName;
 }
 
+/**
+ * Collapse paths that name one file (a symlink and its target, or two links)
+ * onto the first by name. Without this both were extracted and billed. A path
+ * whose real path cannot be resolved is kept as-is; reading it later reports
+ * the real problem.
+ */
+async function dedupeByRealPath(paths: string[]): Promise<{
+  unique: string[];
+  duplicates: Array<{ duplicate: string; kept: string }>;
+}> {
+  const realPaths = await Promise.all(paths.map(async (entry) => {
+    try {
+      return await fs.realpath(entry);
+    } catch {
+      return entry;
+    }
+  }));
+  const keptByRealPath = new Map<string, string>();
+  const unique: string[] = [];
+  const duplicates: Array<{ duplicate: string; kept: string }> = [];
+  paths.forEach((entry, index) => {
+    const kept = keptByRealPath.get(realPaths[index]);
+    if (kept !== undefined) {
+      duplicates.push({ duplicate: entry, kept });
+      return;
+    }
+    keptByRealPath.set(realPaths[index], entry);
+    unique.push(entry);
+  });
+  return { unique, duplicates };
+}
+
 /** Resolve every requested input, reporting what discovery dropped along the way. */
 export async function discoverInputSet(
   rawInputs: string[],
@@ -431,11 +566,14 @@ export async function discoverInputSet(
     };
   }
 
-  const expanded = await Promise.all([...new Set(rawInputs)].map((input) => expandInput(input, options, signal)));
+  const excludes = new ExcludeMatcher(options.excludes, options.cwd, options.configExcludes);
+  const expanded = await Promise.all([...new Set(rawInputs)].map((input) => (
+    expandInput(input, options, excludes, signal)
+  )));
   signal?.throwIfAborted();
   const uniqueAbsolute = (paths: string[]): string[] => [...new Set(paths.map((entry) => path.resolve(entry)))]
     .sort((a, b) => a.localeCompare(b));
-  const unique = uniqueAbsolute(expanded.flatMap((entry) => entry.files));
+  const { unique, duplicates } = await dedupeByRealPath(uniqueAbsolute(expanded.flatMap((entry) => entry.files)));
   // Refuse oversized unions before opening every matched input for MIME sniffing.
   if (unique.length > options.maxFiles) {
     throw inputError(`Matched ${unique.length} files, exceeding --max-files ${options.maxFiles}`);
@@ -454,6 +592,15 @@ export async function discoverInputSet(
       count: expanded.reduce((total, entry) => total + entry.defaultExcludedCount, 0),
       names: mergeNames(expanded.flatMap((entry) => entry.defaultExcludedSample)),
     },
+    ...(duplicates.length > 0 ? {
+      duplicates: {
+        count: duplicates.length,
+        names: duplicates.slice(0, MAX_REPORTED_SKIP_NAMES).map(({ duplicate, kept }) => (
+          `${safeRelativePath(options.cwd, duplicate)} (same file as ${safeRelativePath(options.cwd, kept)})`
+        )),
+      },
+    } : {}),
+    ...(excludes.unmatched().length > 0 ? { unmatchedExcludes: excludes.unmatched() } : {}),
   };
   if (unique.length === 0) {
     // Naming what was passed over turns "nothing matched" from a dead end into
@@ -514,6 +661,13 @@ export function describeDiscoverySkips(skipped: InputDiscoverySkips): string | u
       'director(y/ies) skipped by default excludes',
       ' (use --no-default-excludes to scan them)',
     ),
+    skipped.duplicates
+      ? describeSkipCategory(skipped.duplicates, 'duplicate input(s) skipped because they resolve to an already-listed file')
+      : undefined,
+    skipped.unmatchedExcludes?.length
+      ? `--exclude pattern(s) matched nothing: ${skipped.unmatchedExcludes.join(', ')} `
+        + '(patterns match relative to the working directory or to a scanned folder; explicitly named files are never excluded)'
+      : undefined,
   ].filter((clause): clause is string => clause !== undefined);
   return clauses.length > 0 ? clauses.join('; ') : undefined;
 }
@@ -685,8 +839,46 @@ export async function readAndValidateInput(input: ResolvedInput): Promise<{ byte
   };
 }
 
-export function inputFingerprint(input: ResolvedInput, modeKey: string): string {
+/**
+ * Stream a document's bytes through SHA-256. Resume compares content, not
+ * size and mtime: an edit that preserves both (a copy that restores
+ * timestamps, a same-length rewrite within mtime resolution) must not be
+ * skipped as unchanged.
+ */
+export async function inputContentSha256(input: ResolvedInput): Promise<string> {
+  const hash = createHash('sha256');
+  if (input.stdinBytes) return hash.update(input.stdinBytes).digest('hex');
+  if (!input.absolutePath) return hash.digest('hex');
+  try {
+    for await (const chunk of createReadStream(input.absolutePath)) hash.update(chunk as Buffer);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // An unreadable input still gets a fingerprint, one that can match no
+    // completed entry, so extraction reports the real read failure.
+    if (code === 'ENOENT' || code === 'EACCES' || code === 'EISDIR' || code === 'EPERM') {
+      return `unreadable:${code}`;
+    }
+    throw error;
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * Resume fingerprint of one input under one set of output-affecting options.
+ *
+ * With `contentSha256` (fingerprint v2) the identity is path, size, content
+ * hash, and mode; mtime is deliberately left out so a touched-but-unchanged
+ * file is not re-billed. Without it, this is the legacy v1 fingerprint
+ * (path, size, mtime), kept only so manifests written by earlier releases can
+ * be recognised and upgraded.
+ */
+export function inputFingerprint(input: ResolvedInput, modeKey: string, contentSha256?: string): string {
   const identity = input.absolutePath ?? `<stdin:${input.relativePath}>`;
+  if (contentSha256 !== undefined) {
+    return createHash('sha256')
+      .update(`v2\0${identity}\0${input.size}\0${contentSha256}\0${modeKey}`)
+      .digest('hex');
+  }
   const fingerprint = createHash('sha256')
     .update(`${identity}\0${input.size}\0${input.mtimeMs}\0${modeKey}`);
   if (input.stdinBytes) fingerprint.update('\0stdin-bytes\0').update(input.stdinBytes);

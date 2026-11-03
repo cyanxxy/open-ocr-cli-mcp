@@ -220,12 +220,12 @@ function addExtractOptions(command: Command): Command {
     .addOption(new Option('--progress <level>', 'agent progress detail').choices(['off', 'standard', 'detailed']))
     .option('-c, --concurrency <count>', 'parallel documents (1-16)')
     .option('--retries <count>', 'transient retries per document (0-10)')
-    .option('--timeout <seconds>', 'per-document time limit')
+    .option('--timeout <seconds>', 'per-document time limit, shared by all retry attempts')
     .option('--max-files <count>', 'safety limit for matched documents')
     .option('--max-total-mb <megabytes>', 'safety limit for total input size')
-    .option('--max-cost <usd>', 'block new requests and documents after estimated paid-tier cost reaches this value')
+    .option('--max-cost <usd>', 'block new requests and documents once estimated paid-tier cost reaches this value (cumulative across resumed runs of the output directory)')
     .option('--requests-per-minute <count>', 'maximum provider API request starts per minute (0 disables)')
-    .option('--exclude <glob>', 'exclude pattern; repeatable', collect, [])
+    .option('--exclude <glob>', 'exclude pattern, relative to the working directory or a scanned folder; repeatable', collect, [])
     // Both forms are declared so Commander leaves the value undefined when
     // neither is passed, letting the config file's defaultExcludes decide.
     .option('--default-excludes', 'skip node_modules, dist, build, vendor, and target in directory scans (default)')
@@ -271,7 +271,7 @@ Agent quickstart:
 Examples:
   $ ${commandName}                       # print help; never prompts
   $ ${commandName} extract invoice.pdf
-  $ ${commandName} extract invoice.pdf --provider kimi --model kimi-k3
+  $ ${commandName} extract invoice.pdf --provider kimi --model kimi-k3.1-pro
   $ ${commandName} extract invoice.pdf --provider openrouter --model anthropic/claude-sonnet-5.5
   $ ${commandName} extract invoice.pdf --provider gemini --gateway cloudflare
   $ ${commandName} extract invoice.pdf --schema invoice.schema.json

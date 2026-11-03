@@ -608,7 +608,8 @@ describe('OcrJobService', () => {
   });
 
   it.each([
-    { provider: 'kimi' as const, model: 'kimi-k3' },
+    // Kimi direct accepts HEIC/HEIF (platform.kimi.ai vision guide); Muse does not.
+    { provider: 'muse' as const, model: 'muse-spark-1.3' },
     { provider: 'openrouter' as const, model: 'moonshotai/kimi-k3' },
   ])('rejects HEIC early for $provider image transports', async ({ provider, model }) => {
     const documentPath = path.join(directory, 'document.heic');
@@ -925,7 +926,9 @@ describe('OcrJobService', () => {
   });
 
   it('reserves single-run manifest paths before invoking the provider', async () => {
-    const documentPath = path.join(directory, '.open-ocr-manifest.jpg');
+    // A hidden input name loses its dot (`_.open-ocr-manifest.json`), so the
+    // non-hidden summary is the metadata name an input can still collide with.
+    const documentPath = path.join(directory, 'batch-summary.jpg');
     const outputDirectory = path.join(directory, 'single-output');
     await writeFile(documentPath, JPEG_BYTES);
     const baseOptions = resolveCliOptions({ dryRun: true }, {}, directory);

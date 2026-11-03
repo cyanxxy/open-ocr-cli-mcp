@@ -21,7 +21,7 @@ import { evaluateAgentCompletion } from './agentSchema';
 import type { InteractionStep } from './gemini/interactions';
 import { isFatalGeminiError, isRetryableGeminiError } from './gemini/client';
 import { isGeminiCostLimitError } from './gemini/requestPolicy';
-import { transientRetryDelayMs } from './providers/retry';
+import { providerRetryDelayMs } from './providers/retry';
 import { createAgentDeadline, streamAgentOperation, waitForAbortableAgentDelay } from './agentStepStream';
 
 /**
@@ -274,7 +274,7 @@ export async function* agentLoop(
         if (isRetryableGeminiError(error) && transientRetries < MAX_TRANSIENT_RETRIES) {
           transientRetries++;
           const baseDelay = agentConfig.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
-          const backoff = transientRetryDelayMs(transientRetries - 1, baseDelay);
+          const backoff = providerRetryDelayMs(transientRetries - 1, error, baseDelay);
           yield {
             type: 'thinking',
             source: 'runtime',

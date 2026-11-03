@@ -72,7 +72,7 @@ jobs:
         env:
           EVAL_PROVIDER: kimi
           MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          OPEN_OCR_MODEL: kimi-k3
+          OPEN_OCR_MODEL: kimi-k3.1-pro
 
       - name: Run OpenRouter live canary
         if: ${{ steps.credentials.outputs.openrouter == 'true' }}
