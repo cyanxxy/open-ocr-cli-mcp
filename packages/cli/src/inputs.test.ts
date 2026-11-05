@@ -343,6 +343,42 @@ describe('CLI input discovery', () => {
     await expect(discoverInputSet(['*'], options)).rejects.toThrow('Unsupported document extension: .md');
   });
 
+  it('follows a symlinked glob prefix but never a symlinked scan folder', async () => {
+    await mkdir(path.join(directory, 'source'));
+    await writeFile(path.join(directory, 'source', 'scan.png'), PNG_BYTES);
+    await symlink(path.join(directory, 'source'), path.join(directory, 'linked'), 'dir');
+
+    const viaPattern = await discoverInputs(['linked/*.png'], options);
+    expect(viaPattern.map((input) => input.relativePath)).toEqual([path.join('linked', 'scan.png')]);
+    await expect(discoverInputs(['linked'], options)).rejects.toThrow('No supported documents matched');
+  });
+
+  it('matches literal dot segments in a pattern without --hidden, but not dotfiles via wildcards', async () => {
+    await mkdir(path.join(directory, 'docs', '.cache'), { recursive: true });
+    await writeFile(path.join(directory, 'docs', '.cache', 'a.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'docs', '.b.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'docs', 'c.png'), PNG_BYTES);
+
+    const literal = await discoverInputs(['docs/.cache/*.png'], options);
+    expect(literal.map((input) => input.relativePath)).toEqual([path.join('docs', '.cache', 'a.png')]);
+    const wildcard = await discoverInputs(['docs/**/*.png'], options);
+    expect(wildcard.map((input) => input.relativePath)).toEqual([path.join('docs', 'c.png')]);
+    const hidden = await discoverInputs(['docs/**/*.png'], { ...options, hidden: true });
+    expect(hidden.map((input) => input.relativePath)).toEqual([path.join('docs', '.b.png'), path.join('docs', '.cache', 'a.png'), path.join('docs', 'c.png')]);
+  });
+
+  it('stops a non-recursive pattern at the depth it can reach', async () => {
+    await mkdir(path.join(directory, 'a', 'b', 'c'), { recursive: true });
+    await writeFile(path.join(directory, 'a', 'top.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'a', 'b', 'mid.png'), PNG_BYTES);
+    await writeFile(path.join(directory, 'a', 'b', 'c', 'deep.png'), PNG_BYTES);
+
+    const found = await discoverInputs(['a/*/*.png'], options);
+    expect(found.map((input) => input.relativePath)).toEqual([path.join('a', 'b', 'mid.png')]);
+    const braces = await discoverInputs(['{a/b/c,a}/*.png'], options);
+    expect(braces.map((input) => input.relativePath)).toEqual([path.join('a', 'b', 'c', 'deep.png'), path.join('a', 'top.png')]);
+  });
+
   it('leaves hidden entries pruned so a scan never descends into dot directories', async () => {
     await mkdir(path.join(directory, '.git'));
     await writeFile(path.join(directory, '.git', 'config'), 'plain text');
