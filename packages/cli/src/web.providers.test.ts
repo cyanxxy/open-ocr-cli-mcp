@@ -262,7 +262,7 @@ describe('compatible-provider Web OCR', () => {
     if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
     const body = JSON.parse(init.body) as Record<string, unknown>;
     const serialized = JSON.stringify(body);
-    expect(serialized).toContain('MARKET & SALES');
+    expect(serialized).toContain('Market & Sales');
     expect(serialized).toContain('image_url');
     expect(serialized).toContain('file_data');
     expect(body.plugins).toEqual([{ id: 'file-parser' }]);

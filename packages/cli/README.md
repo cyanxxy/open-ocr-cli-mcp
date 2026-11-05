@@ -5,7 +5,7 @@ JSON protocol and a stdio MCP server. Works with Gemini, Kimi, Meta Muse,
 OpenRouter, or any OpenAI-compatible endpoint.
 
 ```bash
-npm install --global open-ocr-cli   # Node 20.19+, 22.13+, or 24+
+npm install --global open-ocr-cli   # Node 22.13+ or 24+
 export GEMINI_API_KEY=...           # or --provider kimi|muse|openrouter|openai-compatible
 open-ocr-cli extract invoice.pdf
 ```

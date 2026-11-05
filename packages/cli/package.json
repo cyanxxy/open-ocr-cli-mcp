@@ -38,7 +38,7 @@
     "claude-code"
   ],
   "engines": {
-    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
+    "node": "^22.13.0 || >=24.0.0"
   },
   "bin": {
     "open-ocr-cli": "dist/index.js"
@@ -63,7 +63,7 @@
   },
   "devDependencies": {
     "@open-ocr/engine": "4.4.0",
-    "@types/html-to-text": "^9.0.4",
+    "@types/picomatch": "^4.0.3",
     "tsup": "^8.5.1",
     "typescript": "^5.8.3"
   },
@@ -74,11 +74,10 @@
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "commander": "^14.0.3",
-    "glob": "^14.0.3",
-    "html-to-text": "^10.0.1",
+    "htmlparser2": "^12.0.0",
     "ipaddr.js": "^2.4.0",
     "pdfjs-dist": "5.5.207",
-    "sharp": "^0.35.5",
+    "picomatch": "^4.0.7",
     "zod": "^4.6.7"
   },
   "publishConfig": {

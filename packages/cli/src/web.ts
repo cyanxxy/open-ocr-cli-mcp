@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { convert } from 'html-to-text';
+import { Parser } from 'htmlparser2';
 
 import {
   dedupeRequestedUrls,
@@ -107,24 +107,75 @@ export async function runWebJob(
   });
 }
 
+// Elements whose text is never page content. `title` stands in for `head`:
+// pages often omit </head> and <body>, and skipping `head` would then drop
+// the whole page.
+const SKIPPED_HTML_ELEMENTS: ReadonlySet<string> = new Set([
+  'title', 'script', 'style', 'noscript', 'template', 'svg', 'math', 'iframe', 'object',
+]);
+
+// Elements set apart from their neighbours by a blank line.
+const BLOCK_HTML_ELEMENTS: ReadonlySet<string> = new Set([
+  'address', 'article', 'aside', 'blockquote', 'caption', 'details', 'div', 'dl',
+  'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'header', 'hr', 'main', 'nav', 'ol', 'p', 'pre', 'section', 'summary', 'table',
+  'tbody', 'tfoot', 'thead', 'ul',
+]);
+
+// Elements that each start one new line: list items, table rows, definitions.
+const LINE_HTML_ELEMENTS: ReadonlySet<string> = new Set(['li', 'tr', 'dt', 'dd']);
+
+/**
+ * Turn fetched HTML into plain text for a text-only provider prompt.
+ *
+ * htmlparser2 tokenizes in a single linear pass and decodes every HTML entity;
+ * this only decides which text to keep and where line breaks go. Headings keep
+ * their case and links keep only their text, so the model sees what a reader
+ * of the page would.
+ */
+function htmlToPlainText(html: string): string {
+  const chunks: string[] = [];
+  let skipDepth = 0;
+  let cellsInRow = 0;
+  const parser = new Parser({
+    onopentag(name) {
+      if (SKIPPED_HTML_ELEMENTS.has(name)) {
+        skipDepth += 1;
+        return;
+      }
+      if (skipDepth > 0) return;
+      if (name === 'br') chunks.push('\n');
+      else if (name === 'tr') cellsInRow = 0;
+      else if (name === 'td' || name === 'th') {
+        if (cellsInRow > 0) chunks.push(' | ');
+        cellsInRow += 1;
+      }
+      if (BLOCK_HTML_ELEMENTS.has(name) || LINE_HTML_ELEMENTS.has(name)) chunks.push('\n');
+      if (name === 'li') chunks.push('- ');
+    },
+    ontext(text) {
+      if (skipDepth === 0) chunks.push(text);
+    },
+    onclosetag(name) {
+      if (SKIPPED_HTML_ELEMENTS.has(name)) {
+        if (skipDepth > 0) skipDepth -= 1;
+        return;
+      }
+      if (skipDepth === 0 && BLOCK_HTML_ELEMENTS.has(name)) chunks.push('\n');
+    },
+  }, { decodeEntities: true });
+  parser.end(html);
+  return chunks.join('');
+}
+
 export function readableWebText(bytes: Uint8Array, contentType: string): string {
   const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   if (!contentType.includes('html') && !contentType.includes('xml')) return decoded;
-  return convert(decoded, {
-    wordwrap: false,
-    preserveNewlines: true,
-    selectors: [
-      { selector: 'script', format: 'skip' },
-      { selector: 'style', format: 'skip' },
-      { selector: 'noscript', format: 'skip' },
-      { selector: 'svg', format: 'skip' },
-      { selector: 'img', format: 'skip' },
-      { selector: 'a', options: { ignoreHref: true } },
-    ],
-  })
+  return htmlToPlainText(decoded)
     .replace(/\u00a0/g, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n\s*\n\s*\n+/g, '\n\n')
+    .replace(/[ \t\f\r]+/g, ' ')
+    .replace(/ ?\n ?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 

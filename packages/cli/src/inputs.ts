@@ -1,11 +1,11 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { createReadStream, promises as fs, type Stats } from 'node:fs';
+import { createReadStream, type Dirent, promises as fs, type Stats } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import type { Readable } from 'node:stream';
 
-import { globIterate, Ignore, type IgnoreLike } from 'glob';
+import picomatch from 'picomatch';
 
 import { EXTENSION_TO_MIME, FILE_CONSTRAINTS, maxFileSizeForMime } from '@open-ocr/engine/constants';
 import { CliExitError, type OcrErrorCode } from './errors';
@@ -36,7 +36,69 @@ const DEFAULT_EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set([
   'target',
 ]);
 
-type DiscoveryPath = Parameters<NonNullable<IgnoreLike['ignored']>>[0];
+/** A filesystem entry met during discovery. */
+interface DiscoveryEntry {
+  /** Absolute path. */
+  readonly fullpath: string;
+  /** Path from the walk root, '/'-separated; empty for the root itself. */
+  readonly relative: string;
+}
+
+interface WalkEntry extends DiscoveryEntry {
+  readonly name: string;
+  readonly dirent: Dirent;
+}
+
+/** Discovery's view of an exclude: prune a directory's children, or drop one match. */
+interface DiscoveryIgnore {
+  ignored(entry: WalkEntry): boolean;
+  childrenIgnored(entry: DiscoveryEntry & { readonly name: string; readonly dirent?: Dirent }): boolean;
+}
+
+// Pattern inputs match case-insensitively where the filesystem usually is.
+const CASE_INSENSITIVE_FILESYSTEM = process.platform === 'darwin' || process.platform === 'win32';
+
+function toPosixPath(value: string): string {
+  return value.split(path.sep).join('/');
+}
+
+function stripLeadingDotSlash(pattern: string): string {
+  let stripped = pattern;
+  while (stripped.startsWith('./')) stripped = stripped.slice(2);
+  return stripped;
+}
+
+/**
+ * One `--exclude` pattern. Patterns always match dotfiles, are case-sensitive,
+ * and are tested both as written and with a trailing `/`, so `drafts/` names a
+ * directory. A pattern ending in `/**` also prunes the walk below whatever
+ * directory it matches. Absolute patterns are tested against absolute paths.
+ */
+class ExcludePattern {
+  private readonly matches: (candidate: string) => boolean;
+  private readonly absolute: boolean;
+  private readonly children: boolean;
+
+  constructor(pattern: string) {
+    const normalized = stripLeadingDotSlash(pattern);
+    this.matches = picomatch(normalized, { dot: true });
+    this.absolute = path.isAbsolute(normalized);
+    this.children = normalized === '**' || normalized.endsWith('/**');
+  }
+
+  private candidate(entry: DiscoveryEntry): string {
+    return this.absolute ? toPosixPath(entry.fullpath) : (entry.relative || '.');
+  }
+
+  ignored(entry: DiscoveryEntry): boolean {
+    const candidate = this.candidate(entry);
+    return this.matches(candidate) || this.matches(`${candidate}/`);
+  }
+
+  childrenIgnored(entry: DiscoveryEntry): boolean {
+    return this.children && this.matches(`${this.candidate(entry)}/`);
+  }
+}
 
 /**
  * The `--exclude` patterns of one discovery, each tracked for whether it matched
@@ -50,7 +112,7 @@ type DiscoveryPath = Parameters<NonNullable<IgnoreLike['ignored']>>[0];
  * whether the input was `docs` or a `docs/**` glob.
  */
 export class ExcludeMatcher {
-  private readonly patterns: Array<{ pattern: string; root: Ignore; fromCwd?: Ignore; matched: boolean }>;
+  private readonly patterns: Array<{ pattern: string; root: ExcludePattern; fromCwd?: ExcludePattern; matched: boolean }>;
   private readonly ambient: ReadonlySet<string>;
   private walked = false;
 
@@ -63,30 +125,27 @@ export class ExcludeMatcher {
     this.ambient = new Set(ambientPatterns);
     // The working-directory reading matches the pattern against each entry's
     // path relative to the working directory, never against an absolute
-    // pattern built from it: glob re-parses an Ignore pattern's literal
-    // segments, so even an escaped cwd such as /work/scans{a,b} brace-expanded
-    // into paths that never exist and the exclude silently matched nothing
-    // (billing every file it was meant to drop).
+    // pattern built from it: glob syntax in the cwd itself, such as
+    // /work/scans{a,b}, would otherwise brace-expand into paths that never
+    // exist and the exclude would silently match nothing (billing every file
+    // it was meant to drop).
     this.patterns = patterns.map((pattern) => {
       const posixPattern = pattern.replaceAll('\\', '/');
       const fromCwd = !path.isAbsolute(pattern) && !posixPattern.startsWith('**')
-        ? new Ignore([posixPattern.replace(/^\.\//u, '')], {})
+        ? new ExcludePattern(posixPattern)
         : undefined;
-      return { pattern, root: new Ignore([pattern], {}), ...(fromCwd ? { fromCwd } : {}), matched: false };
+      return { pattern, root: new ExcludePattern(pattern), ...(fromCwd ? { fromCwd } : {}), matched: false };
     });
   }
 
   /** The entry as seen from the working directory, for the cwd-relative reading. */
-  private fromCwdView(entry: DiscoveryPath): DiscoveryPath {
-    const fullpath = entry.fullpath();
-    const relative = path.relative(this.cwd, fullpath).split(path.sep).join('/');
-    // Ignore reads only these two accessors.
-    return { relative: () => relative, fullpath: () => fullpath } as unknown as DiscoveryPath;
+  private fromCwdView(entry: DiscoveryEntry): DiscoveryEntry {
+    return { fullpath: entry.fullpath, relative: toPosixPath(path.relative(this.cwd, entry.fullpath)) };
   }
 
-  private test(entry: DiscoveryPath, check: (ignore: Ignore, candidate: DiscoveryPath) => boolean): boolean {
+  private test(entry: DiscoveryEntry, check: (pattern: ExcludePattern, candidate: DiscoveryEntry) => boolean): boolean {
     let ignored = false;
-    let view: DiscoveryPath | undefined;
+    let view: DiscoveryEntry | undefined;
     for (const candidate of this.patterns) {
       const hit = check(candidate.root, entry)
         || (candidate.fromCwd !== undefined && check(candidate.fromCwd, view ??= this.fromCwdView(entry)));
@@ -98,12 +157,12 @@ export class ExcludeMatcher {
     return ignored;
   }
 
-  ignored(entry: DiscoveryPath): boolean {
-    return this.test(entry, (ignore, candidate) => ignore.ignored(candidate));
+  ignored(entry: DiscoveryEntry): boolean {
+    return this.test(entry, (pattern, candidate) => pattern.ignored(candidate));
   }
 
-  childrenIgnored(entry: DiscoveryPath): boolean {
-    return this.test(entry, (ignore, candidate) => ignore.childrenIgnored(candidate));
+  childrenIgnored(entry: DiscoveryEntry): boolean {
+    return this.test(entry, (pattern, candidate) => pattern.childrenIgnored(candidate));
   }
 
   /** Record that a directory scan or glob walk consulted these patterns. */
@@ -126,13 +185,67 @@ export class ExcludeMatcher {
 
 // Prune excluded children while retaining the directory entry for skip reports.
 // Explicitly naming an excluded directory still scans that directory itself.
-function discoveryIgnore(excludes: ExcludeMatcher, applyDefaults: boolean): IgnoreLike {
+function discoveryIgnore(excludes: ExcludeMatcher, applyDefaults: boolean): DiscoveryIgnore {
   return {
-    ignored: (entry) => entry.isSymbolicLink() || excludes.ignored(entry),
-    childrenIgnored: (entry) => entry.isSymbolicLink()
+    ignored: (entry) => entry.dirent.isSymbolicLink() || excludes.ignored(entry),
+    childrenIgnored: (entry) => entry.dirent?.isSymbolicLink() === true
       || excludes.childrenIgnored(entry)
-      || (applyDefaults && entry.relative() !== '' && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)),
+      || (applyDefaults && entry.relative !== '' && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)),
   };
+}
+
+interface WalkOptions {
+  /** Descend into and report entries whose name starts with a dot. */
+  dot: boolean;
+  /** Deepest entry level reported; direct children of the root are level 1. */
+  maxDepth: number;
+  /** Paths in reported entries are relative to this directory. */
+  relativeTo: string;
+  /** Enter the root even when it is a symbolic link to a directory. */
+  followRootLink: boolean;
+  ignore: DiscoveryIgnore;
+  signal?: AbortSignal | undefined;
+}
+
+/**
+ * Walk a directory tree without following symbolic links.
+ *
+ * Every entry is offered to `ignore.childrenIgnored` before the walk enters it
+ * (the root included), so excluded trees are pruned rather than filtered.
+ * Unreadable directories are skipped, as a shell glob would. Streaming entries
+ * keeps memory flat while a scan passes over a large dependency tree.
+ */
+async function* walkTree(root: string, options: WalkOptions): AsyncGenerator<WalkEntry> {
+  const relativeOf = (fullpath: string): string => toPosixPath(path.relative(options.relativeTo, fullpath));
+  // A scanned folder that is itself a symbolic link is not entered. The
+  // literal prefix of a glob pattern (`linked/*.pdf`) is a path the caller
+  // spelled out, so it resolves like any other path.
+  const rootStat = await (options.followRootLink ? fs.stat(root) : fs.lstat(root)).catch(() => undefined);
+  if (!rootStat?.isDirectory()) return;
+  const rootEntry = { fullpath: root, relative: relativeOf(root), name: path.basename(root) };
+  if (options.ignore.childrenIgnored(rootEntry)) return;
+  const pending: Array<{ fullpath: string; depth: number }> = [{ fullpath: root, depth: 0 }];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    let handle;
+    try {
+      handle = await fs.opendir(directory.fullpath);
+    } catch {
+      continue;
+    }
+    for await (const dirent of handle) {
+      options.signal?.throwIfAborted();
+      if (!options.dot && dirent.name.startsWith('.')) continue;
+      const fullpath = path.join(directory.fullpath, dirent.name);
+      const entry: WalkEntry = { fullpath, relative: relativeOf(fullpath), name: dirent.name, dirent };
+      yield entry;
+      if (
+        dirent.isDirectory()
+        && directory.depth + 1 < options.maxDepth
+        && !options.ignore.childrenIgnored(entry)
+      ) pending.push({ fullpath, depth: directory.depth + 1 });
+    }
+  }
 }
 
 /**
@@ -335,13 +448,14 @@ async function scanDirectory(
 ): Promise<ExpandedInput> {
   const applyDefaults = options.defaultExcludes;
   excludes.markWalked();
-  const entries = globIterate('**/*', {
-    cwd: absolute,
-    withFileTypes: true,
+  const ignore = discoveryIgnore(excludes, applyDefaults);
+  const entries = walkTree(absolute, {
     dot: options.hidden,
-    follow: false,
+    maxDepth: Number.POSITIVE_INFINITY,
+    relativeTo: absolute,
+    followRootLink: false,
+    ignore,
     signal,
-    ignore: discoveryIgnore(excludes, applyDefaults),
   });
   const files: string[] = [];
   const unsupportedSample: string[] = [];
@@ -350,15 +464,17 @@ async function scanDirectory(
   let defaultExcludedCount = 0;
   for await (const entry of entries) {
     signal?.throwIfAborted();
-    const absolutePath = entry.fullpath();
-    if (entry.isDirectory()) {
+    if (ignore.ignored(entry)) continue;
+    const absolutePath = entry.fullpath;
+    const { dirent } = entry;
+    if (dirent.isDirectory()) {
       if (applyDefaults && DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name)) {
         defaultExcludedCount += 1;
         sampleSkippedPath(defaultExcludedSample, absolutePath);
       }
       continue;
     }
-    if (!entry.isFile()) continue;
+    if (!dirent.isFile()) continue;
     if (applyDefaults && hasDefaultExcludedAncestor(absolute, absolutePath)) continue;
     if (SUPPORTED_EXTENSIONS.has(path.extname(absolutePath).toLowerCase())) {
       appendDiscoveredFile(files, absolutePath, options.maxFiles);
@@ -369,6 +485,43 @@ async function scanDirectory(
     }
   }
   return { files, unsupportedCount, unsupportedSample, defaultExcludedCount, defaultExcludedSample };
+}
+
+/**
+ * Files matching a glob pattern, relative to the working directory or absolute.
+ *
+ * The walk starts at the pattern's literal prefix (`docs` for `docs/**\/*.pdf`)
+ * and stops at the deepest level the pattern can reach unless it contains
+ * `**`. Wildcards match dotfiles only with `--hidden`; a literal dot segment
+ * in the pattern always matches. Symbolic links are never followed or matched.
+ */
+async function* expandGlobPattern(
+  value: string,
+  options: ResolvedCliOptions,
+  excludes: ExcludeMatcher,
+  signal?: AbortSignal,
+): AsyncGenerator<string> {
+  const pattern = stripLeadingDotSlash(value);
+  const absolute = path.isAbsolute(pattern);
+  const matches = picomatch(pattern, { dot: options.hidden, nocase: CASE_INSENSITIVE_FILESYSTEM });
+  const { base, glob } = picomatch.scan(pattern);
+  const walkRoot = path.resolve(options.cwd, base || '.');
+  // A slash count bounds the depth of every brace or extglob alternative.
+  const maxDepth = glob.includes('**') ? Number.POSITIVE_INFINITY : glob.split('/').length;
+  const literalDotSegment = /(?:^|\/)\.[^/]/u.test(glob);
+  const ignore = discoveryIgnore(excludes, false);
+  for await (const entry of walkTree(walkRoot, {
+    dot: options.hidden || literalDotSegment,
+    maxDepth,
+    relativeTo: options.cwd,
+    followRootLink: true,
+    ignore,
+    signal,
+  })) {
+    const candidate = absolute ? toPosixPath(entry.fullpath) : entry.relative;
+    if (!matches(candidate) || ignore.ignored(entry)) continue;
+    if (entry.dirent.isFile()) yield entry.fullpath;
+  }
 }
 
 async function expandInput(
@@ -398,17 +551,9 @@ async function expandInput(
   // the default directory excludes never apply — `dist/**/*.pdf` means `dist`.
   const files: string[] = [];
   excludes.markWalked();
-  for await (const match of globIterate(value, {
-    cwd: options.cwd,
-    withFileTypes: true,
-    nodir: true,
-    dot: options.hidden,
-    follow: false,
-    signal,
-    ignore: discoveryIgnore(excludes, false),
-  })) {
+  for await (const match of expandGlobPattern(value, options, excludes, signal)) {
     signal?.throwIfAborted();
-    if (match.isFile()) appendDiscoveredFile(files, match.fullpath(), options.maxFiles);
+    appendDiscoveredFile(files, match, options.maxFiles);
   }
   // A missing file named like `Scan (2).pdf` or `inv[1].pdf` arrives here as a
   // "pattern". Matching nothing must fail like any other missing input; an

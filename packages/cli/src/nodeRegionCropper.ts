@@ -1,11 +1,14 @@
 import { Buffer } from 'node:buffer';
 
-import { createCanvas, DOMMatrix, ImageData, Path2D } from '@napi-rs/canvas';
-import sharp from 'sharp';
+import { type Canvas, createCanvas, DOMMatrix, Image, ImageData, Path2D } from '@napi-rs/canvas';
 
 import type { NormalizedRegion, RegionCropResult, RegionCropper } from '@open-ocr/engine/agentTypes';
 
 const PDF_RENDER_SCALE = 2;
+// Decompression-bomb guard: a small compressed file can declare enormous
+// dimensions. Matches the 0x3FFF * 0x3FFF pixel ceiling sharp/libvips used
+// before cropping moved onto @napi-rs/canvas.
+const MAX_INPUT_PIXELS = 0x3fff * 0x3fff;
 const CANVAS_GLOBAL_NAMES = ['DOMMatrix', 'ImageData', 'Path2D'] as const;
 type CanvasGlobalName = (typeof CANVAS_GLOBAL_NAMES)[number];
 const canvasGlobalValues: Readonly<Record<CanvasGlobalName, unknown>> = { DOMMatrix, ImageData, Path2D };
@@ -25,21 +28,35 @@ function pixelBox(region: NormalizedRegion, width: number, height: number) {
   return { left, top, width: right - left, height: bottom - top };
 }
 
-async function cropRaster(bytes: Buffer, region: NormalizedRegion): Promise<RegionCropResult> {
-  const image = sharp(bytes, { failOn: 'error' });
-  const metadata = await image.metadata();
-  if (!metadata.width || !metadata.height) throw new Error('Unable to determine document image dimensions');
-  const box = pixelBox(region, metadata.width, metadata.height);
-  const output = await image.extract(box).png().toBuffer();
+function assertPixelBudget(width: number, height: number): void {
+  if (width * height > MAX_INPUT_PIXELS) {
+    throw new RangeError(`Document image is ${width}x${height} pixels, which exceeds the ${MAX_INPUT_PIXELS} pixel limit`);
+  }
+}
+
+function cropSource(source: Image | Canvas, width: number, height: number, region: NormalizedRegion): RegionCropResult {
+  const box = pixelBox(region, width, height);
+  const output = createCanvas(box.width, box.height);
+  output.getContext('2d').drawImage(source, box.left, box.top, box.width, box.height, 0, 0, box.width, box.height);
   return {
-    dataUrl: `data:image/png;base64,${output.toString('base64')}`,
+    dataUrl: `data:image/png;base64,${output.toBuffer('image/png').toString('base64')}`,
     mimeType: 'image/png',
     width: box.width,
     height: box.height,
   };
 }
 
-async function renderPdfPage(bytes: Buffer, region: NormalizedRegion): Promise<Buffer> {
+function cropRaster(bytes: Buffer, region: NormalizedRegion): RegionCropResult {
+  // Assigning src only parses the header; pixels are decoded on drawImage, so
+  // the pixel budget is enforced before any large allocation happens.
+  const image = new Image();
+  image.src = bytes;
+  if (!image.width || !image.height) throw new Error('Unable to determine document image dimensions');
+  assertPixelBudget(image.width, image.height);
+  return cropSource(image, image.width, image.height, region);
+}
+
+async function cropPdfPage(bytes: Buffer, region: NormalizedRegion): Promise<RegionCropResult> {
   let releaseQueue: () => void = () => undefined;
   const previousRender = pdfRenderQueue;
   const currentRender = new Promise<void>((resolve) => {
@@ -75,7 +92,10 @@ async function renderPdfPage(bytes: Buffer, region: NormalizedRegion): Promise<B
       }
       const page = await pdf.getPage(region.page);
       const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
-      const canvas = createCanvas(Math.max(1, Math.ceil(viewport.width)), Math.max(1, Math.ceil(viewport.height)));
+      const width = Math.max(1, Math.ceil(viewport.width));
+      const height = Math.max(1, Math.ceil(viewport.height));
+      assertPixelBudget(width, height);
+      const canvas = createCanvas(width, height);
       const context = canvas.getContext('2d');
       // pdf.js declares these slots as HTMLCanvasElement/CanvasRenderingContext2D.
       // Those names are unresolvable under the CLI's DOM-free lib set, so the
@@ -87,7 +107,7 @@ async function renderPdfPage(bytes: Buffer, region: NormalizedRegion): Promise<B
         viewport,
       }).promise;
       page.cleanup();
-      return canvas.toBuffer('image/png');
+      return cropSource(canvas, width, height, region);
     } finally {
       await loadingTask.destroy();
     }
@@ -104,7 +124,7 @@ async function renderPdfPage(bytes: Buffer, region: NormalizedRegion): Promise<B
 export const nodeRegionCropper: RegionCropper = async (fileData, mimeType, region) => {
   const bytes = base64Bytes(fileData);
   if (mimeType === 'application/pdf') {
-    return cropRaster(await renderPdfPage(bytes, region), region);
+    return cropPdfPage(bytes, region);
   }
   if (mimeType.startsWith('image/')) {
     if (region.page !== 1) throw new RangeError(`Image documents only contain page 1, requested page ${region.page}`);

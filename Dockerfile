@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS build
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 # Every workspace manifest must be present for `npm ci` to reconcile the
@@ -9,7 +9,7 @@ RUN npm ci --workspace=open-ocr-cli --include-workspace-root=false
 COPY . .
 RUN npm run cli:build
 
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS runtime
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/cyanxxy/open-ocr-cli-mcp"
 LABEL org.opencontainers.image.description="Agent-first OCR CLI and MCP server"
 ENV NODE_ENV=production

@@ -82,13 +82,37 @@ describe('CLI Web OCR', () => {
     ].join('');
     const text = readableWebText(new TextEncoder().encode(html), 'text/html');
 
-    expect(text).toContain('INVOICE 42');
+    // Headings keep their case: the text is model input, not a terminal render.
+    expect(text).toContain('Invoice 42');
     expect(text).toContain('Seller: ACME & Co');
     expect(text).toContain('Total: €10 + tax');
     expect(text).toContain('First item');
     expect(text).not.toContain('doNotInclude');
   });
 
+
+  it('keeps page text when </head> and <body> are omitted', () => {
+    const html = '<html><head><title>Tab title</title><meta charset="utf-8"><p>Body text</p>';
+    expect(readableWebText(new TextEncoder().encode(html), 'text/html')).toBe('Body text');
+  });
+
+  it('puts list items and table rows on their own lines and drops non-content elements', () => {
+    const html = [
+      '<ol><li>One<li>Two</ol>',
+      '<table><tr><th>Item</th><th>Qty</th></tr><tr><td>Pen</td><td>2</td></tr></table>',
+      '<p>a<svg><text>icon</text></svg>b<style>p{}</style><noscript>enable js</noscript></p>',
+      '<p>x<script>if (a < b) { leak() }</script>y</p>',
+    ].join('');
+    expect(readableWebText(new TextEncoder().encode(html), 'text/html'))
+      .toBe('- One\n- Two\n\nItem | Qty\nPen | 2\n\nab\n\nxy');
+  });
+
+  it('converts adversarial markup in linear time', () => {
+    const html = '<a '.repeat(200_000) + '<div ' + '"'.repeat(1_000);
+    const started = performance.now();
+    readableWebText(new TextEncoder().encode(html), 'text/html');
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
 
   it('preflights an existing destination before Web OCR can spend API tokens', async () => {
     const target = path.join(directory, 'result.md');
