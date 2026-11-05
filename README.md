@@ -166,7 +166,7 @@ takes images only. Cloudflare AI Gateway routing is supported with
 
 ## Installation
 
-Requires Node.js 20.19+, 22.13+, or 24+.
+Requires Node.js 22.13+ or 24+ (26 LTS recommended).
 
 **npm**
 

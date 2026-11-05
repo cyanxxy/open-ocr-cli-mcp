@@ -83,9 +83,7 @@ export function cliVersion(): string {
 
 function isSupportedNode(version: string): boolean {
   const [major = 0, minor = 0] = version.split('.').map(Number);
-  return (major === 20 && minor >= 19)
-    || (major === 22 && minor >= 13)
-    || major >= 24;
+  return (major === 22 && minor >= 13) || major >= 24;
 }
 
 function collect(value: string, previous: string[]): string[] {
@@ -821,7 +819,7 @@ then CLI flags. Later sources win.
       };
       if (flags.json) process.stdout.write(`${JSON.stringify(checks, null, 2)}\n`);
       else {
-        process.stdout.write(`Node.js ${checks.node.version}: ${checks.node.ok ? 'ok' : 'use Node 20.19+, 22.13+, or 24+'}\n`);
+        process.stdout.write(`Node.js ${checks.node.version}: ${checks.node.ok ? 'ok' : 'use Node 22.13+ or 24+'}\n`);
         process.stdout.write(`Configuration: ${checks.configuration.ok ? 'ok' : checks.configuration.error}\n`);
         if (checks.configuration.hint) process.stdout.write(`  hint: ${checks.configuration.hint}\n`);
         process.stdout.write(`${apiKeyEnv}: ${checks.apiKey.ok ? 'configured' : 'missing'}\n`);

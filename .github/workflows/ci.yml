@@ -29,9 +29,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both advertised minimums plus the current LTS line. The
-        # expensive static/coverage gates only need to run once on Node 24.
-        node-version: [20.19.0, 22.13.0, 24.x]
+        # Exercise the advertised minimum, the maintenance LTS line, and the
+        # active LTS line. The expensive static/coverage gates run once, on 26.
+        node-version: [22.13.0, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
@@ -63,32 +63,32 @@ jobs:
           node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
 
       - name: Type check
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.node-version == '26.x' }}
         run: npm run typecheck
 
       - name: Lint code
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.node-version == '26.x' }}
         run: npm run lint
 
       - name: Run tests with coverage
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.node-version == '26.x' }}
         run: npm run test:coverage
 
       - name: Run tests
-        if: ${{ matrix.node-version != '24.x' }}
+        if: ${{ matrix.node-version != '26.x' }}
         run: npm test
 
       - name: Validate AI eval fixtures
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.node-version == '26.x' }}
         run: npm run evals:validate && npm run evals:matrix:check
 
       - name: Check for vulnerabilities
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.node-version == '26.x' }}
         run: npx audit-ci --config audit-ci.json
 
       - name: Upload coverage to Codecov
         # Only publish coverage from a single matrix leg to avoid duplicate uploads.
-        if: ${{ matrix.node-version == '24.x' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
+        if: ${{ matrix.node-version == '26.x' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -114,7 +114,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24.x'
+          node-version: '26.x'
           cache: 'npm'
 
       - name: Install dependencies
@@ -131,10 +131,10 @@ jobs:
       - name: Setup minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20.19.0'
+          node-version: '22.13.0'
           package-manager-cache: false
 
-      - name: Smoke-test engine-strict CLI installation on Node 20
+      - name: Smoke-test engine-strict CLI installation on Node 22.13
         run: npm run cli:install-smoke
 
   # Release workflows publish a multi-architecture image. CI performs the

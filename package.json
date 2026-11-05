@@ -37,7 +37,7 @@
     "claude-code"
   ],
   "engines": {
-    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
+    "node": "^22.13.0 || >=24.0.0"
   },
   "packageManager": "npm@11.14.1",
   "workspaces": [
@@ -74,7 +74,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@modelcontextprotocol/client": "2.4.0",
-    "@types/node": "^20.19.43",
+    "@types/node": "^22.20.5",
     "@vitest/coverage-v8": "^4.1.12",
     "audit-ci": "^7.1.0",
     "eslint": "^10.8.1",
