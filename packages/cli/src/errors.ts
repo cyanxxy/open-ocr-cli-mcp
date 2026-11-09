@@ -452,6 +452,16 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       if (status === 403) {
         return { code: 'PERMISSION_DENIED', category: 'authorization', retryable: false, hint: 'Verify that the credential and project are allowed to use this model or operation.' };
       }
+      if (status === 504 && String(recordValue(current, 'code') ?? '').toLowerCase() === 'gateway_timeout') {
+        // Meta Muse: the request ran past the server-side limit and "will
+        // usually time out again", so an agent must change it, not retry it.
+        return {
+          code: 'TIMEOUT',
+          category: 'limit',
+          retryable: false,
+          hint: 'The provider timed out this request server-side; split the document or use a smaller page range instead of retrying.',
+        };
+      }
       if (status === 408 || status === 504) {
         return { code: 'TIMEOUT', category: 'limit', retryable: true, hint: 'Retry with a longer timeout or a smaller document.' };
       }

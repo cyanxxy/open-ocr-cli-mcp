@@ -162,6 +162,14 @@ describe('CLI exit errors', () => {
       category: 'authorization',
       retryable: false,
     });
+    expect(ocrErrorPayload(new ProviderApiError('Request timed out', 504, 'gateway_timeout'), 1)).toMatchObject({
+      code: 'TIMEOUT',
+      retryable: false,
+    });
+    expect(ocrErrorPayload(new ProviderApiError('Gateway Timeout', 504), 1)).toMatchObject({
+      code: 'TIMEOUT',
+      retryable: true,
+    });
     expect(ocrErrorPayload(new ProviderApiError('Conflict', 409), 1)).toMatchObject({
       code: 'PROVIDER_FAILURE',
       category: 'provider',

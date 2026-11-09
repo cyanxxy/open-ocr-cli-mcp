@@ -96,6 +96,9 @@ describe('quota exhaustion', () => {
     expect(isQuotaExhaustedError(new Error('wrapped', { cause: credits }))).toBe(true);
     // A plain throttle stays retryable.
     expect(isRetryableProviderError(new ProviderApiError('slow down', 429, 'rate_limit_exceeded'))).toBe(true);
+    // Muse: a non-streaming request past the server time limit times out again.
+    expect(isRetryableProviderError(new ProviderApiError('took too long', 504, 'gateway_timeout'))).toBe(false);
+    expect(isRetryableProviderError(new ProviderApiError('bad gateway', 504))).toBe(true);
   });
 
   it('treats a Gemini per-day or zero-limit quota as exhausted, per-minute as transient', () => {

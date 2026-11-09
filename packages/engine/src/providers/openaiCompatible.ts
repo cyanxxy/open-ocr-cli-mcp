@@ -321,6 +321,11 @@ export function isRetryableProviderError(error: unknown): boolean {
     const code = error.code?.toUpperCase();
     if (isTransientBudgetProviderError(error)) return true;
     if (isQuotaExhaustedProviderError(error)) return false;
+    // Meta Muse answers a non-streaming request that ran past its server-side
+    // limit with 504 `gateway_timeout` and documents "Do not simply retry —
+    // the same request will usually time out again" (dev.meta.ai/docs/
+    // error-handling). Re-sending a large PDF only bills the same timeout again.
+    if (code === 'GATEWAY_TIMEOUT') return false;
     return error.status === 408
       || error.status === 409
       || error.status === 429
