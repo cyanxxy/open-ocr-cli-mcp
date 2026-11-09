@@ -97,6 +97,48 @@ describe('agentTools', () => {
     expect(unnamed.error).toMatch(/^Invalid field entry fields\[0\]: Expected non-empty string for "field_name"/);
   });
 
+  it('accepts common printed date formats so required date fields can complete', async () => {
+    const formats = [
+      '2026-01-12', '2026/1/12', '2026.01.12', '1/12/2026', '12.01.2026', '12/01/26',
+      'Jan 12, 2026', '12 January 2026', '12-Jan-2026', 'Sept. 3rd, 2026', '2026-01-12T14:22:09Z',
+      '01/12/2026 2:05 pm',
+    ];
+    for (const value of formats) {
+      const result = await executeExtractFieldsBatch({
+        fields: [{ field_name: 'issue_date', field_value: value, confidence: 0.9 }],
+      }, '', '', createMemory('form'));
+      const update = result.memoryUpdate?.fieldReviews?.issue_date;
+      expect({ value, isValid: update?.isValid }).toEqual({ value, isValid: true });
+    }
+    for (const value of ['2026-02-30', '13/13/2026', 'Smarch 12, 2026', '14:22', '1/12/2026 25:00']) {
+      const result = await executeExtractFieldsBatch({
+        fields: [{ field_name: 'issue_date', field_value: value, confidence: 0.9 }],
+      }, '', '', createMemory('form'));
+      expect({ value, isValid: result.memoryUpdate?.fieldReviews?.issue_date?.isValid })
+        .toEqual({ value, isValid: false });
+    }
+  });
+
+  it('infers validation rules from whole words in the field name, not substrings', async () => {
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'candidate_id', field_value: 'C-1042', confidence: 0.9 },
+        { field_name: 'mandate_ref', field_value: 'MR/77', confidence: 0.9 },
+        { field_name: 'tax_id', field_value: '12-3456789', confidence: 0.9 },
+        { field_name: 'vat_number', field_value: 'DE123456789', confidence: 0.9 },
+        { field_name: 'tax_amount', field_value: 'not a number', confidence: 0.9 },
+        { field_name: 'Ship Date', field_value: 'someday', confidence: 0.9 },
+      ],
+    }, '', '', createMemory('form'));
+    const fields = result.memoryUpdate?.fieldReviews ?? {};
+    expect(fields.candidate_id?.isValid).toBe(true);
+    expect(fields.mandate_ref?.isValid).toBe(true);
+    expect(fields.tax_id?.isValid).toBe(true);
+    expect(fields.vat_number?.isValid).toBe(true);
+    expect(fields.tax_amount?.isValid).toBe(false);
+    expect(Object.entries(fields).find(([name]) => name.includes('ship'))?.[1].isValid).toBe(false);
+  });
+
   it('normalizes extracted alias field names to canonical schema names in a batch', async () => {
     const result = await executeExtractFieldsBatch(
       {

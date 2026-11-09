@@ -111,7 +111,6 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
       merchant: 'merchant_name',
       date: 'transaction_date',
       receipt_date: 'transaction_date',
-      transaction_time: 'transaction_date',
       total: 'total_amount',
       grand_total: 'total_amount',
       subtotal: 'subtotal_amount',

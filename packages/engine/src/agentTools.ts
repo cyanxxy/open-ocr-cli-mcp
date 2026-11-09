@@ -598,28 +598,98 @@ function parseNumeric(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** Parse supported numeric dates without depending on host locale or Date.parse. */
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+  may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11,
+  dec: 12, december: 12,
+};
+
+// Optional time of day: "14:22", "2:05 pm", "T14:22:09Z", "14:22+01:00".
+const TIME_SUFFIX = String.raw`(?:(?:[ T]|,\s*)(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*([ap]\.?m\.?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?`;
+const YEAR_FIRST = new RegExp(String.raw`^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})${TIME_SUFFIX}$`, 'i');
+const NUMERIC = new RegExp(String.raw`^(\d{1,2})([-/.])(\d{1,2})\2(\d{4}|\d{2})${TIME_SUFFIX}$`, 'i');
+const DAY_MONTH_NAME = new RegExp(String.raw`^(\d{1,2})(?:st|nd|rd|th)?[ .-]+([a-z]{3,9})\.?,?[ .-]+(\d{4})${TIME_SUFFIX}$`, 'i');
+const MONTH_NAME_DAY = new RegExp(String.raw`^([a-z]{3,9})\.?[ .-]+(\d{1,2})(?:st|nd|rd|th)?,?[ .-]+(\d{4})${TIME_SUFFIX}$`, 'i');
+
+function expandYear(text: string): number {
+  if (text.length === 4) return Number(text);
+  // Two-digit years pivot at 70, matching common spreadsheet behaviour.
+  const short = Number(text);
+  return short < 70 ? 2000 + short : 1900 + short;
+}
+
+function utcInstant(
+  year: number,
+  month: number,
+  day: number,
+  time: { hour: number; minute: number; seconds: number },
+): number | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(time.hour, time.minute, time.seconds, 0);
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    ? date.getTime()
+    : null;
+}
+
+function parseTime(hourText?: string, minuteText?: string, secondsText?: string, meridiem?: string):
+  { hour: number; minute: number; seconds: number } | null {
+  let hour = Number(hourText ?? 0);
+  const minute = Number(minuteText ?? 0);
+  const seconds = Number(secondsText ?? 0);
+  if (minute > 59 || seconds > 59) return null;
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    const pm = meridiem.toLowerCase().startsWith('p');
+    hour = (hour % 12) + (pm ? 12 : 0);
+  } else if (hour > 23) {
+    return null;
+  }
+  return { hour, minute, seconds };
+}
+
+/**
+ * Parse common printed dates without depending on host locale or Date.parse.
+ *
+ * Accepts ISO and year-first dates (2026-01-12, 2026/1/12, 2026.01.12),
+ * day/month numeric dates in either order with `/`, `-`, or `.` and a two- or
+ * four-digit year (1/12/2026, 12.01.2026, 12/01/26), and English month names
+ * (Jan 12, 2026; 12 January 2026; 12-Jan-2026), each with an optional time.
+ * Ambiguous numeric dates return every valid reading; callers never guess.
+ */
 function dateCandidates(value: string): number[] {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
-  const numeric = /^(\d{2})([/-])(\d{2})\2(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
-  if (!iso && !numeric) return [];
-  const year = Number(iso?.[1] ?? numeric?.[4]);
-  const first = Number(iso?.[2] ?? numeric?.[1]);
-  const second = Number(iso?.[3] ?? numeric?.[3]);
-  const hour = Number(iso?.[4] ?? numeric?.[5] ?? 0);
-  const minute = Number(iso?.[5] ?? numeric?.[6] ?? 0);
-  const seconds = Number(iso?.[6] ?? numeric?.[7] ?? 0);
-  if (hour > 23 || minute > 59 || seconds > 59) return [];
-  const pairs = iso ? [[first, second]] : [[first, second], [second, first]];
+  const text = value.trim().replace(/\s+/g, ' ');
   const candidates: number[] = [];
-  for (const [month, day] of pairs) {
-    if (month < 1 || month > 12 || day < 1 || day > 31) continue;
-    const date = new Date(0);
-    date.setUTCFullYear(year, month - 1, day);
-    date.setUTCHours(hour, minute, seconds, 0);
-    if (date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day) {
-      candidates.push(date.getTime());
-    }
+  const push = (year: number, month: number, day: number, timeGroups: Array<string | undefined>): void => {
+    const time = parseTime(...(timeGroups as [string?, string?, string?, string?]));
+    if (!time) return;
+    const instant = utcInstant(year, month, day, time);
+    if (instant !== null) candidates.push(instant);
+  };
+
+  const yearFirst = YEAR_FIRST.exec(text);
+  if (yearFirst) {
+    push(Number(yearFirst[1]), Number(yearFirst[3]), Number(yearFirst[4]), yearFirst.slice(5, 9));
+  }
+  const numeric = NUMERIC.exec(text);
+  if (numeric) {
+    const year = expandYear(numeric[4]);
+    const first = Number(numeric[1]);
+    const second = Number(numeric[3]);
+    push(year, first, second, numeric.slice(5, 9));
+    push(year, second, first, numeric.slice(5, 9));
+  }
+  const dayMonth = DAY_MONTH_NAME.exec(text);
+  const dayMonthNumber = dayMonth ? MONTH_NAMES[dayMonth[2].toLowerCase()] : undefined;
+  if (dayMonth && dayMonthNumber) {
+    push(Number(dayMonth[3]), dayMonthNumber, Number(dayMonth[1]), dayMonth.slice(4, 8));
+  }
+  const monthDay = MONTH_NAME_DAY.exec(text);
+  const monthDayNumber = monthDay ? MONTH_NAMES[monthDay[1].toLowerCase()] : undefined;
+  if (monthDay && monthDayNumber) {
+    push(Number(monthDay[3]), monthDayNumber, Number(monthDay[2]), monthDay.slice(4, 8));
   }
   return [...new Set(candidates)];
 }
@@ -671,21 +741,30 @@ function validateFieldValue(value: string, rule: string): { isValid: boolean; me
   }
 }
 
-function inferValidationRule(fieldName: string): string | undefined {
-  const lowerFieldName = fieldName.toLowerCase();
+/**
+ * Split a field name into lowercase words: `invoiceDate`, `invoice_date`, and
+ * `Invoice Date` all yield ["invoice", "date"]. Rules match whole words, so
+ * `candidate_name` is not a date and `tax_id` is not an amount.
+ */
+function fieldNameWords(fieldName: string): string[] {
+  return fieldName
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
 
-  if (lowerFieldName.includes('email')) return 'email';
-  if (lowerFieldName.includes('phone')) return 'phone';
-  if (lowerFieldName.includes('date')) return 'date';
-  if (
-    lowerFieldName.includes('amount')
-    || lowerFieldName === 'total'
-    || lowerFieldName === 'subtotal'
-    || lowerFieldName.includes('tax')
-  ) {
+const NON_AMOUNT_WORDS = new Set(['id', 'number', 'no', 'code', 'rate', 'percent', 'percentage', 'registration', 'reg', 'type', 'name']);
+
+function inferValidationRule(fieldName: string): string | undefined {
+  const words = fieldNameWords(fieldName);
+  if (words.includes('email')) return 'email';
+  if (words.includes('phone') || words.includes('mobile')) return 'phone';
+  if (words.includes('date')) return 'date';
+  if (words.includes('amount') || words.includes('total') || words.includes('subtotal')) return 'currency';
+  if ((words.includes('tax') || words.includes('vat')) && !words.some((word) => NON_AMOUNT_WORDS.has(word))) {
     return 'currency';
   }
-
   return undefined;
 }
 
@@ -736,18 +815,8 @@ function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFie
  * Validate field format
  */
 function validateFieldFormat(value: string, fieldName: string): { isValid: boolean; message: string } {
-  // Basic format validation based on field name patterns
-  if (fieldName.toLowerCase().includes('email')) {
-    return validateFieldValue(value, 'email');
-  } else if (fieldName.toLowerCase().includes('phone')) {
-    return validateFieldValue(value, 'phone');
-  } else if (fieldName.toLowerCase().includes('date')) {
-    return validateFieldValue(value, 'date');
-  } else if (fieldName.toLowerCase().includes('amount') || fieldName.toLowerCase().includes('total')) {
-    return validateFieldValue(value, 'currency');
-  }
-  
-  return { isValid: true, message: 'Format validation passed' };
+  const rule = inferValidationRule(fieldName);
+  return rule ? validateFieldValue(value, rule) : { isValid: true, message: 'Format validation passed' };
 }
 
 /**
@@ -791,18 +860,21 @@ function validateFieldConsistency(value: string, fieldName: string, memory: Read
  */
 function validateFieldCrossReference(value: string, fieldName: string, memory: Readonly<AgentMemory>): { isValid: boolean; message: string } {
   const existingFields = memory.extractedFields;
-  const lowerFieldName = fieldName.toLowerCase();
+  const words = fieldNameWords(fieldName);
 
   // Date Cross-References
-  if (lowerFieldName.includes('date')) {
+  if (words.includes('date')) {
     const currentDates = dateCandidates(value);
     if (currentDates.length === 0) {
       return { isValid: false, message: 'Invalid date or time' };
     }
 
     // Check Due Date vs Invoice Date
-    if (lowerFieldName.includes('due')) {
-      const invoiceDateField = Object.entries(existingFields).find(([key]) => key.toLowerCase().includes('invoice') && key.toLowerCase().includes('date'));
+    if (words.includes('due')) {
+      const invoiceDateField = Object.entries(existingFields).find(([key]) => {
+        const keyWords = fieldNameWords(key);
+        return keyWords.includes('invoice') && keyWords.includes('date');
+      });
       if (invoiceDateField) {
         const invoiceDates = dateCandidates(invoiceDateField[1].value);
         // Ambiguous numeric dates are not guessed: reject only when no
