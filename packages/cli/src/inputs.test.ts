@@ -1,4 +1,5 @@
 import { copyFile, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -76,6 +77,15 @@ describe('CLI input discovery', () => {
     controller.abort(new Error('Discovery cancelled'));
     await expect(discoverInputs(['.'], options, controller.signal)).rejects.toThrow('Discovery cancelled');
     await expect(discoverInputs(['**/*.png'], options, controller.signal)).rejects.toThrow('Discovery cancelled');
+  });
+
+  it.skipIf(process.platform === 'win32')('names a FIFO input instead of silently dropping it', async () => {
+    const fifo = path.join(directory, 'pipe.pdf');
+    execFileSync('mkfifo', [fifo]);
+    await writeFile(path.join(directory, 'scan.png'), PNG_BYTES);
+    const thrown = await discoverInputs(['scan.png', 'pipe.pdf'], options).catch((error: unknown) => error);
+    expect(thrown).toMatchObject({ code: 'INPUT_INVALID', category: 'input' });
+    expect((thrown as Error).message).toBe('Input is not a regular file or directory: pipe.pdf');
   });
 
   it('matches brace and extglob patterns without following symbolic links', async () => {

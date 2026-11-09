@@ -390,7 +390,15 @@ async function expandInput(
   }
   if (entry?.isFile()) return { files: [absolute], ...noExpansionSkips() };
   if (entry?.isDirectory()) return scanDirectory(absolute, options, excludes, signal);
-  if (entry) return { files: [], ...noExpansionSkips() };
+  // A FIFO, socket, or device (`<(curl ...)`, `/dev/stdin`) used to expand to
+  // nothing, silently dropping the input from the run. Name it instead.
+  if (entry) {
+    throw inputError(
+      `Input is not a regular file or directory: ${value}`,
+      'INPUT_INVALID',
+      'Save the document to a file first, or pass `-` as the only input to read it from stdin.',
+    );
+  }
 
   if (!isGlobPattern(value)) throw inputError(`Input does not exist: ${value}`, 'INPUT_NOT_FOUND');
   // An explicit pattern is the caller's own filter: unsupported matches stay in
