@@ -391,7 +391,8 @@ async function webArguments(
     configuredChoice(config.format, ['markdown', 'json'] as const, 'markdown'),
   );
   const args = ['web', ...urls, ...providerArgs, '--analysis', analysis, '--format', format];
-  const output = (await prompter.ask('Output file (blank for stdout)', config.output ?? '')).trim();
+  // config.output is the extract output directory, not a web output file.
+  const output = (await prompter.ask('Output file (blank for stdout)', '')).trim();
   if (output) args.push('--output', output);
   const maxCost = await optionalMaxCost(prompter, writeOutput, config.maxCostUsd);
   if (maxCost) args.push('--max-cost', maxCost);

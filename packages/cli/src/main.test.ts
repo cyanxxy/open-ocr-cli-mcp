@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -668,6 +668,30 @@ describe('CLI command exit contracts', () => {
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toBe('Gemini request failed');
     expect(cliExitCode(thrown)).toBe(1);
+  });
+
+  it('does not treat a config output directory as the Web output file', async () => {
+    const outputDirectory = path.join(directory, 'ocr-out');
+    await mkdir(outputDirectory);
+    vi.mocked(loadCliConfig).mockResolvedValueOnce({ output: outputDirectory });
+    mocks.runWebJob.mockResolvedValueOnce({
+      summary: {
+        results: [{ status: 'succeeded', artifacts: { markdown: '# ok\n' } }],
+        usage: { totalTokens: 0, requests: 0, estimatedCostUsd: 0 },
+        succeeded: 1, partial: 0, failed: 0, skipped: 0, costLimitReached: false,
+      },
+    });
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      await createProgram().parseAsync([
+        'node', 'open-ocr-cli', 'web', 'https://example.com/report', '--dry-run', '--quiet',
+      ]);
+    } finally {
+      stdout.mockRestore();
+    }
+
+    expect(mocks.runWebJob).toHaveBeenCalledTimes(1);
+    expect(mocks.runWebJob.mock.calls[0]?.[2]).toMatchObject({ output: undefined });
   });
 
   it('rejects an existing Web output before starting a Gemini request', async () => {

@@ -30,7 +30,7 @@ async function listen(handler: http.RequestListener): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-afterEach(async () => {
+afterEach(() => {
   if (server) {
     server.closeAllConnections();
     server.close();

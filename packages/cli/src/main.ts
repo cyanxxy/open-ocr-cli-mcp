@@ -610,6 +610,11 @@ then CLI flags. Later sources win.
           mode: 'simple',
           preset: undefined,
           schema: undefined,
+          // A config `output` is the `extract` output *directory*. `web`
+          // writes a single file or stdout, so honouring it here sent web
+          // results to a file named after that directory (or failed with
+          // "Output already exists" once it existed). Only --output applies.
+          output: undefined,
           // `web` supports only markdown and JSON, so a `format` meant for
           // `extract` (`csv`, `all`) must not leak in from the config file and
           // fail the run. Commander already restricts the flag itself, so an
