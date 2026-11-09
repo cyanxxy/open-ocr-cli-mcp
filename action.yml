@@ -62,7 +62,28 @@ inputs:
 runs:
   using: composite
   steps:
+    # setup-node changes PATH for every later step of the calling job, so only
+    # install Node when the runner has none that satisfies the CLI's engines.
+    - name: Check runner Node.js
+      id: node
+      shell: bash
+      run: |
+        compatible=false
+        if command -v node >/dev/null 2>&1 && command -v npx >/dev/null 2>&1 \
+          && node -e '
+            var v = process.versions.node.split(".").map(Number);
+            var ok = (v[0] === 20 && v[1] >= 19) || (v[0] === 22 && v[1] >= 13) || v[0] >= 24;
+            process.exit(ok ? 0 : 1);
+          '; then
+          compatible=true
+          echo "Using the runner's Node.js $(node --version)."
+        else
+          echo "No Node.js matching ^20.19.0 || ^22.13.0 || >=24.0.0 on PATH; installing Node.js 22.x."
+        fi
+        echo "compatible=$compatible" >> "$GITHUB_OUTPUT"
+
     - name: Set up Node.js
+      if: ${{ steps.node.outputs.compatible != 'true' }}
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22.x'

@@ -226,6 +226,28 @@ jobs:
           platforms: linux/amd64,linux/arm64
           provenance: false
 
+      # A multi-platform result cannot be loaded into the runner's image store,
+      # so load the amd64 variant (cached by the build above) and run it.
+      - name: Load native container for a run smoke
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: linux/amd64
+          provenance: false
+          tags: open-ocr-cli:release-candidate
+
+      - name: Run CLI inside the container
+        shell: bash
+        run: |
+          expected_version="${GITHUB_REF_NAME#v}"
+          actual_version=$(docker run --rm --network none open-ocr-cli:release-candidate --version)
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "Container reported version '$actual_version', expected '$expected_version'" >&2
+            exit 1
+          fi
+
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

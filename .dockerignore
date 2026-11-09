@@ -1,6 +1,8 @@
+# Unlike .gitignore, these patterns are anchored at the build-context root;
+# use **/ for anything that can appear inside a workspace package.
 .git
 .github
-node_modules
+**/node_modules
 **/dist
 coverage
 tmp
@@ -9,6 +11,6 @@ tmp
 evals/cache
 evals/reports/runs
 *.tgz
-.env*
+**/.env*
 .open-ocr-results
 open-ocr-output

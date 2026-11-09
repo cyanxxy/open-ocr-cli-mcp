@@ -29,9 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both advertised minimums plus the current LTS line. The
-        # expensive static/coverage gates only need to run once on Node 24.
-        node-version: [20.19.0, 22.13.0, 24.x]
+        # Exercise the advertised 20.x and 22.x minimums, the 24.x line used
+        # for release builds, and Node 26 (the current LTS line). Node 20 is
+        # end-of-life but stays until the next major drops it from `engines`.
+        # The expensive static/coverage gates only need to run once on Node 24.
+        node-version: [20.19.0, 22.13.0, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
@@ -57,9 +59,9 @@ jobs:
       - name: Check release notes for the current version
         run: |
           VERSION=$(node -p "require('./packages/cli/package.json').version")
-          # The script prefers GITHUB_REF_NAME (a tag in release runs); on a PR
-          # that is "<n>/merge", so point it at the version being released.
-          GITHUB_REF_NAME="v$VERSION" node scripts/assert-release-version.mjs
+          # An explicit tag argument takes precedence over GITHUB_REF_NAME,
+          # which on a PR is "<n>/merge" rather than a release tag.
+          node scripts/assert-release-version.mjs "v$VERSION"
           node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
 
       - name: Type check
@@ -127,7 +129,17 @@ jobs:
         run: npm run action:smoke
 
       # Keep Build Application's required check name stable while validating
-      # both the current build runtime and the oldest supported consumer.
+      # the current build runtime, the current LTS line, and the oldest
+      # supported consumer.
+      - name: Setup current LTS Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.x'
+          package-manager-cache: false
+
+      - name: Smoke-test engine-strict CLI installation on Node 26
+        run: npm run cli:install-smoke
+
       - name: Setup minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -157,3 +169,22 @@ jobs:
 
       - name: Verify non-root work directory is writable
         run: docker run --rm --entrypoint sh open-ocr-cli:ci -c 'test -w /work'
+
+      # Run the real entrypoint: these commands need no credentials or network.
+      - name: Run CLI inside the container
+        shell: bash
+        run: |
+          expected_version=$(node -p "require('./packages/cli/package.json').version")
+          actual_version=$(docker run --rm --network none open-ocr-cli:ci --version)
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "Container reported version '$actual_version', expected '$expected_version'" >&2
+            exit 1
+          fi
+          docker run --rm --network none open-ocr-cli:ci providers --json | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const providers = JSON.parse(input);
+              if (!Array.isArray(providers) || !providers.some((provider) => provider.id === "openrouter")) process.exit(1);
+            });
+          '

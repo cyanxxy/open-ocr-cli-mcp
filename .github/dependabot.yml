@@ -30,6 +30,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    # Unlike npm, the base image is not covered by Dependabot security
+    # updates, so OS and Node.js security patches for the digest-pinned
+    # node:24-bookworm-slim only arrive through these version-update PRs.
+    open-pull-requests-limit: 2
     labels:
       - dependencies

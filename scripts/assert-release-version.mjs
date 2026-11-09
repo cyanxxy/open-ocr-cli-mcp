@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 
-const tag = process.env.GITHUB_REF_NAME ?? process.argv[2];
+// An explicit argument wins: GITHUB_REF_NAME is set in every Actions run and is
+// a branch or merge ref outside tag-triggered releases.
+const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME;
 if (!tag?.startsWith('v') || tag.length === 1) {
   throw new Error('Release tag must be supplied as v<version>');
 }
