@@ -922,19 +922,24 @@ async function streamedChatCompletion(
     ...(reasoningDetails.length ? { reasoning_details: reasoningDetails } : {}),
     ...(annotations.length ? { annotations } : {}),
   };
-  if (!text && completedToolCalls.length === 0) {
-    if (refusal.trim()) throw refusalError(refusal.trim());
-    throw new ProviderApiError('Provider returned an empty response');
-  }
   const raw = {
     ...lastChunk,
     choices: [{ message: rawMessage, finish_reason: finishReason ?? null }],
     ...(usage !== undefined ? { usage } : {}),
   };
+  // Record (or flag as unreported) usage before any outcome check: an empty
+  // or truncated stream was still billed, and skipping this left the
+  // `--max-cost` "usage unknown" gate open.
   if (usage === undefined) recordProviderUsage(raw, config, config.runtime);
+  // Same order as the non-streamed path: `finish_reason: length` with no text
+  // (reasoning used the whole budget) is truncation, not an empty response.
   assertFinishReason(finishReason);
   if (finishReason === 'tool_calls' && completedToolCalls.length === 0) {
     throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
+  }
+  if (!text && completedToolCalls.length === 0) {
+    if (refusal.trim()) throw refusalError(refusal.trim());
+    throw new ProviderApiError('Provider returned an empty response');
   }
   return { text, message: parseAssistantMessage(rawMessage), finishReason, raw };
 }

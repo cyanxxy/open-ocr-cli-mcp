@@ -373,6 +373,29 @@ describe('runModelInteraction', () => {
     });
   });
 
+  it('flags a completed stream that reported no usage as unreported, not free', async () => {
+    async function* events(): AsyncGenerator<Record<string, unknown>> {
+      await Promise.resolve();
+      yield { event_type: 'interaction.created', interaction: { id: 'no-usage', status: 'in_progress' } };
+      yield { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } };
+      yield { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'Done' } };
+      yield { event_type: 'step.stop', index: 0 };
+      yield { event_type: 'interaction.completed', interaction: { id: 'no-usage', status: 'completed' } };
+    }
+    mockInteractionCreate.mockResolvedValueOnce(events());
+    const runtime = createProviderExecutionContext();
+
+    await runModelInteraction({
+      apiKey: 'test-key',
+      model: 'gemini-3.8-flash',
+      input: 'Extract text',
+      runtime,
+      onProgress: () => undefined,
+    });
+
+    expect(runtime.getUsage()).toMatchObject({ unreportedUsageRequests: 1 });
+  });
+
   it('keeps a delta channel ID stable when a gateway emits deltas before interaction.created', async () => {
     async function* events(): AsyncGenerator<Record<string, unknown>> {
       await Promise.resolve();

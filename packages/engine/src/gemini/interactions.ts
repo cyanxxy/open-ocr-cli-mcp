@@ -706,6 +706,11 @@ export async function runModelInteraction({
       model,
       runtime,
     );
+  } else {
+    // A stream that reported no usage at all was still a paid request. Record
+    // it as unreported, as the unary path does, so the `--max-cost`
+    // "usage unknown" gate closes instead of treating the request as free.
+    recordGeminiInteractionUsage({}, model, runtime);
   }
   if (!receivedCompletion) {
     throw new Error('Gemini interaction stream ended without a terminal interaction.completed event');

@@ -410,6 +410,24 @@ describe('OpenAI-compatible transport', () => {
     expect(getProviderUsage()).toMatchObject({ requests: 1, totalTokens: 5 });
   });
 
+  it('reports a textless length stop as truncation and flags its missing usage', async () => {
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'thinking' }, finish_reason: 'length' }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(sse, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }))));
+
+    await expect(createChatCompletion(config(), {
+      messages: [{ role: 'user', content: 'Extract' }],
+      maxTokens: 10,
+      onDelta: () => undefined,
+    })).rejects.toThrow('output token limit');
+    expect(getProviderUsage()).toMatchObject({ requests: 1, unreportedUsageRequests: 1 });
+  });
+
   it('parses multiline Kimi SSE data blocks', async () => {
     const sse = [
       'data: {"choices":[{"delta":{"content":"multi"},',
