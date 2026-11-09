@@ -31,7 +31,8 @@ describe('Gemini usage accumulator', () => {
       toolTokens: 4,
       cachedTokens: 0,
       totalTokens: 189,
-      estimatedCostUsd: 0.0001325,
+      // The 4 tool-use tokens are billed as input on top of the 150 prompt tokens.
+      estimatedCostUsd: 0.0001337,
     });
   });
 
@@ -57,21 +58,24 @@ describe('Gemini usage accumulator', () => {
     });
   });
 
-  it('records tool-use tokens without double-counting their input cost', () => {
+  it('bills tool-use tokens as input on top of the prompt tokens', () => {
+    // Gemini reports tool results separately from the prompt; total_tokens is
+    // their sum, and the retrieved content is billed as input.
     recordGeminiUsage({
       usage: {
         total_input_tokens: 100,
         total_output_tokens: 25,
         total_tool_use_tokens: 50,
-        total_tokens: 125,
+        total_tokens: 175,
       },
     }, 'gemini-3.5-flash-lite');
     expect(getGeminiUsage()).toMatchObject({
       inputTokens: 100,
       outputTokens: 25,
       toolTokens: 50,
-      totalTokens: 125,
-      estimatedCostUsd: 0.0000925,
+      totalTokens: 175,
+      estimatedCostUsd: 0.0001075,
     });
   });
+
 });

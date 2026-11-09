@@ -100,6 +100,7 @@ function usageMeasurement(response: unknown): UsageMeasurement | undefined {
   const toolTokens = numberAt(
     candidate,
     'toolUsePromptTokenCount', 'tool_use_prompt_token_count', 'totalToolUseTokens', 'total_tool_use_tokens',
+    'tool_use_input_tokens',
   );
   const cachedTokens = numberAt(
     candidate,
@@ -117,7 +118,7 @@ function usageMeasurement(response: unknown): UsageMeasurement | undefined {
     toolTokens,
     cachedTokens,
     totalTokens: reportedTotal
-      || inputTokens + outputTokens + (usesOpenAITokenAccounting ? 0 : thoughtTokens),
+      || inputTokens + toolTokens + outputTokens + (usesOpenAITokenAccounting ? 0 : thoughtTokens),
     exactCost: optionalNumberAt(candidate, 'cost', 'estimated_cost', 'estimated_cost_usd'),
     usesOpenAITokenAccounting,
   };
@@ -367,7 +368,13 @@ export class ProviderExecutionContext {
     const localEstimate = effectivePricing
       ? estimateProviderRequestCostUsd(
         effectivePricing,
-        measurement.inputTokens,
+        // Gemini reports tool results (URL Context, search) separately from
+        // the prompt: totalTokenCount is "the sum of prompt_token_count,
+        // candidates_token_count, tool_use_prompt_token_count, and
+        // thoughts_token_count", and that content "is counted as part of the
+        // input tokens" for billing. Leaving it out under-counted web OCR by
+        // the whole retrieved page and let --max-cost fail open.
+        measurement.inputTokens + measurement.toolTokens,
         measurement.outputTokens,
         measurement.usesOpenAITokenAccounting ? 0 : measurement.thoughtTokens,
         measurement.cachedTokens,
