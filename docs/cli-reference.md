@@ -78,6 +78,8 @@ never caps preset extraction.
 Environment overrides: `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`, `OPEN_OCR_MODEL`,
 `OPEN_OCR_THINKING`. `OPEN_OCR_MODEL` and `OPEN_OCR_THINKING` belong to the
 ambient provider and are dropped when `--provider` selects a different one.
+`OPEN_OCR_DEBUG=1` adds a stack trace to fatal errors on stderr; it changes no
+results or exit codes.
 Configure credentials with `apiKeyEnv`, the environment variable name. Raw key
 fields and other unknown config keys are warned about and ignored.
 

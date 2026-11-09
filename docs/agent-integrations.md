@@ -53,6 +53,14 @@ failing to connect, use the [CLI protocol](#portable-cli-integration) or the
 [portable skill](#portable-skill) instead. Use `/mcp` to verify connection and
 discovery.
 
+Set `MCP_PROTOCOL_NEGOTIATION=auto` in Claude Code's environment (for example
+`MCP_PROTOCOL_NEGOTIATION=auto claude`, or the `env` block of its
+`settings.json`). When it is unset, Claude Code can skip probing a stdio server
+for 7 days after a failed probe, so a server that failed once, for example
+before upgrading Claude Code or this CLI, stays on the earlier handshake and
+fails to connect until that window ends. On a Claude Code release where v2 is
+not yet the default for your session type, also set `MCP_SDK_GENERATION=v2`.
+
 Two client limits bound a tool call:
 
 - The per-server `timeout` (milliseconds) is a hard wall-clock limit per call;

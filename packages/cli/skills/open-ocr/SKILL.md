@@ -14,8 +14,11 @@ Verify an installed Pi extension's protocol support before using an MCP bridge.
 For Codex and Claude Agent SDK, verify the installed host supports MCP
 2026-07-28 before registering this server. Generic MCP support is not sufficient.
 Claude Code's v2 runtime is documented for all session types from 2.1.274;
-set `MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto` in the host environment
-for stdio revision probing. Codex keeps a stdio server on the legacy handshake,
+set `MCP_PROTOCOL_NEGOTIATION=auto` in the host environment (plus
+`MCP_SDK_GENERATION=v2` where v2 is not yet the default) so Claude Code probes
+this stdio server for revision 2026-07-28. When it is unset, Claude Code can
+skip that probe for 7 days after a failed one, for example after an upgrade.
+Codex keeps a stdio server on the legacy handshake,
 which this server rejects, unless its under-development `mcp_2026_07_28`
 feature is enabled and the server's `env` sets
 `CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"` (from Codex source, not its

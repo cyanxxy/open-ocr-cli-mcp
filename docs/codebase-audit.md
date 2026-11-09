@@ -1,5 +1,10 @@
 # Codebase and provider audit — 2026-10-03
 
+> **Dated snapshot.** This audit records the codebase and upstream contracts as
+> of 2026-10-03. It is not updated with later releases and may not reflect
+> open-ocr-cli 4.4.0 or newer; check the [CHANGELOG](../CHANGELOG.md) and the
+> current docs before relying on any finding here.
+
 Scope: every implemented provider profile, shared extraction/agent tools, CLI
 input/output/resume behavior, machine schemas, MCP, dependencies, agent setup,
 packaging, evaluation tooling, and public documentation. Three parallel agents

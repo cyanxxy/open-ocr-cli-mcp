@@ -45,6 +45,9 @@ claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
 Start Claude with the provider key in its environment, then check with `/mcp`.
+Also set `MCP_PROTOCOL_NEGOTIATION=auto` in Claude Code's environment: when it
+is unset, Claude Code can skip probing a stdio server for 7 days after a failed
+probe (for example one made before upgrading Claude Code or this CLI).
 Claude Code aborts a stdio tool call that sends no response or progress for 30
 minutes (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`); a single document may run up to
 `timeoutSeconds` (at most 3600), so keep that under 1800 or raise the window.
@@ -126,9 +129,9 @@ stale locks. Output names never start with a dot or match an agent
 instruction file: `.mcp.png` is written as `_.mcp.md`, `CLAUDE.png` as
 `CLAUDE.ocr.md`.
 
-Other commands: `init` (guided config), `doctor` (environment check),
-`status` (inspect a batch), `models`, `providers`, `presets`. Run any command
-with `--help`.
+Other commands: `init` (guided config), `interactive` (guided command menu),
+`doctor` (environment check), `status` (inspect a batch), `models`,
+`providers`, `presets`. Run any command with `--help`.
 
 ### For agents and scripts
 
@@ -140,7 +143,8 @@ open-ocr-cli run --request job.json --response-format jsonl
 
 `run` takes a protocol v2 request and streams lifecycle events that end in
 `run.completed` or `run.failed`. Exit codes: `0` success, `1` failed, partial,
-or cost-limited, `2` invalid command or config. Request examples are in the
+or cost-limited, `2` invalid command or config, `130` interrupted by SIGINT,
+`143` terminated by SIGTERM. Request examples are in the
 [CLI reference](docs/cli-reference.md#machine-requests-and-events).
 
 ## Providers
@@ -166,7 +170,8 @@ takes images only. Cloudflare AI Gateway routing is supported with
 
 ## Installation
 
-Requires Node.js 20.19+, 22.13+, or 24+.
+Requires Node.js 20.19+, 22.13+, or 24+. Node.js 20 is end-of-life; support
+for it will be removed in the next major release.
 
 **npm**
 
@@ -195,7 +200,11 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
     output: ocr-results
 ```
 
-All inputs are listed in [action.yml](action.yml).
+All inputs are listed in [action.yml](action.yml). The action uses the
+runner's `node` when it satisfies `^20.19.0 || ^22.13.0 || >=24.0.0`.
+Otherwise it runs `actions/setup-node` with Node.js 22.x, which, like any
+setup-node step, changes `node` and `PATH` for the rest of the job; add your
+own `actions/setup-node` step before this action to keep a specific version.
 
 **Agent skill.** A portable skill for Claude Code and Codex ships in the npm
 package and in [integrations/open-ocr](integrations/open-ocr/skills/open-ocr).
@@ -210,7 +219,9 @@ variables, which override config files. Keys are referenced by variable name
 and never stored. A project config is treated as untrusted: it cannot redirect
 requests to another endpoint or credential. See
 [configuration](docs/cli-reference.md#configuration) and the
-[example config](.open-ocr-cli.example.json).
+[example config](.open-ocr-cli.example.json). Set `OPEN_OCR_DEBUG=1` to add a
+stack trace to fatal errors on stderr; the full list of environment variables
+is in `open-ocr-cli --help`.
 
 ## Quality
 

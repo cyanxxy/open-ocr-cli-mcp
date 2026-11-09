@@ -10,6 +10,9 @@ export GEMINI_API_KEY=...           # or --provider kimi|muse|openrouter|openai-
 open-ocr-cli extract invoice.pdf
 ```
 
+Node.js 20 is end-of-life; support for it will be removed in the next major
+release.
+
 **Agents:** `open-ocr-cli capabilities --json`, then
 `open-ocr-cli run --request job.json --response-format jsonl`.
 **MCP:** `open-ocr-cli mcp` (protocol 2026-07-28).
