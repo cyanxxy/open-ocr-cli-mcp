@@ -138,6 +138,19 @@ describe('CLI init', () => {
     expect(output.join('')).toContain('4. Enter a custom model ID');
   });
 
+  it('refuses to store token prices in a project config the MCP server would reject', async () => {
+    const thrown = await runInit({ skipValidation: true }, {
+      cwd: directory,
+      env: {},
+      prompter: answers(['2', '4', 'kimi-custom-vision', '3', '2', '0', '5', '1.5', '6']),
+      writeOutput: () => undefined,
+    }).catch((error: unknown) => error);
+
+    expect(thrown).toMatchObject({ code: 'CONFIG_INVALID', category: 'configuration' });
+    expect((thrown as Error).message).toContain('cannot be stored in a project configuration');
+    await expect(readFile(path.join(directory, '.open-ocr-cli.json'), 'utf8')).rejects.toThrow();
+  });
+
   it('uses Kimi K3 reasoning and published pricing defaults during setup', async () => {
     const result = await runInit({
       yes: true,

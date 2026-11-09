@@ -353,6 +353,23 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
     const needsCustomPrice = maxCostUsd !== undefined
       && provider !== 'openrouter'
       && providerTokenPrice({ provider, model }, 0) === undefined;
+    if (needsCustomPrice && projectScoped) {
+      // The MCP server refuses token prices from a project file (an agent that
+      // can edit it could price every request at zero and defeat the
+      // operator's cost ceiling), so writing them here made every later MCP
+      // tool call fail on the config this command produced.
+      throw new CliExitError(
+        `A maximum cost for ${provider}/${model} needs token prices, which cannot be stored in a project configuration`,
+        2,
+        {
+          code: 'CONFIG_INVALID',
+          category: 'configuration',
+          retryable: false,
+          hint: 'Run `open-ocr-cli init --global` to store prices in your user configuration, '
+            + 'leave the maximum cost blank, or pass --max-cost with --input-price and --output-price per run.',
+        },
+      );
+    }
     const inputPricePerMillionUsd = needsCustomPrice
       ? optionalPositiveNumber(
           await ask('Input price per million tokens in USD', ''),
