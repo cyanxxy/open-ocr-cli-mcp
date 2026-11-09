@@ -93,6 +93,24 @@ describe('custom JSON schemas', () => {
       .rejects.toThrow('Invalid JSON in schema');
   });
 
+  it('types every structural schema error as SCHEMA_INVALID, whatever the property names say', async () => {
+    const cases = [
+      { properties: { timeout: 5 } },
+      { properties: { total_cost_limit: 'nope' } },
+      { type: 'object', anyOf: { rate_limit: true } },
+    ];
+    for (const [index, schema] of cases.entries()) {
+      const schemaPath = path.join(directory, `structural-${index}.json`);
+      await writeFile(schemaPath, JSON.stringify(schema));
+      const thrown = await loadCustomSchema(schemaPath, directory).catch((error: unknown) => error);
+      expect(ocrErrorPayload(thrown, 2)).toMatchObject({
+        code: 'SCHEMA_INVALID',
+        category: 'schema',
+        retryable: false,
+      });
+    }
+  });
+
   it('reports where schema JSON is malformed without quoting the file', async () => {
     const schemaPath = path.join(directory, 'passwd');
     await writeFile(schemaPath, 'root:x:0:0:root:/root:/bin/bash\n');

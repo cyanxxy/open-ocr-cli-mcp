@@ -192,6 +192,19 @@ export async function loadCustomSchema(schemaPath: string, cwd: string): Promise
       throw unreadableSchemaError(error, schemaPath) ?? error;
     }
     return validateCustomSchema(parsed);
+  } catch (error) {
+    if (error instanceof CliExitError) throw error;
+    // Structural problems are thrown as plain Errors. Unwrapped, they reached
+    // the substring classifier, so a property named `timeout` came back as a
+    // retryable TIMEOUT and `total_cost_limit` as COST_LIMIT. `run` and MCP
+    // already wrap the same errors as SCHEMA_INVALID.
+    throw new CliExitError(error instanceof Error ? error.message : String(error), 2, {
+      cause: error,
+      code: 'SCHEMA_INVALID',
+      category: 'schema',
+      retryable: false,
+      hint: 'Validate the JSON Schema against the supported structured-output subset.',
+    });
   } finally {
     await handle.close();
   }

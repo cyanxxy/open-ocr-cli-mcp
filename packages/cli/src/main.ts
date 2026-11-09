@@ -371,7 +371,11 @@ then CLI flags. Later sources win.
             // A schema the provider will reject otherwise surfaces as a bare 400
             // naming no field, so say which construct is at fault up front.
             const schemaWarning = customSchemaCompatibilityWarning(customSchema);
-            if (schemaWarning) process.stderr.write(`${schemaWarning}\n`);
+            if (schemaWarning) {
+              process.stderr.write(`${schemaWarning}\n`);
+              // Also carried as run.warning / result.warnings, as `run` does.
+              priorWarnings.push(schemaWarning);
+            }
           }
           const resolvedOptions = resolveCliOptions(flags, fileConfig, cwd, 'flag', env);
           const options = customSchema
