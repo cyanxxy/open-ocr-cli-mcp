@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- URL fetching (`web` and URL inputs for every provider except Gemini URL
+  Context) failed for every hostname on Node 20+ with
+  `ERR_INVALID_IP_ADDRESS`; the pinned DNS lookup now answers Node's
+  `{ all: true }` call. A reset or stalled compressed body now fails at once
+  instead of after the 120-second deadline.
+- Gemini Interactions calls no longer retry up to 4 times inside the SDK,
+  outside the rate limit, request count, and quota handling.
+- Agentic mode accepts common printed dates (`Jan 12, 2026`, `1/12/2026`,
+  `12.01.2026`, `12/01/26`, with optional times) and infers validation rules
+  from whole words, so `candidate_name` is not a date and `tax_id` is not an
+  amount. The receipt alias `transaction_time` no longer overwrites the date.
+- `web` ignores the config file's `output` directory; only `--output` names its
+  output file.
+- Structural `--schema` errors are `SCHEMA_INVALID` instead of being classified
+  by property names (a property named `timeout` was a retryable `TIMEOUT`).
+- `run`/MCP URL requests ignore config `format`, `mode`, `preset`, and `schema`
+  defaults that URL inputs cannot use, as `web` does.
+- Project-scoped `init` refuses to store token prices that the MCP server would
+  then reject on every call.
+- FIFO and device inputs fail with `INPUT_INVALID` instead of being dropped.
+- Muse 504 `gateway_timeout` is not retried (Meta documents that it times out
+  again) and is reported with `retryable: false`.
+- Streamed completions report a textless `length` stop as truncation, and
+  usage-less paid streams close the `--max-cost` "usage unknown" gate.
+- Gemini tool-use tokens (URL Context, search) are priced as input in cost
+  estimates.
+- Preset Markdown escapes `[ ] ( ) !` in values and the summary, so injected
+  document text cannot render as a remote image or link.
+- Evals: strict CER no longer penalizes identical Markdown text,
+  `table_cell_f1` keeps cells such as `Total:`, and negative or non-finite
+  `pass_rate_weight` values are rejected.
+
+### Delivery
+
+- The GitHub Action uses the runner's Node.js when it satisfies `engines` and
+  installs Node 22 only otherwise.
+- CI tests Node 26 and runs the CLI inside the built container; nightly evals
+  run each provider independently and publish from a job without secrets.
+- Node.js 20 is end-of-life; support will be removed in the next major.
+
 ## 4.4.0 - 2026-11-01
 
 A security and correctness release. The MCP server now treats its caller as

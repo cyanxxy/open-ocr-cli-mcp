@@ -452,7 +452,8 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       if (status === 403) {
         return { code: 'PERMISSION_DENIED', category: 'authorization', retryable: false, hint: 'Verify that the credential and project are allowed to use this model or operation.' };
       }
-      if (status === 504 && String(recordValue(current, 'code') ?? '').toLowerCase() === 'gateway_timeout') {
+      const bodyCode = recordValue(current, 'code');
+      if (status === 504 && typeof bodyCode === 'string' && bodyCode.toLowerCase() === 'gateway_timeout') {
         // Meta Muse: the request ran past the server-side limit and "will
         // usually time out again", so an agent must change it, not retry it.
         return {
