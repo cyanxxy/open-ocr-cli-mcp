@@ -176,6 +176,15 @@ function isEvalMetricName(value: unknown): value is EvalMetricName {
   ].includes(value);
 }
 
+/**
+ * A case weight is a finite, non-negative number. Zero is allowed (the case
+ * does not count toward the weighted score); a negative or non-finite weight
+ * would push the weighted score outside 0-1.
+ */
+function isValidCaseWeight(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 function isAllowedAssertion(assertion: unknown): assertion is EvalAssertion {
   if (!isRecord(assertion) || typeof assertion.type !== 'string') return false;
 
@@ -195,6 +204,7 @@ function isAllowedAssertion(assertion: unknown): assertion is EvalAssertion {
     case 'metric_max':
       return isEvalMetricName(assertion.metric) && typeof assertion.value === 'number';
     case 'pass_rate_weight':
+      return isValidCaseWeight(assertion.value);
     case 'overall_score_min':
       return typeof assertion.value === 'number';
     default:
@@ -262,6 +272,9 @@ export function validateEvalCase(input: unknown): EvalCase {
 
   if (!Array.isArray(input.expectedAssertions) || input.expectedAssertions.length === 0) {
     throw new Error(`Eval case "${input.id}" must include at least one assertion.`);
+  }
+  if (input.expectedAssertions.some((assertion) => isRecord(assertion) && assertion.type === 'pass_rate_weight' && !isValidCaseWeight(assertion.value))) {
+    throw new Error(`Eval case "${input.id}" must use a non-negative finite number for pass_rate_weight.`);
   }
   if (!input.expectedAssertions.every(isAllowedAssertion)) throw new Error(`Eval case "${input.id}" includes an invalid assertion.`);
   if (!Array.isArray(input.tags) || !input.tags.every((tag) => typeof tag === 'string')) {
@@ -484,8 +497,10 @@ export function buildEvalSummary(
   suiteConfig: EvalSuiteConfig = {},
   suite?: EvalSuiteName,
 ): EvalRunSummary {
-  const totalWeight = caseResults.reduce((sum, result) => sum + result.weight, 0);
-  const passingWeight = caseResults.reduce((sum, result) => sum + (result.passed ? result.weight : 0), 0);
+  // Results can be built without validateEvalCase, so an invalid weight counts as 0 here too.
+  const weightOf = (result: EvalCaseResult): number => (isValidCaseWeight(result.weight) ? result.weight : 0);
+  const totalWeight = caseResults.reduce((sum, result) => sum + weightOf(result), 0);
+  const passingWeight = caseResults.reduce((sum, result) => sum + (result.passed ? weightOf(result) : 0), 0);
   const passCount = caseResults.filter((result) => result.passed).length;
   const weightedScore = totalWeight > 0 ? passingWeight / totalWeight : (caseResults.length === 0 ? 0 : passCount / caseResults.length);
   const failures = caseResults.filter((result) => !result.passed).map((result) => ({

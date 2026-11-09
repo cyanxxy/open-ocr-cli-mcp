@@ -92,9 +92,19 @@ function multisetOverlap(reference: readonly string[], prediction: readonly stri
   return overlap;
 }
 
+/**
+ * Strict CER text: Markdown markers are removed and line endings unified, but
+ * case, punctuation, and line boundaries are kept. Applied identically to the
+ * reference and the prediction (as `normalizeOcrText` is for the normalized
+ * metrics), so identical inputs always score 0.
+ */
+function strictOcrText(value: string): string {
+  return markdownToPlainText(value.replace(/\r\n?/g, '\n')).normalize('NFC').trim();
+}
+
 export function scoreOcrText(referenceText: string, predictionMarkdown: string): EvalMetricScores {
-  const strictReference = referenceText.normalize('NFC').replace(/\r\n?/g, '\n').trim();
-  const strictPrediction = markdownToPlainText(predictionMarkdown).normalize('NFC').trim();
+  const strictReference = strictOcrText(referenceText);
+  const strictPrediction = strictOcrText(predictionMarkdown);
   const normalizedReference = normalizeOcrText(referenceText);
   const normalizedPrediction = normalizeOcrText(predictionMarkdown);
   const referenceTokens = tokenize(referenceText);
@@ -198,17 +208,25 @@ export function scoreFields(
   };
 }
 
+/** A Markdown table delimiter cell such as `---`, `:---`, or `:---:`. */
+const TABLE_SEPARATOR_CELL = /^:?-{3,}:?$/;
+
 function tableCellTokens(rows: unknown): string[] {
   if (!Array.isArray(rows)) return [];
+  const cellToken = (column: string, value: unknown): string[] => {
+    const cell = canonicalValue(value);
+    // Drop only empty and separator cells; a value such as "Total:" is content.
+    return cell === '' || TABLE_SEPARATOR_CELL.test(cell) ? [] : [`${column}:${cell}`];
+  };
   return rows.flatMap((row) => {
     if (Array.isArray(row)) {
-      return row.map((value, index) => `${index}:${canonicalValue(value)}`);
+      return row.flatMap((value, index) => cellToken(String(index), value));
     }
     if (isRecord(row)) {
-      return Object.entries(row).map(([key, value]) => `${normalizeOcrText(key)}:${canonicalValue(value)}`);
+      return Object.entries(row).flatMap(([key, value]) => cellToken(normalizeOcrText(key), value));
     }
     return [];
-  }).filter((token) => !token.endsWith(':'));
+  });
 }
 
 export function scoreTableCells(referenceRows: unknown, predictionRows: unknown): EvalMetricScores {

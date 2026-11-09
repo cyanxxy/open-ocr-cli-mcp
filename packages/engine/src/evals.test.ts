@@ -87,6 +87,38 @@ describe('eval utilities', () => {
     })).toThrow(/confidenceThreshold/);
   });
 
+  it('rejects negative or non-finite pass_rate_weight values', () => {
+    const caseWithWeight = (value: unknown) => ({
+      id: 'weighted',
+      mode: 'simple',
+      inputPath: 'evals/corpus/receipt.pdf',
+      expectedAssertions: [
+        { type: 'contains', target: 'markdown', value: 'Total' },
+        { type: 'pass_rate_weight', value },
+      ],
+      tags: [],
+    });
+
+    for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY, '2']) {
+      expect(() => validateEvalCase(caseWithWeight(value))).toThrow(/pass_rate_weight/);
+    }
+    expect(validateEvalCase(caseWithWeight(0)).expectedAssertions).toContainEqual({ type: 'pass_rate_weight', value: 0 });
+    expect(validateEvalCase(caseWithWeight(1.5)).expectedAssertions).toContainEqual({ type: 'pass_rate_weight', value: 1.5 });
+  });
+
+  it('keeps the weighted score within 0-1 even for unvalidated negative weights', () => {
+    const summary = buildEvalSummary(
+      'gemini-3.5-flash-lite',
+      [
+        { id: 'case-1', passed: true, weight: 2, failedAssertions: [] },
+        { id: 'case-2', passed: false, weight: -1, failedAssertions: ['failed'] },
+        { id: 'case-3', passed: false, weight: Number.NaN, failedAssertions: ['failed'] },
+      ],
+    );
+
+    expect(summary.weightedScore).toBe(1);
+  });
+
   it('evaluates assertions against structured output', () => {
     const evalCase = validateEvalCase({
       id: 'receipt-template',

