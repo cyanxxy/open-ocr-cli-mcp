@@ -425,6 +425,28 @@ function buildResponseFormat(
   };
 }
 
+
+/**
+ * Per-call request options for `interactions.create()`.
+ *
+ * The Interactions client in @google/genai 2.x defaults to an
+ * `attempt-count-backoff` policy with `maxRetries: 4` on 408/409/429/5XX and
+ * connection errors. Those hidden retries bypassed the request-rate gate, were
+ * never counted as requests, multiplied with `--retries` and the agent's own
+ * retries, and re-sent terminal daily-quota 429s before
+ * `classifyGeminiQuotaError` could see them. Retrying is owned by this
+ * package's policy (`retry.ts`), so the SDK must not retry on its own.
+ */
+export function interactionRequestOptions(abortSignal?: AbortSignal): {
+  retries: { strategy: 'none' };
+  fetchOptions?: { signal: AbortSignal };
+} {
+  return {
+    retries: { strategy: 'none' },
+    ...(abortSignal ? { fetchOptions: { signal: abortSignal } } : {}),
+  };
+}
+
 export async function runModelInteraction({
   apiKey,
   model,
@@ -475,7 +497,7 @@ export async function runModelInteraction({
     };
     const interaction = await withReadableProviderErrors(() => genAI.interactions.create(
       params,
-      abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+      interactionRequestOptions(abortSignal),
     )) as Interactions.Interaction;
     recordGeminiInteractionUsage(
       interaction,
@@ -504,7 +526,7 @@ export async function runModelInteraction({
   };
   const stream = await withReadableProviderErrors(() => genAI.interactions.create(
     params,
-    abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+    interactionRequestOptions(abortSignal),
   )) as AsyncIterable<Interactions.InteractionSSEEvent>;
   const steps = new Map<number, InteractionStep>();
   const argumentDeltas = new Map<number, string>();

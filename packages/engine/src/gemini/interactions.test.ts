@@ -211,7 +211,7 @@ describe('runModelInteraction', () => {
     expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
     expect(mockInteractionCreate).toHaveBeenCalledWith(
       expect.objectContaining({ stream: true }),
-      undefined,
+      { retries: { strategy: 'none' } },
     );
   });
 
@@ -244,7 +244,7 @@ describe('runModelInteraction', () => {
     })).rejects.toThrow('reached the output token limit');
     expect(mockInteractionCreate).toHaveBeenCalledWith(
       expect.objectContaining({ stream: true, automatic_continuation: false }),
-      undefined,
+      { retries: { strategy: 'none' } },
     );
     // The billed hop is still accounted for.
     expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
@@ -263,6 +263,27 @@ describe('runModelInteraction', () => {
       input: 'Extract text',
     })).rejects.toThrow('reached the output token limit');
     expect(mockInteractionCreate.mock.calls[0]?.[0]).toMatchObject({ stream: false, automatic_continuation: false });
+  });
+
+  it('turns off the SDK-internal retry policy so retries stay gated and counted', async () => {
+    // @google/genai 2.x retries Interactions calls up to 4 times by default,
+    // invisible to the rate gate, request counting, and quota classification.
+    mockInteractionCreate.mockResolvedValueOnce({ id: 'no-sdk-retry', status: 'completed', steps: [], output_text: 'ok' });
+    const controller = new AbortController();
+    await runModelInteraction({
+      apiKey: 'test-key',
+      model: 'gemini-3.8-flash',
+      input: 'Extract text',
+      abortSignal: controller.signal,
+    });
+    expect(mockInteractionCreate.mock.calls[0]?.[1]).toEqual({
+      retries: { strategy: 'none' },
+      fetchOptions: { signal: controller.signal },
+    });
+
+    mockInteractionCreate.mockResolvedValueOnce({ id: 'no-sdk-retry-2', status: 'completed', steps: [], output_text: 'ok' });
+    await runModelInteraction({ apiKey: 'test-key', model: 'gemini-3.8-flash', input: 'Extract text' });
+    expect(mockInteractionCreate.mock.calls[1]?.[1]).toEqual({ retries: { strategy: 'none' } });
   });
 
   it('preserves output_text supplied only by the terminal streaming event', async () => {
