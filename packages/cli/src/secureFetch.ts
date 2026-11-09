@@ -2,7 +2,8 @@ import { lookup } from 'node:dns/promises';
 import http, { type IncomingMessage, type RequestOptions } from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
-import type { Readable } from 'node:stream';
+import type { LookupAddress } from 'node:dns';
+import { pipeline, type Readable } from 'node:stream';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 
 import { isPublicIpAddress, parseSupportedHttpUrl } from '@open-ocr/engine/urlValidation';
@@ -69,12 +70,25 @@ async function resolvedPublicAddresses(hostname: string): Promise<Array<{ addres
   return addresses.map((entry) => ({ address: entry.address, family: entry.family as 4 | 6 }));
 }
 
+/**
+ * `pipeline`, not `.pipe()`: `.pipe()` forwards neither a socket error nor an
+ * idle-timeout destroy to the decoder, so a reset compressed body stalled until
+ * the total deadline and was misreported as a slow site. `pipeline` destroys
+ * every stage on the first error, which also closes the socket when the
+ * decoded body exceeds the size cap.
+ */
 function decodedStream(response: IncomingMessage): Readable {
   const encoding = String(response.headers['content-encoding'] ?? '').toLowerCase();
-  if (encoding === 'gzip') return response.pipe(createGunzip());
-  if (encoding === 'deflate') return response.pipe(createInflate());
-  if (encoding === 'br') return response.pipe(createBrotliDecompress());
-  return response;
+  const decoder = encoding === 'gzip'
+    ? createGunzip()
+    : encoding === 'deflate'
+      ? createInflate()
+      : encoding === 'br'
+        ? createBrotliDecompress()
+        : undefined;
+  if (!decoder) return response;
+  // Errors surface on the decoder, which `readBounded` listens to.
+  return pipeline(response, decoder, () => undefined);
 }
 
 function readBounded(stream: Readable, signal?: AbortSignal): Promise<Uint8Array> {
@@ -111,7 +125,7 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
   const addresses = await resolvedPublicAddresses(host);
   // DNS cannot be cancelled; honour a deadline that fired while it ran.
   signal?.throwIfAborted();
-  const selected = addresses[0];
+  const pinned: LookupAddress[] = addresses.map(({ address, family }) => ({ address, family }));
   return new Promise<IncomingMessage>((resolve, reject) => {
     const options: RequestOptions = {
       protocol: url.protocol,
@@ -126,7 +140,14 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
         'Accept-Encoding': 'gzip, deflate, br',
         'User-Agent': 'open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli-mcp)',
       },
-      lookup: (_hostname, _options, callback) => callback(null, selected.address, selected.family),
+      // Answer only with the validated addresses. Node >= 20 enables
+      // autoSelectFamily and calls lookup with `{ all: true }`, expecting an
+      // array; answering that call with a single address made every hostname
+      // fetch fail with ERR_INVALID_IP_ADDRESS.
+      lookup: ((_hostname: string, lookupOptions: { all?: boolean }, callback: (...args: unknown[]) => void) => {
+        if (lookupOptions?.all) callback(null, pinned);
+        else callback(null, pinned[0].address, pinned[0].family);
+      }) as RequestOptions['lookup'],
       // SNI carries names, never addresses; sending an IP literal as the server
       // name is rejected by conforming servers.
       ...(url.protocol === 'https:' && isIP(host) === 0 ? { servername: host } : {}),

@@ -31,6 +31,8 @@ interface ResponseFixture {
   defer?: boolean;
   /** Send headers and part of the body, then never finish it. */
   trickle?: boolean;
+  /** Send headers and part of the body, then fail the response stream. */
+  resetAfter?: Error;
 }
 
 const fixtures: ResponseFixture[] = [];
@@ -66,6 +68,11 @@ beforeEach(() => {
         response.statusCode = fixture.status;
         response.headers = fixture.headers ?? {};
         callback(response);
+        if (fixture.resetAfter) {
+          const error = fixture.resetAfter;
+          response.write(fixture.body ?? 'x', () => response.destroy(error));
+          return;
+        }
         if (fixture.trickle) {
           response.write(fixture.body ?? 'x');
           return;
@@ -117,6 +124,19 @@ describe('secure public URL fetching', () => {
       .toBe('open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli-mcp)');
     const createdRequest = mocks.request.mock.results[0].value as { setTimeout: ReturnType<typeof vi.fn> };
     expect(createdRequest.setTimeout).toHaveBeenCalledWith(30_000, expect.any(Function));
+  });
+
+  it('surfaces a response error on a compressed body instead of waiting for the deadline', async () => {
+    const reset = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    fixtures.push({
+      status: 200,
+      headers: { 'content-type': 'text/plain', 'content-encoding': 'gzip' },
+      body: gzipSync('x'.repeat(200_000)).subarray(0, 64),
+      resetAfter: reset,
+    });
+
+    await expect(secureFetchPublicUrl('http://documents.example/big.txt', undefined, { totalTimeoutMs: 2_000 }))
+      .rejects.toBe(reset);
   });
 
   it('revalidates redirect DNS and blocks redirects into a private network', async () => {
