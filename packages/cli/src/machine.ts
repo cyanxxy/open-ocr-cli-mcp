@@ -262,6 +262,22 @@ function suppliedModeScopedFields(request: OcrJobRequest): ModeScopedOptionKey[]
   return supplied;
 }
 
+/**
+ * Config-file extraction defaults are written for path inputs. A URL request
+ * supports only simple Markdown/JSON, so a config `"format": "all"`, a preset,
+ * a schema, or `"mode": "agentic"` used to fail every URL request. Drop them as
+ * the `web` command does; explicit request fields are still checked strictly.
+ */
+function urlCompatibleFileConfig(fileConfig: CliConfigFile): CliConfigFile {
+  return {
+    ...fileConfig,
+    mode: undefined,
+    preset: undefined,
+    schema: undefined,
+    format: fileConfig.format === undefined ? undefined : fileConfig.format === 'json' ? 'json' : 'markdown',
+  };
+}
+
 function machineConfigurationError(request: OcrJobRequest, fileConfig: CliConfigFile): string | undefined {
   const requestExtraction = request.extraction;
   const requestHasSchema = requestExtraction?.schema !== undefined || requestExtraction?.schemaPath !== undefined;
@@ -405,6 +421,7 @@ export async function executeOcrJobRequest(
   } else {
     fileConfig = await loadCliConfig(execution.cwd, request.configPath, hermetic);
   }
+  if (urlInputs.length > 0) fileConfig = urlCompatibleFileConfig(fileConfig);
   const invalidConfiguration = machineConfigurationError(request, fileConfig);
   if (invalidConfiguration) throw configurationError(invalidConfiguration);
 

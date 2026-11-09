@@ -161,6 +161,26 @@ describe('machine request execution', () => {
     });
   });
 
+  it('ignores config extraction defaults that URL inputs cannot use', async () => {
+    const configPath = path.join(directory, 'extract-defaults.json');
+    await writeFile(configPath, JSON.stringify({ format: 'all', mode: 'agentic', preset: 'invoice' }));
+    const execution = await executeOcrJobRequest({
+      protocolVersion: 2,
+      operation: 'extract',
+      inputs: [{ type: 'url', url: 'https://example.com/article' }],
+      delivery: { mode: 'inline' },
+      configPath,
+      dryRun: true,
+    }, {
+      cwd: directory,
+      runId: 'url-config-defaults',
+      abortController: new AbortController(),
+      noConfig: true,
+    });
+
+    expect(execution.result).toMatchObject({ status: 'validated', failed: 0 });
+  });
+
   it('names an unreadable request path instead of leaking an errno into the payload', async () => {
     let thrown: unknown;
     try {
