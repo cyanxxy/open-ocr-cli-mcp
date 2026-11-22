@@ -82,9 +82,9 @@ test('the dockerignore matcher follows Docker anchoring rules', () => {
 
 test('CI covers both advertised minimums and the Maintenance and Active LTS lines', () => {
   const workflow = read('.github', 'workflows', 'ci.yml');
-  const quality = workflow.slice(workflow.indexOf('\n  quality:\n'), workflow.indexOf('\n  build:\n'));
-  const matrix = /^ {8}node-version: \[([^\]]+)\]$/mu.exec(quality)?.[1].split(',').map((entry) => entry.trim());
-  assert.ok(matrix, 'the quality job must declare a node-version matrix');
+  const tests = workflow.slice(workflow.indexOf('\n  test:\n'), workflow.indexOf('\n  build:\n'));
+  const matrix = /^ {8}node-version: \[([^\]]+)\]$/mu.exec(tests)?.[1].split(',').map((entry) => entry.trim());
+  assert.ok(matrix, 'the test job must declare a node-version matrix');
   const engines = JSON.parse(read('packages', 'cli', 'package.json')).engines.node;
   for (const minimum of engines.matchAll(/\^(\d+\.\d+\.\d+)/gu)) assert.ok(matrix.includes(minimum[1]), minimum[1]);
   // Node 24 has been Maintenance LTS since 2026-10-20; Node 26 Active LTS since 2026-10-28.
@@ -97,4 +97,18 @@ test('CI covers both advertised minimums and the Maintenance and Active LTS line
     const smoke = build.indexOf(`- name: Smoke-test engine-strict CLI installation on Node ${label}\n        run: npm run cli:install-smoke\n`);
     assert.ok(setup !== -1 && smoke > setup, `Build Application must run the packed-install and MCP smoke on Node ${version}`);
   }
+});
+
+test('no CI job waits on another, and the checks job runs every check', async () => {
+  const workflow = read('.github', 'workflows', 'ci.yml');
+  // A `needs` edge puts one job's whole duration in front of another's.
+  assert.doesNotMatch(workflow, /^ {4}needs:/mu, 'CI jobs must start in parallel: remove `needs`');
+  const checks = workflow.slice(workflow.indexOf('\n  checks:\n'), workflow.indexOf('\n  test:\n'));
+  assert.match(checks, /^ {8}run: node scripts\/run-checks\.mjs$/mu, 'the checks job must run every check');
+  const { CHECKS } = await import('./run-checks.mjs');
+  assert.deepEqual(
+    CHECKS.map((check) => check.name),
+    ['types', 'lint', 'scripts', 'release-notes', 'evals', 'audit'],
+    'a check removed from run-checks.mjs must be removed on purpose',
+  );
 });

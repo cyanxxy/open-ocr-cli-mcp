@@ -19,27 +19,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Quality checks, tests, and security audit. Security was folded into this job
-  # so the workspace's `npm ci` is reused instead of installing a second time in
-  # a dedicated job (audit O-07).
-  quality:
-    name: Code Quality & Tests
+  # Every job starts at once: nothing waits on another (no `needs`), so the
+  # run takes as long as its slowest job, not the sum of a chain.
+
+  # The small checks in one job. scripts/run-checks.mjs runs them
+  # concurrently, lets each finish even when another fails, and lists every
+  # failure at the end.
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    # Hard cap so a hung check can never wedge the runner indefinitely (audit Q-01).
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run checks (types, lint, scripts, release notes, evals, audit)
+        run: node scripts/run-checks.mjs
+
+  # The unit suite on every supported Node.js line. Coverage and its upload
+  # run once, on Node 24.
+  test:
+    name: Tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     # Hard cap so a hung test can never wedge the runner indefinitely (audit Q-01).
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        # Exercise the advertised minimum (22.13.0), Node 24 (Maintenance LTS
-        # since 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
-        # static/coverage gates only need to run once on Node 24.
+        # The advertised minimum (22.13.0), Node 24 (Maintenance LTS since
+        # 2026-10-20) and Node 26 (Active LTS since 2026-10-28).
         node-version: [22.13.0, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Node.js ${{ matrix.node-version }}
@@ -51,27 +77,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Test release and packaging scripts
-        run: node --test scripts/*.test.mjs
-
-      # The release workflow rejects a version whose changelog section lacks
-      # headings or a comparison link; check it before merge, not after tagging.
-      - name: Check release notes for the current version
-        run: |
-          VERSION=$(node -p "require('./packages/cli/package.json').version")
-          # The script prefers GITHUB_REF_NAME (a tag in release runs); on a PR
-          # that is "<n>/merge", so point it at the version being released.
-          GITHUB_REF_NAME="v$VERSION" node scripts/assert-release-version.mjs
-          node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
-
-      - name: Type check
-        if: ${{ matrix.node-version == '24.x' }}
-        run: npm run typecheck
-
-      - name: Lint code
-        if: ${{ matrix.node-version == '24.x' }}
-        run: npm run lint
-
       - name: Run tests with coverage
         if: ${{ matrix.node-version == '24.x' }}
         run: npm run test:coverage
@@ -79,14 +84,6 @@ jobs:
       - name: Run tests
         if: ${{ matrix.node-version != '24.x' }}
         run: npm test
-
-      - name: Validate AI eval fixtures
-        if: ${{ matrix.node-version == '24.x' }}
-        run: npm run evals:validate && npm run evals:matrix:check
-
-      - name: Check for vulnerabilities
-        if: ${{ matrix.node-version == '24.x' }}
-        run: npx audit-ci --config audit-ci.json
 
       - name: Upload coverage to Codecov
         # Only publish coverage from a single matrix leg to avoid duplicate uploads.
@@ -105,7 +102,6 @@ jobs:
     name: Build Application
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [quality]
 
     steps:
       - name: Checkout repository
@@ -191,7 +187,6 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [quality]
 
     steps:
       - name: Checkout repository
