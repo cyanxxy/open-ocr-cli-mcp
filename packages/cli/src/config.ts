@@ -302,7 +302,7 @@ export async function loadCliConfig(
   // user/project files that could reintroduce baseUrl or credential env names.
   if (hermetic) return explicit;
 
-  const userPath = path.join(homedir(), '.config', 'open-ocr-cli', 'config.json');
+  const userPath = path.join(userHomeDirectory(), '.config', 'open-ocr-cli', 'config.json');
   const projectPath = path.join(cwd, '.open-ocr-cli.json');
   const [user, project] = await Promise.all([
     readConfigFile(userPath, false),
@@ -369,7 +369,19 @@ export function mergeConfigLayers(lower: CliConfigFile, higher: CliConfigFile): 
  * The user configuration as the CLI reads it, or `{}` when there is none.
  * Used by `init` to describe what a project configuration will inherit.
  */
-export async function readUserConfig(homeDirectory = homedir()): Promise<CliConfigFile> {
+/**
+ * The user's home directory, read from the environment when called: `HOME`
+ * (`USERPROFILE` on Windows), else the account's directory. This is what
+ * Node's `os.homedir()` returns; it is read here on every call because other
+ * runtimes cache `os.homedir()` at startup, which would pin the user
+ * configuration to the directory the process started with.
+ */
+export function userHomeDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnvironment = process.platform === 'win32' ? env.USERPROFILE : env.HOME;
+  return fromEnvironment || homedir();
+}
+
+export async function readUserConfig(homeDirectory = userHomeDirectory()): Promise<CliConfigFile> {
   const userPath = path.join(homeDirectory, '.config', 'open-ocr-cli', 'config.json');
   return readConfigFile(userPath, false, userPath, true);
 }
@@ -483,7 +495,7 @@ export async function loadMcpCallerConfig(
   callerNoConfig = false,
 ): Promise<McpCallerConfig> {
   const operatorDisabled = environmentDisablesConfig();
-  const userPath = path.join(homedir(), '.config', 'open-ocr-cli', 'config.json');
+  const userPath = path.join(userHomeDirectory(), '.config', 'open-ocr-cli', 'config.json');
   const user = operatorDisabled ? {} : await readConfigFile(userPath, false, userPath, true);
   const ceilings = pickCeilings(user);
   if (callerNoConfig) return { fileConfig: {}, ceilings, operatorSchema: false };

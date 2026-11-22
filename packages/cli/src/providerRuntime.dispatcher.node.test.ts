@@ -1,3 +1,10 @@
+/**
+ * Node runtime contract: Node's built-in fetch honors the undici-7 global
+ * dispatcher the CLI installs, so only the document deadline cuts a request.
+ * Bun's fetch is its own and ignores undici dispatchers. Files named
+ * *.node.test.ts run on Node only; bun test skips them by name and CI runs
+ * them under Vitest on Node.
+ */
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
