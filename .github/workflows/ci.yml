@@ -3,8 +3,9 @@ name: CI Pipeline
 on:
   push:
     branches: [ main ]
+  # Every pull request, including one stacked on another branch: a stack's
+  # upper PRs otherwise get no feedback until the lower ones merge.
   pull_request:
-    branches: [ main ]
   merge_group:
     types: [ checks_requested ]
 
