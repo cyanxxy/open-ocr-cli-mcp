@@ -178,7 +178,9 @@ reasoning effort only when you choose one with `--thinking`.
 
 ## Installation
 
-Requires Node.js 22.13+ or 24+. CI tests Node.js 22, 24, and 26.
+Requires Node.js 22.13+ or 24+. CI tests Node.js 22, 24, and 26. Upgrading from
+4.x: Node.js 20 is no longer supported, and a few setups now behave differently;
+see [5.0.0 in the changelog](CHANGELOG.md#500---2026-11-22).
 
 **npm**
 
@@ -197,7 +199,7 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
 **GitHub Actions**
 
 ```yaml
-- uses: cyanxxy/open-ocr-cli-mcp@v4
+- uses: cyanxxy/open-ocr-cli-mcp@v5
   env:
     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
   with:

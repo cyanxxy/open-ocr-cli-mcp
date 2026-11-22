@@ -1,11 +1,14 @@
 # Changelog
 
-## Unreleased
+## 5.0.0 - 2026-11-22
 
-Fixes from the [2026-11-21 codebase audit](docs/codebase-audit.md#codebase-audit-2026-11-21).
+A major release: Node.js 20 is no longer supported (it reached end of life on
+2026-04-30), and the CLI requires Node.js 22.13+ or 24+. It also carries the
+fixes from the [2026-11-21 codebase audit](docs/codebase-audit.md#codebase-audit-2026-11-21).
 Some of them change results or refuse setups that ran before: configuration
 files that switch provider, OpenRouter reasoning on unlisted models, agentic
 field names, and template signs. Review the first section before upgrading.
+The GitHub Action's moving major tag is now `v5`; `v4` stays on 4.4.0.
 
 ### Changed (review before upgrading)
 
@@ -237,7 +240,7 @@ field names, and template signs. Review the first section before upgrading.
   guide, and skill now give `MCP_PROTOCOL_NEGOTIATION=auto` as the first fix
   when `/mcp` cannot connect.
 
-[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.4.0...main)
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.4.0...v5.0.0)
 
 ## 4.4.0 - 2026-11-01
 
