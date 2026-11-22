@@ -130,8 +130,39 @@ export function webFileConfig(fileConfig: CliConfigFile): CliConfigFile {
 /** Wall-clock budget for converting one fetched page to text. */
 export const WEB_TEXT_CONVERSION_TIMEOUT_MS = 15_000;
 
-/** An SVG document's root is `<svg>`: skipping inline SVG there would skip the whole document. */
-const SVG_DOCUMENT = /^\s*(?:<\?xml[^>]*>\s*)?(?:(?:<!--[\s\S]*?-->|<!DOCTYPE[^>]*>)\s*)*<svg[\s/>]/iu;
+/**
+ * Whether the document's root element is `<svg>` (skipping inline SVG there
+ * would skip the whole document). A linear scan past the XML declaration,
+ * comments and doctype: a regex with a repeated lazy comment group backtracks
+ * exponentially on input like `<!--` followed by many `--><!--`.
+ */
+function isSvgDocument(text: string): boolean {
+  let index = 0;
+  const skipSpace = (): void => {
+    while (index < text.length && /\s/u.test(text[index])) index += 1;
+  };
+  skipSpace();
+  if (text.startsWith('<?xml', index)) {
+    const end = text.indexOf('>', index);
+    if (end === -1) return false;
+    index = end + 1;
+  }
+  for (;;) {
+    skipSpace();
+    if (text.startsWith('<!--', index)) {
+      const end = text.indexOf('-->', index + 4);
+      if (end === -1) return false;
+      index = end + 3;
+    } else if (text.slice(index, index + 9).toUpperCase() === '<!DOCTYPE') {
+      const end = text.indexOf('>', index);
+      if (end === -1) return false;
+      index = end + 1;
+    } else {
+      break;
+    }
+  }
+  return text.slice(index, index + 4).toLowerCase() === '<svg' && /[\s/>]/u.test(text[index + 4] ?? '');
+}
 
 function htmlToTextOptions(svgDocument: boolean): HtmlToTextOptions {
   return {
@@ -237,7 +268,7 @@ export async function readableWebText(
 ): Promise<string> {
   const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   if (!contentType.includes('html') && !contentType.includes('xml')) return decoded;
-  const svgDocument = contentType === 'image/svg+xml' || SVG_DOCUMENT.test(decoded);
+  const svgDocument = contentType === 'image/svg+xml' || isSvgDocument(decoded);
   const text = await convertHtmlOffThread(decoded, htmlToTextOptions(svgDocument), signal, timeoutMs);
   return text
     .replace(/\u00a0/g, ' ')

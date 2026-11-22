@@ -287,7 +287,7 @@ export async function* providerAgentLoop(
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStep, AgentMemory, unknown> {
   const memory = createInitialMemory(
-    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    crypto.randomUUID(),
     file.name,
     config.pageCount,
   );

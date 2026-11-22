@@ -787,11 +787,16 @@ describe('durable job metadata', () => {
     const loaded = await store.load({ unreadable: 'set-aside' });
     expect(loaded.setAsidePath).toMatch(/\.open-ocr-manifest\.json\.corrupt-[0-9TZ-]+$/u);
     await expect(readFile(loaded.setAsidePath!, 'utf8')).resolves.toBe('');
-    await expect(fs.lstat(manifestPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(store.recordedUsage()).toBeUndefined();
 
     // Only invalid JSON is set aside: a manifest another tool wrote is still refused.
-    await writeFile(manifestPath, JSON.stringify({ version: 9, entries: {} }));
+    // The exclusive create also proves the corrupt manifest was moved away.
+    const replacement = await fs.open(manifestPath, 'wx');
+    try {
+      await replacement.writeFile(JSON.stringify({ version: 9, entries: {} }));
+    } finally {
+      await replacement.close();
+    }
     await expect(new ManifestStore(directory).load({ unreadable: 'set-aside' }))
       .rejects.toThrow('Unsupported manifest version');
   });

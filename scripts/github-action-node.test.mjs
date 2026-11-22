@@ -72,7 +72,9 @@ test('action.yml only runs setup-node when the job lacks a supported Node.js', (
   // Run the check step's script as the runner would, against different PATHs.
   const runBlock = /^ {6}run: \|\n((?: {8}.*\n|\n)+)/mu.exec(steps[checkIndex])?.[1];
   assert.ok(runBlock, 'the check step must have a run block');
-  const commands = runBlock.replace(/^ {8}/gmu, '').replaceAll('${{ github.action_path }}', root);
+  // The action path reaches the script through the environment, not by
+  // interpolation, so the shell command itself is the file's own text.
+  const commands = runBlock.replace(/^ {8}/gmu, '').replaceAll('${{ github.action_path }}', '${ACTION_PATH}');
   const temporary = mkdtempSync(path.join(tmpdir(), 'open-ocr-action-path-'));
   try {
     const nodeOnly = path.join(temporary, 'node-only');
@@ -82,7 +84,7 @@ test('action.yml only runs setup-node when the job lacks a supported Node.js', (
       const output = path.join(temporary, `output-${Math.random().toString(16).slice(2)}`);
       writeFileSync(output, '');
       const result = spawnSync('/bin/bash', ['-e', '-c', commands], {
-        env: { PATH: searchPath, GITHUB_OUTPUT: output },
+        env: { PATH: searchPath, GITHUB_OUTPUT: output, ACTION_PATH: root },
         encoding: 'utf8',
       });
       assert.equal(result.status, 0, result.stderr);

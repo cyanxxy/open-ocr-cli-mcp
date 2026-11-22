@@ -225,14 +225,14 @@ interface ParsedLocaleNumber {
 const GROUPING_SPACE = /[\s\u00a0\u202f'\u2019]/u;
 
 /** "-5", "-$5", "$-5", "Rs.-500", "-USD 5": a minus not attached to a word, next to the amount. */
-const LEADING_MINUS = /(?:^|[^\p{L}\p{N}])-\s*(?:\p{Sc}|[A-Z]{3}\.?)?\s*$/u;
+const LEADING_MINUS = /(?:^|[^\p{L}\p{N}])-(?:\s*(?:\p{Sc}|[A-Z]{3}\.?))?$/u;
 /** "USD-5.00": a currency code directly followed by a minus. */
-const CURRENCY_THEN_MINUS = /^\s*(?:\p{Sc}|[A-Z]{3}\.?)\s*-\s*$/u;
+const CURRENCY_THEN_MINUS = /^(?:\p{Sc}|[A-Z]{3}\.?)\s*-$/u;
 /** "5.00-": a minus right after the amount. */
 const TRAILING_MINUS = /^-(?:\s|$)/u;
 /** "(27.00)", "($27.00)", "(27.00 EUR)": parentheses around the amount alone. */
-const ACCOUNTING_OPEN = /\(\s*(?:\p{Sc}|[A-Za-z]{3})?\s*$/u;
-const ACCOUNTING_CLOSE = /^\s*(?:\p{Sc}|[A-Za-z]{3})?\s*\)/u;
+const ACCOUNTING_OPEN = /\((?:\s*(?:\p{Sc}|[A-Za-z]{3}))?$/u;
+const ACCOUNTING_CLOSE = /^(?:(?:\p{Sc}|[A-Za-z]{3})\s*)?\)/u;
 
 /**
  * Currency abbreviations that are written with a trailing period, lower-cased
@@ -299,10 +299,14 @@ function parseLocaleNumber(
   // A sign is read only next to the amount. A hyphenated label ("Sub-total",
   // "T-shirt"), a dash before a remark ("50.00 - Visa") or a parenthesised
   // remark ("(approx. $27.00)") keeps the magnitude and is reported instead.
-  const negative = LEADING_MINUS.test(prefix)
-    || CURRENCY_THEN_MINUS.test(prefix)
+  // Trimmed first, so each pattern has no two quantifiers that can match the
+  // same whitespace: on a long run of spaces that would backtrack polynomially.
+  const nearPrefix = prefix.trimEnd();
+  const nearSuffix = suffix.trimStart();
+  const negative = LEADING_MINUS.test(nearPrefix)
+    || CURRENCY_THEN_MINUS.test(nearPrefix.trimStart())
     || TRAILING_MINUS.test(suffix)
-    || (ACCOUNTING_OPEN.test(prefix) && ACCOUNTING_CLOSE.test(suffix));
+    || (ACCOUNTING_OPEN.test(nearPrefix) && ACCOUNTING_CLOSE.test(nearSuffix));
   const ignoredSign = !negative
     && (prefix.includes('-') || /^\s*-/u.test(suffix) || (prefix.includes('(') && suffix.includes(')')));
 

@@ -967,8 +967,10 @@ interface ConfirmedRun {
   sendOnly: ReadonlySet<string>;
 }
 
-function isConfirmedRun(value: unknown): value is ConfirmedRun {
-  return typeof value === 'object' && value !== null && 'sendOnly' in value;
+function isConfirmedRun(
+  value: InputRequiredResult | ReturnType<typeof mcpResult> | ConfirmedRun,
+): value is ConfirmedRun {
+  return 'sendOnly' in value;
 }
 
 /**
