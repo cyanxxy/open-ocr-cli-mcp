@@ -43,6 +43,13 @@ npm run cli -- --help
 `npm ci` at the repository root installs every workspace; there is no separate
 install step inside `packages/`.
 
+Type checking uses `bun check` (TypeScript 7 semantics). Install the exact Bun
+build CI uses, pinned in `.github/actions/setup-bun/bun.json`:
+
+```bash
+npm install --global bun@1.4.5-canary.20261121.1
+```
+
 Before opening a PR, run:
 
 ```bash

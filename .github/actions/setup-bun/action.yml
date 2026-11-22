@@ -1,0 +1,27 @@
+name: Set up pinned Bun
+description: Put the exact Bun build pinned in bun.json on PATH, verified by its npm integrity hash and cached by version.
+runs:
+  using: composite
+  steps:
+    - name: Read pinned Bun version
+      id: pin
+      shell: bash
+      run: echo "version=$(node -p "require('${{ github.action_path }}/bun.json').version")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Bun
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.bun-pinned
+        key: bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.version }}
+
+    - name: Download and verify Bun
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: node "${{ github.action_path }}/install.mjs" "$HOME/.bun-pinned"
+
+    - name: Add Bun to PATH
+      shell: bash
+      run: |
+        echo "$HOME/.bun-pinned/bin" >> "$GITHUB_PATH"
+        "$HOME/.bun-pinned/bin/bun" --revision

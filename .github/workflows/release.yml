@@ -152,6 +152,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
       - name: Type check
         run: npm run typecheck
 
