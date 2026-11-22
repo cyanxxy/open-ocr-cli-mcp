@@ -53,7 +53,9 @@ let directory: string;
 beforeEach(async () => {
   directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-main-'));
   process.env.GEMINI_API_KEY = 'test-key';
-  process.exitCode = undefined;
+  // Reset to 0, not undefined: Bun ignores assigning undefined and keeps the
+  // previous code, so an earlier test's failure would leak into this one.
+  process.exitCode = 0;
   mocks.runWebJob.mockReset();
   mocks.runBatch.mockReset();
   mocks.promptInteractiveArguments.mockReset();
@@ -62,7 +64,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  process.exitCode = undefined;
+  process.exitCode = 0;
   if (originalApiKey === undefined) delete process.env.GEMINI_API_KEY;
   else process.env.GEMINI_API_KEY = originalApiKey;
   await rm(directory, { recursive: true, force: true });
@@ -426,7 +428,7 @@ describe('CLI command exit contracts', () => {
         expect(value).toMatchObject({ protocolVersion: 2, type: 'run.failed', sequence: 0 });
       }],
     ] as const) {
-      process.exitCode = undefined;
+      process.exitCode = 0;
       const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
       let output: string;
       try {
@@ -459,7 +461,7 @@ describe('CLI command exit contracts', () => {
     // the record types, so prose alone would trip a substring check.
     const records = output.split('\n').filter((line) => line.startsWith('{'));
     expect(records).toEqual([]);
-    expect(process.exitCode).toBeUndefined();
+    expect(process.exitCode ?? 0).toBe(0);
   });
 
   it.each([
@@ -557,7 +559,7 @@ describe('CLI command exit contracts', () => {
     ]);
 
     expect(mocks.runBatch).toHaveBeenCalledTimes(1);
-    expect(process.exitCode).toBeUndefined();
+    expect(process.exitCode ?? 0).toBe(0);
   });
 
   it('rejects a preset the named mode would silently discard', async () => {
@@ -870,7 +872,7 @@ describe('agent machine commands', () => {
         ok: true,
         status: 'validated',
       });
-      expect(process.exitCode).toBeUndefined();
+      expect(process.exitCode ?? 0).toBe(0);
     } finally {
       stdout.mockRestore();
     }
@@ -884,7 +886,7 @@ describe('agent machine commands', () => {
       { type: 'stdin' as const, name: 'scan.png' },
       { type: 'path' as const, path: '-' },
     ]) {
-      process.exitCode = undefined;
+      process.exitCode = 0;
       mocks.readOcrJobRequest.mockResolvedValueOnce({
         protocolVersion: 2,
         operation: 'extract',
@@ -961,7 +963,7 @@ describe('agent machine commands', () => {
         'node', 'open-ocr-cli', 'run', '--request', 'request.json', '--response-format', 'json',
       ]);
       expect(stdout).toHaveBeenCalledOnce();
-      expect(process.exitCode).toBeUndefined();
+      expect(process.exitCode ?? 0).toBe(0);
     } finally {
       stdout.mockRestore();
     }
