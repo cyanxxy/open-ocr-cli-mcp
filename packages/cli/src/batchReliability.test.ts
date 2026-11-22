@@ -9,7 +9,6 @@ import { describeDiscoverySkips, discoverInputSet, inputFingerprint } from './in
 import { modeFingerprint, OcrJobService, type OcrDocumentExtractor } from './ocrJobService';
 import {
   BatchOutputLock,
-  MANIFEST_FLUSH_INTERVAL_MS,
   ManifestStore,
   processStartIdentity,
   recoverStaleTransactionFiles,
@@ -21,6 +20,32 @@ const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
 const TX = '4242-0f8fad5b-d9cb-469f-a165-70867728950e';
 
 let directory: string;
+
+/**
+ * Manifest writes are timer-driven and their duration is I/O-bound (each one
+ * fsyncs the file and its directory), so tests wait for the write itself
+ * instead of sleeping for a margin past MANIFEST_FLUSH_INTERVAL_MS: a margin
+ * that is enough on a fast disk is not on a loaded CI runner. A write
+ * serialises the whole manifest when it starts, so the next write that starts
+ * after a change carries it; if none ever does, the wait fails the test at
+ * its timeout.
+ */
+function watchManifestWrites(): { nextWrite: () => Promise<void> } {
+  type Writer = { write(): Promise<void> };
+  const prototype = ManifestStore.prototype as unknown as Writer;
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via call() below
+  const original = prototype.write;
+  const waiting: Array<() => void> = [];
+  vi.spyOn(prototype, 'write').mockImplementation(function (this: Writer) {
+    const written = original.call(this);
+    const ready = waiting.splice(0);
+    void written.then(() => {
+      for (const resolve of ready) resolve();
+    }, () => undefined);
+    return written;
+  });
+  return { nextWrite: () => new Promise<void>((resolve) => { waiting.push(resolve); }) };
+}
 
 beforeEach(async () => {
   directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-reliability-'));
@@ -142,13 +167,24 @@ describe('crash-safe resume', () => {
     const docs = await seedDocs(['a.jpg', 'b.jpg']);
     const out = path.join(directory, 'out');
     let statusOfAWhileBRuns: string | undefined;
+    const { nextWrite } = watchManifestWrites();
+    const statusOfA = async (): Promise<string | undefined> => {
+      const onDisk = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
+        entries: Record<string, ManifestEntry>;
+      };
+      return Object.entries(onDisk.entries).find(([key]) => key.endsWith('a.jpg'))?.[1].status;
+    };
     const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
       if (input.name === 'b.jpg') {
-        await new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 400));
-        const onDisk = JSON.parse(await readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')) as {
-          entries: Record<string, ManifestEntry>;
-        };
-        statusOfAWhileBRuns = Object.entries(onDisk.entries).find(([key]) => key.endsWith('a.jpg'))?.[1].status;
+        // b keeps running until a's result is on disk, so the write that put
+        // it there is an interval flush, not the end-of-batch one. Each pass
+        // waits for a real write; if a's result never lands mid-batch, the
+        // test fails at its timeout.
+        statusOfAWhileBRuns = await statusOfA();
+        while (statusOfAWhileBRuns !== 'succeeded') {
+          await nextWrite();
+          statusOfAWhileBRuns = await statusOfA();
+        }
       }
       return { artifacts: { markdown: `# ${input.name}`, json: { name: input.name } }, attempts: 1 };
     });
@@ -194,9 +230,12 @@ describe('crash-safe resume', () => {
 
     // What a SIGKILL while a.jpg is running would leave on disk.
     let snapshot = '';
+    const { nextWrite } = watchManifestWrites();
     const extractDocument = vi.fn<OcrDocumentExtractor>(async (input) => {
       if (input.name === 'a.jpg') {
-        await new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 400));
+        // a's start is recorded in memory before extraction begins; the next
+        // write carries it (an interval flush, while a is still running).
+        await nextWrite();
         snapshot = await readFile(manifestPath, 'utf8');
       }
       return { artifacts: { markdown: `# ${input.name}` }, attempts: 1 };
@@ -541,12 +580,13 @@ describe('spend accounting across runs', () => {
     const docs = await seedDocs(['long.jpg']);
     const manifestPath = path.join(directory, 'out', '.open-ocr-manifest.json');
     let recordedWhileRunning: number | undefined;
-    const pause = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 300));
+    const { nextWrite } = watchManifestWrites();
     const extractDocument = vi.fn<OcrDocumentExtractor>(async (input, _options, _signal, _step, runtime) => {
-      // An agentic document paying for one response per iteration.
+      // An agentic document paying for one response per iteration. Recorded
+      // spend schedules an interval flush; the next write carries it.
       for (let iteration = 0; iteration < 2; iteration += 1) {
         runtime.recordUsage({ usage: { input_tokens: 1, total_tokens: 1, cost: 4.5 } });
-        await pause();
+        await nextWrite();
       }
       // What a SIGKILL here would leave for the next resume's --max-cost check.
       recordedWhileRunning = (JSON.parse(await readFile(manifestPath, 'utf8')) as {
