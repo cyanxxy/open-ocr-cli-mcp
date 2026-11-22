@@ -7,7 +7,12 @@ import { GoogleGenAI, ThinkingLevel as GoogleThinkingLevel } from '@google/genai
 import { logger } from '../logger';
 import { isRecord } from './errorPayload';
 import { GeminiModel, OcrError, OcrErrorType, ThinkingLevel } from './types';
-import { knownModelThinkingLevels, providerDefaultThinkingLevel } from '../providers/registry';
+import { isLocalTransportTimeoutError } from '../providers/openaiCompatible';
+import {
+  knownModelThinkingLevels,
+  providerDefaultBaseUrl,
+  providerDefaultThinkingLevel,
+} from '../providers/registry';
 
 /**
  * Cache for GoogleGenAI instances to avoid recreating them
@@ -45,12 +50,17 @@ export function getGenAIClient(apiKey: string, transport: GeminiTransportOptions
   try {
     const genAI = new GoogleGenAI({
       apiKey,
-      ...((transport.baseUrl || transport.headers) ? {
-        httpOptions: {
-          ...(transport.baseUrl ? { baseUrl: transport.baseUrl } : {}),
-          ...(transport.headers ? { headers: transport.headers } : {}),
-        },
-      } : {}),
+      // Every routing input is explicit. Left unset, the SDK's node entry reads
+      // GOOGLE_GENAI_USE_VERTEXAI / GOOGLE_GENAI_USE_ENTERPRISE (switching to
+      // Vertex AI), GOOGLE_GEMINI_BASE_URL (sending the key to another host) and
+      // GOOGLE_GENAI_API_VERSION from the environment, so the destination could
+      // differ from the one this CLI reports and confirms.
+      vertexai: false,
+      apiVersion: 'v1beta',
+      httpOptions: {
+        baseUrl: transport.baseUrl || providerDefaultBaseUrl('gemini'),
+        ...(transport.headers ? { headers: transport.headers } : {}),
+      },
     });
     clientCache.set(cacheKey, genAI);
     logger.info(`Created new GoogleGenAI client`);
@@ -70,15 +80,30 @@ interface GeminiResponseStatus {
   promptFeedback?: { blockReason?: string };
 }
 
+/**
+ * Stable phrase for a stop at the model's server-side per-request decode limit
+ * (CONTINUATION / requires_continuation). Hosts key their remediation on it:
+ * unlike MAX_TOKENS, a higher output-token limit cannot get past this stop.
+ */
+export const GEMINI_PER_REQUEST_LIMIT_PHRASE = 'per-request output limit';
+
 function assertNotFailedFinishReason(finishReason: string | undefined, operation: string): void {
   if (!finishReason || finishReason === 'STOP') return;
-  // CONTINUATION (@google/genai >= 2.26): the per-request decode limit was hit.
-  // Automatic continuation is disabled on every request (each hop re-bills the
-  // input past --max-cost), so this output is as incomplete as MAX_TOKENS.
-  if (finishReason === 'MAX_TOKENS' || finishReason === 'CONTINUATION') {
+  if (finishReason === 'MAX_TOKENS') {
     throw new Error(
       `${operation} reached the output token limit and returned incomplete output. `
       + 'Increase the output-token limit or lower the thinking level and retry.',
+    );
+  }
+  // CONTINUATION (@google/genai >= 2.26): the per-request decode limit was hit
+  // before maxOutputTokens. Automatic continuation is disabled on every request
+  // (each hop re-bills the input past --max-cost), so this output is as
+  // incomplete as MAX_TOKENS, but raising the output-token limit cannot fix it.
+  if (finishReason === 'CONTINUATION') {
+    throw new Error(
+      `${operation} stopped at the model's ${GEMINI_PER_REQUEST_LIMIT_PHRASE} (finishReason CONTINUATION) `
+      + 'and returned incomplete output. A larger output budget cannot help; '
+      + 'lower the thinking level or split the document (for example by page ranges) and retry.',
     );
   }
   throw new Error(`${operation} did not complete normally (finishReason: ${finishReason})`);
@@ -199,7 +224,40 @@ function structuredErrorMetadata(error: unknown): { status?: number; code?: stri
   return firstCode ? { code: firstCode } : {};
 }
 
+/**
+ * The engine's own typed errors are classified by type, never by message:
+ * OUTPUT_INVALID messages quote model output (JSON positions, schema paths),
+ * whose digits must not read as an HTTP status. A wrapper that restates such an
+ * error (a retry layer copying its message) is classified the same way.
+ * Returns undefined when no such error is in the cause chain, or when a
+ * provider status in the chain should decide instead.
+ */
+function engineErrorVerdict(error: unknown): { fatal: boolean; retryable: boolean } | undefined {
+  if (structuredErrorMetadata(error).status !== undefined) return undefined;
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; isRecord(current) && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (current instanceof OcrError || (current.name === 'OcrError' && typeof current.type === 'string')) {
+      return { fatal: current.type === OcrErrorType.API_KEY_MISSING, retryable: false };
+    }
+    current = current.cause;
+  }
+  return undefined;
+}
+
+/**
+ * A status only where a status is written: the Interactions "401 <message>"
+ * form, "[403 Forbidden]", "HTTP 401", "status 403", `"code":401`. A bare
+ * number elsewhere (a JSON position, a page count) is not one.
+ */
+const CREDENTIAL_STATUS_TEXT = /^\s*(?:401|403)\b|\[(?:401|403)\b|\b(?:status|http|code|error)\D{0,3}(?:401|403)\b/u;
+const TRANSIENT_STATUS_TEXT = /^\s*(?:429|50[0234])\b|\[(?:429|50[0234])\b|\b(?:status|http|code|error)\D{0,3}(?:429|50[0234])\b/u;
+
 export function isFatalGeminiError(error: unknown): boolean {
+  const typed = engineErrorVerdict(error);
+  if (typed) return typed.fatal;
   const { status, code } = structuredErrorMetadata(error);
   if (code && ['API_KEY_INVALID', 'UNAUTHENTICATED', 'PERMISSION_DENIED'].includes(code)) {
     return true;
@@ -212,8 +270,7 @@ export function isFatalGeminiError(error: unknown): boolean {
     || message.includes('permission_denied')
     || message.includes('permission denied')
     || message.includes('unauthorized')
-    || message.includes('401')
-    || message.includes('403')
+    || CREDENTIAL_STATUS_TEXT.test(message)
   );
   if (status !== undefined) {
     // Google AI Studio can report an invalid API key as HTTP 400 rather than
@@ -316,7 +373,7 @@ function collectGoogleQuotaEvidence(error: unknown): GoogleQuotaEvidence {
 }
 
 /** "34.07s", "60s", "900ms" -> seconds (google.protobuf.Duration JSON form). */
-function parseDurationSeconds(duration: string): number | undefined {
+export function parseDurationSeconds(duration: string): number | undefined {
   const match = /^\s*(\d+(?:\.\d+)?)(ms|s)\s*$/u.exec(duration);
   if (!match) return undefined;
   const value = Number(match[1]);
@@ -412,7 +469,12 @@ export function isGeminiQuotaExhaustedError(error: unknown): boolean {
  * first 429/5xx as permanently fatal (audit H-17).
  */
 export function isRetryableGeminiError(error: unknown): boolean {
+  const typed = engineErrorVerdict(error);
+  if (typed) return typed.retryable;
   if (isFatalGeminiError(error)) return false;
+  // A local headers/body timeout leaves the provider still working (and
+  // billing); re-sending would pay for the same work twice.
+  if (isLocalTransportTimeoutError(error)) return false;
   const quota = classifyGeminiQuotaError(error);
   if (quota) return quota === 'retryable';
   const { status, code } = structuredErrorMetadata(error);
@@ -441,11 +503,7 @@ export function isRetryableGeminiError(error: unknown): boolean {
     || message.includes('rate limit')
     || message.includes('rate-limit')
     || message.includes('quota')
-    || message.includes('429')
-    || message.includes('500')
-    || message.includes('502')
-    || message.includes('503')
-    || message.includes('504')
+    || TRANSIENT_STATUS_TEXT.test(message)
     || message.includes('unavailable')
     || message.includes('overloaded')
     || message.includes('internal error')
@@ -459,7 +517,8 @@ export function isRetryableGeminiError(error: unknown): boolean {
 /**
  * Model-aware default thinking level when the host has not set one.
  * - Flash-Lite: minimal (API default; cheap/high-volume)
- * - 3.8 Flash and 4 Argon: medium
+ * - 3.8 Flash, 4 Argon and 4 Carbon: medium
+ * - 4 Hydrogen and 4 Neon: high
  */
 export function defaultThinkingLevelForModel(modelName: GeminiModel): ThinkingLevel {
   return providerDefaultThinkingLevel('gemini', modelName);
@@ -473,7 +532,7 @@ export function defaultThinkingLevelForModel(modelName: GeminiModel): ThinkingLe
 export function normalizeThinkingLevel(
   level: ThinkingLevel | undefined,
   modelName: GeminiModel,
-): 'minimal' | 'low' | 'medium' | 'high' {
+): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
   const rawLevel = level ?? defaultThinkingLevelForModel(modelName);
   const normalized = typeof rawLevel === 'string' ? rawLevel.toUpperCase() : rawLevel;
   const allowed = knownModelThinkingLevels('gemini', modelName) ?? [];
@@ -483,7 +542,7 @@ export function normalizeThinkingLevel(
       + `${String(rawLevel).toLowerCase()} is not supported`,
     );
   }
-  return normalized.toLowerCase() as 'minimal' | 'low' | 'medium' | 'high';
+  return normalized.toLowerCase() as 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }
 
 function generateContentThinkingLevel(
@@ -495,6 +554,9 @@ function generateContentThinkingLevel(
     case 'low': return GoogleThinkingLevel.LOW;
     case 'medium': return GoogleThinkingLevel.MEDIUM;
     case 'high': return GoogleThinkingLevel.HIGH;
+    // The installed SDK (2.32) predates ThinkingLevel.XHIGH (added in 3.3.0);
+    // the wire value is the same string.
+    case 'xhigh': return 'XHIGH' as GoogleThinkingLevel;
   }
 }
 

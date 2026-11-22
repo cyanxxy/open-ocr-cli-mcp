@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'node:fs';
 import { open, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -42,6 +42,19 @@ import {
   type ExtractCommandFlags,
   type ResolvedCliOptions,
 } from './types';
+
+declare module './types' {
+  interface ResolvedCliOptions {
+    /**
+     * True when the thinking level was chosen (a flag or request field,
+     * OPEN_OCR_THINKING, or a configuration-file `thinking` for the same
+     * provider and model) rather than filled in from the model's default.
+     * Providers whose reasoning contract for a model is unknown send a
+     * reasoning parameter only when it was chosen.
+     */
+    thinkingExplicit?: boolean;
+  }
+}
 
 const DEFAULT_CONFIG: Required<Pick<
   ResolvedCliOptions,
@@ -297,7 +310,68 @@ export async function loadCliConfig(
   ]);
   assertProjectConfigDoesNotRoute(project);
   await assertProjectOutputStaysInProject(project, cwd);
-  return { ...user, ...project, ...explicit };
+  return mergeConfigLayers(mergeConfigLayers(user, project), explicit);
+}
+
+/** Settings that describe one provider: its model, endpoint, credential, and model-tuned values. */
+const PROVIDER_COUPLED_KEYS = [
+  'model', 'thinking', 'baseUrl', 'apiKeyEnv', 'cloudflareProvider', 'cloudflareByok',
+  'cloudflareByokAlias', 'maxTokens', 'inputPricePerMillionUsd', 'outputPricePerMillionUsd',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+/** Settings that only make sense for the gateway they were written for. */
+const GATEWAY_COUPLED_KEYS = [
+  'baseUrl', 'cloudflareByok', 'cloudflareByokAlias',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+/** Settings tuned for one model. */
+const MODEL_COUPLED_KEYS = [
+  'thinking', 'maxTokens', 'inputPricePerMillionUsd', 'outputPricePerMillionUsd',
+] as const satisfies readonly (keyof CliConfigFile)[];
+
+function configuredModelOf(config: CliConfigFile): string | undefined {
+  const provider = config.provider ?? DEFAULT_CONFIG.provider;
+  return config.model
+    ?? (PROVIDER_IDS.includes(provider) ? providerDefaultModel(provider) : undefined);
+}
+
+/**
+ * Lay a higher-precedence configuration file over a lower one.
+ *
+ * Keys are not simply overwritten one by one: a higher layer that switches the
+ * provider, gateway, or model drops the lower layer's settings that were
+ * written for the old one. Otherwise a project that sets `provider: kimi` on
+ * top of a user configuration for Gemini sends Kimi requests to the Gemini
+ * endpoint with the Gemini credential, and an MCP caller's `configPath` that
+ * switches provider could aim the operator's `apiKeyEnv` at another host. This
+ * is the file-layer twin of the flag rule in {@link resolveCliOptions}.
+ * Gateway-level keys (account, gateway ID, token variable) and every other
+ * setting are inherited as before.
+ */
+export function mergeConfigLayers(lower: CliConfigFile, higher: CliConfigFile): CliConfigFile {
+  const inherited: Record<string, unknown> = { ...lower };
+  const drop = (keys: readonly (keyof CliConfigFile)[]): void => {
+    for (const key of keys) delete inherited[key];
+  };
+  if (higher.provider !== undefined && higher.provider !== (lower.provider ?? DEFAULT_CONFIG.provider)) {
+    drop(PROVIDER_COUPLED_KEYS);
+  }
+  if (higher.gateway !== undefined && higher.gateway !== (lower.gateway ?? DEFAULT_CONFIG.gateway)) {
+    drop(GATEWAY_COUPLED_KEYS);
+  }
+  if (higher.model !== undefined && higher.model !== configuredModelOf(lower)) {
+    drop(MODEL_COUPLED_KEYS);
+  }
+  return { ...(inherited as CliConfigFile), ...higher };
+}
+
+/**
+ * The user configuration as the CLI reads it, or `{}` when there is none.
+ * Used by `init` to describe what a project configuration will inherit.
+ */
+export async function readUserConfig(homeDirectory = homedir()): Promise<CliConfigFile> {
+  const userPath = path.join(homeDirectory, '.config', 'open-ocr-cli', 'config.json');
+  return readConfigFile(userPath, false, userPath, true);
 }
 
 /**
@@ -431,7 +505,10 @@ export async function loadMcpCallerConfig(
   // configPath, so over MCP the same price rule applies to it.
   assertMcpConfigDoesNotPrice(project, '.open-ocr-cli.json');
   await assertProjectOutputStaysInProject(project, cwd);
-  const fileConfig = withOperatorPricesOnlyForOperatorModel({ ...user, ...project, ...explicit }, user);
+  const fileConfig = withOperatorPricesOnlyForOperatorModel(
+    mergeConfigLayers(mergeConfigLayers(user, project), explicit),
+    user,
+  );
   return {
     fileConfig,
     ceilings,
@@ -607,8 +684,9 @@ export function localEnvironment(cwd: string, disabled = false): NodeJS.ProcessE
   // passes an explicit config path for option resolution.
   if (disabled || environmentDisablesConfig()) return { ...process.env };
   const envPath = path.join(cwd, '.env');
-  if (!existsSync(envPath)) return { ...process.env };
-  const parsed = parseEnv(readFileSync(envPath, 'utf8'));
+  const contents = readProjectEnvFile(envPath);
+  if (contents === undefined) return { ...process.env };
+  const parsed = parseEnv(contents);
   const environment: NodeJS.ProcessEnv = { ...process.env };
   // Values already in the environment win, matching `process.loadEnvFile`.
   for (const name of PROJECT_ENV_CREDENTIALS) {
@@ -626,18 +704,72 @@ export function localEnvironment(cwd: string, disabled = false): NodeJS.ProcessE
   return environment;
 }
 
+// Absent on Windows, where FIFOs cannot be opened this way in the first place.
+const O_NONBLOCK: number = (fsConstants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0;
+
+/**
+ * Read the project `.env`, or `undefined` when there is none to read.
+ *
+ * Opened non-blocking and checked through the same descriptor, like every
+ * other file the MCP server reads (see `openRegularFile`): a FIFO named `.env`
+ * would otherwise block this synchronous read, and with it the whole event
+ * loop of a long-lived server, and a symbolic link to a device never reaches
+ * end of file. Anything that is not a regular file is skipped with a warning.
+ */
+function readProjectEnvFile(envPath: string): string | undefined {
+  let descriptor: number;
+  try {
+    descriptor = openSync(envPath, fsConstants.O_RDONLY | O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw configFileError(error, envPath) ?? configurationError(`Project .env is not readable: ${envPath}`);
+  }
+  try {
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile()) {
+      process.stderr.write(`${envPath}: ignoring .env because it is not a regular file\n`);
+      return undefined;
+    }
+    if (metadata.size > MAX_CONFIG_BYTES) {
+      throw configurationError(`Project .env exceeds the 1 MB limit: ${envPath}`);
+    }
+    return readFileSync(descriptor, 'utf8');
+  } catch (error) {
+    if (error instanceof CliExitError) throw error;
+    throw configFileError(error, envPath) ?? configurationError(`Project .env is not readable: ${envPath}`);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export function credentialSetupGuidance(apiKeyEnv: string, cwd: string, provider = 'provider'): string {
+  // A project .env supplies only the default credential variables (see
+  // localEnvironment); advising any other name there sends the user round in
+  // circles, because the entry is dropped without a word.
+  const projectLine = PROJECT_ENV_CREDENTIALS.includes(apiKeyEnv)
+    ? `  Project:      add ${apiKeyEnv}=your-key to ${path.join(cwd, '.env')} (keep it out of version control)`
+    : `  A project .env can supply only ${PROJECT_ENV_CREDENTIALS.join(', ')}; `
+      + `export ${apiKeyEnv} in your shell or the MCP server environment instead.`;
   return [
     `Set ${apiKeyEnv} with your ${provider} API key before running extraction:`,
     `  macOS/Linux: export ${apiKeyEnv}="your-key"`,
     `  PowerShell:   $env:${apiKeyEnv}="your-key"`,
-    `  Project:      add ${apiKeyEnv}=your-key to ${path.join(cwd, '.env')} (keep it out of version control)`,
+    projectLine,
     'Then run: open-ocr-cli doctor (agents: doctor --json emits the same checks machine-readably)',
   ].join('\n');
 }
 
+/**
+ * `Number('')` is 0, so a blank `--retries ""` or `--requests-per-minute ""`
+ * silently became 0 (no retries, no rate limit). A blank value is an error.
+ */
+function assertNotBlank(value: string | number, label: string): void {
+  if (typeof value === 'string' && value.trim() === '') throw configurationError(`${label} cannot be empty`);
+}
+
 function integer(value: string | number | undefined, fallback: number, label: string, min: number, max: number): number {
   if (value === undefined) return fallback;
+  assertNotBlank(value, label);
   const parsed = typeof value === 'number' ? value : Number(value);
   if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
     throw configurationError(`${label} must be an integer from ${min} to ${max}`);
@@ -647,6 +779,7 @@ function integer(value: string | number | undefined, fallback: number, label: st
 
 function numberInRange(value: string | number | undefined, fallback: number, label: string, min: number, max: number): number {
   if (value === undefined) return fallback;
+  assertNotBlank(value, label);
   const parsed = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
     throw configurationError(`${label} must be between ${min} and ${max}`);
@@ -679,6 +812,12 @@ function oneOf<T extends string>(value: string | undefined, allowed: readonly T[
  * Options with no request field name their configuration-file key instead.
  */
 export type OptionVocabulary = 'flag' | 'field';
+
+/** C0 and C1 controls, U+2028/U+2029, and the bidirectional formatting characters. */
+// eslint-disable-next-line no-control-regex
+const MODEL_ID_FORBIDDEN_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+/** Far above any real model ID; matches `provider.model` maxLength in request-v2. */
+const MAX_MODEL_ID_LENGTH = 256;
 
 const OPTION_NAMES = {
   provider: ['--provider', 'provider.id'],
@@ -714,11 +853,16 @@ export function resolveCliOptions(
   env: NodeJS.ProcessEnv = process.env,
 ): ResolvedCliOptions {
   const name = (key: keyof typeof OPTION_NAMES): string => OPTION_NAMES[key][vocabulary === 'flag' ? 0 : 1];
+  // An exported-but-empty variable (`-e OPEN_OCR_MODEL=${MODEL}` with MODEL
+  // unset, a CI `${{ vars.X }}` that is not defined) means "not set", not "set
+  // to the empty string": it must neither fail the run nor override a value
+  // from the configuration file.
+  const envValue = (variable: string): string | undefined => env[variable]?.trim() || undefined;
   // OPEN_OCR_* variables are a layer of their own between flags and files. An
   // error about one names the variable: the caller never typed the flag, and
   // "fix --model" sends them looking in the wrong place.
-  const envProvider = env.OPEN_OCR_PROVIDER;
-  const envGateway = env.OPEN_OCR_GATEWAY;
+  const envProvider = envValue('OPEN_OCR_PROVIDER');
+  const envGateway = envValue('OPEN_OCR_GATEWAY');
   const configuredProvider = fileConfig.provider ?? DEFAULT_CONFIG.provider;
   const selectedProvider = flags.provider ?? envProvider;
   const provider = oneOf<ProviderId>(
@@ -743,7 +887,7 @@ export function resolveCliOptions(
   // `kimi/gemini-3.8-flash` validates locally and fails upstream.
   const envContextMatches = flags.provider === undefined
     || flags.provider === (envProvider ?? configuredProvider);
-  const envModel = envContextMatches ? env.OPEN_OCR_MODEL : undefined;
+  const envModel = envContextMatches ? envValue('OPEN_OCR_MODEL') : undefined;
   const selectedModel = flags.model ?? envModel;
   const configuredModel = providerContextMatches
     ? fileConfig.model ?? providerDefaultModel(provider)
@@ -752,14 +896,30 @@ export function resolveCliOptions(
     ?? configuredModel
     ?? providerDefaultModel(provider);
   const modelLabel = flags.model === undefined && envModel !== undefined ? 'OPEN_OCR_MODEL' : name('model');
-  if (!model) throw configurationError(`${modelLabel} is required for the openai-compatible provider`);
+  if (!model) {
+    throw configurationError(provider === 'openai-compatible'
+      ? `${modelLabel} is required for the openai-compatible provider`
+      : `${modelLabel} cannot be empty`);
+  }
+  // The model ID is echoed into prompts a person reads before approving a run
+  // (the MCP confirmation) and into logs. No real model ID contains a control,
+  // line-separator, or bidirectional-formatting character, and any of them
+  // lets the ID forge or reorder the surrounding text.
+  if (MODEL_ID_FORBIDDEN_CHARACTERS.test(model)) {
+    throw configurationError(
+      `${modelLabel} contains a control, line-separator, or bidirectional-formatting character`,
+    );
+  }
+  if (model.length > MAX_MODEL_ID_LENGTH) {
+    throw configurationError(`${modelLabel} exceeds ${MAX_MODEL_ID_LENGTH} characters`);
+  }
   if (provider === 'gemini' && !GEMINI_MODELS.includes(model as (typeof GEMINI_MODELS)[number])) {
     throw configurationError(`${modelLabel} must be one of: ${SUPPORTED_MODELS.join(', ')}`);
   }
   const modelContextMatches = providerContextMatches
     && (selectedModel === undefined || selectedModel === configuredModel);
   const envThinking = envContextMatches && (flags.model === undefined || flags.model === (envModel ?? configuredModel))
-    ? env.OPEN_OCR_THINKING
+    ? envValue('OPEN_OCR_THINKING')
     : undefined;
   const configuredThinking = flags.thinking
     ?? envThinking
@@ -796,8 +956,14 @@ export function resolveCliOptions(
   if (!isKimiK3 && provider !== 'openrouter' && !(provider === 'muse' && ['muse-spark-1.3', 'muse-wonder-1.0'].includes(model)) && thinking === 'MAX') {
     throw configurationError(`${thinkingLabel} max is supported by Kimi K3/K3.1, Muse Spark 1.3 Standard, Muse Wonder, and model-dependent OpenRouter routes`);
   }
-  if (provider !== 'openrouter' && provider !== 'muse' && thinking === 'XHIGH') {
-    throw configurationError(`${thinkingLabel} xhigh is supported by Muse and model-dependent OpenRouter routes`);
+  const knownThinking = knownModelThinkingLevels(provider, model);
+  // Models with a verified contract (Gemini 4 Hydrogen and Neon, for one) say
+  // for themselves whether they take xhigh; the check after the Kimi rules
+  // refuses it for those that do not.
+  if (provider !== 'openrouter' && provider !== 'muse' && knownThinking === undefined && thinking === 'XHIGH') {
+    throw configurationError(
+      `${thinkingLabel} xhigh is supported by Muse, models whose thinking levels include it, and model-dependent OpenRouter routes`,
+    );
   }
   if (isKimiK3 && thinking === 'MEDIUM') {
     throw configurationError(`Kimi K3 supports ${thinkingLabel} low, high, or max; medium would be an ambiguous silent upgrade`);
@@ -808,7 +974,6 @@ export function resolveCliOptions(
   if (isKimiK3 && thinking === 'MINIMAL') {
     thinking = 'LOW';
   }
-  const knownThinking = knownModelThinkingLevels(provider, model);
   if (knownThinking && !knownThinking.includes(thinking)) {
     throw configurationError(`${model} supports ${thinkingLabel} ${knownThinking.map((level) => level.toLowerCase()).join(', ')}; ${thinking.toLowerCase()} is not supported`);
   }
@@ -858,10 +1023,10 @@ export function resolveCliOptions(
   );
 
   const cloudflareAccountId = flags.cloudflareAccountId
-    ?? env.CLOUDFLARE_ACCOUNT_ID
+    ?? envValue('CLOUDFLARE_ACCOUNT_ID')
     ?? fileConfig.cloudflareAccountId;
   const cloudflareGatewayId = flags.cloudflareGatewayId
-    ?? env.CLOUDFLARE_AI_GATEWAY_ID
+    ?? envValue('CLOUDFLARE_AI_GATEWAY_ID')
     ?? fileConfig.cloudflareGatewayId;
   const cloudflareProvider = flags.cloudflareProvider
     ?? (providerContextMatches ? fileConfig.cloudflareProvider : undefined);
@@ -956,6 +1121,7 @@ export function resolveCliOptions(
     inputPricePerMillionUsd,
     outputPricePerMillionUsd,
     thinking,
+    thinkingExplicit: configuredThinking !== undefined,
     // Thought summaries are an agent progress surface. Simple/template/web
     // extraction has no consumer for them, so requesting hidden summaries
     // would only spend output tokens without changing the returned artifact.

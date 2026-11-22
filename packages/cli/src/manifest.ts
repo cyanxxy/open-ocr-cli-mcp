@@ -57,10 +57,13 @@ export function parseUsageSnapshot(value: unknown, label: string): ProviderUsage
     || !Number.isFinite(record.estimatedCostUsd)
     || record.estimatedCostUsd < 0
     || (record.unreportedUsageRequests !== undefined && !isNonNegativeInteger(record.unreportedUsageRequests))
+    || (record.unmeteredPaidRequests !== undefined && !isNonNegativeInteger(record.unmeteredPaidRequests))
   ) {
     throw batchMetadataError(`${label} is invalid`);
   }
   const unreported = record.unreportedUsageRequests;
+  // Absent in manifests written by earlier releases, which read as 0.
+  const unmeteredPaid = record.unmeteredPaidRequests;
   return {
     requests: record.requests as number,
     inputTokens: record.inputTokens as number,
@@ -71,6 +74,7 @@ export function parseUsageSnapshot(value: unknown, label: string): ProviderUsage
     totalTokens: record.totalTokens as number,
     estimatedCostUsd: record.estimatedCostUsd,
     ...(unreported ? { unreportedUsageRequests: unreported } : {}),
+    ...(unmeteredPaid ? { unmeteredPaidRequests: unmeteredPaid } : {}),
   };
 }
 
@@ -81,6 +85,7 @@ export function addUsageSnapshots(
 ): ProviderUsageSnapshot {
   if (!left) return { ...right };
   const unreported = (left.unreportedUsageRequests ?? 0) + (right.unreportedUsageRequests ?? 0);
+  const unmeteredPaid = (left.unmeteredPaidRequests ?? 0) + (right.unmeteredPaidRequests ?? 0);
   return {
     requests: left.requests + right.requests,
     inputTokens: left.inputTokens + right.inputTokens,
@@ -91,6 +96,7 @@ export function addUsageSnapshots(
     totalTokens: left.totalTokens + right.totalTokens,
     estimatedCostUsd: Number((left.estimatedCostUsd + right.estimatedCostUsd).toFixed(8)),
     ...(unreported > 0 ? { unreportedUsageRequests: unreported } : {}),
+    ...(unmeteredPaid > 0 ? { unmeteredPaidRequests: unmeteredPaid } : {}),
   };
 }
 

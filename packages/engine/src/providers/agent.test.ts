@@ -348,7 +348,7 @@ describe('provider agent loop', () => {
       { name: 'form.png', type: 'image/png' },
       'data:image/png;base64,AA==',
       config,
-      { maxIterations: 1, confidenceThreshold: 0.8, maxTokens: 4096 },
+      { maxIterations: 1, confidenceThreshold: 0.8, maxTokens: 4096, pageCount: 3 },
       cropper,
     );
     let state = await generator.next();
@@ -358,9 +358,11 @@ describe('provider agent loop', () => {
       state = await generator.next();
     }
 
-    expect(cropper).toHaveBeenCalledWith('data:image/png;base64,AA==', 'image/png', region);
+    // The run's abort signal reaches the cropper so a cancelled run stops rendering.
+    expect(cropper).toHaveBeenCalledWith('data:image/png;base64,AA==', 'image/png', region, expect.any(AbortSignal));
     expect(steps.filter((step) => step.functionResult?.success === false)).toEqual([]);
     expect(state.value.stopReason).toBe('succeeded');
+    expect(state.value.documentAnalysis.pageCount).toBe(3);
     expect(state.value.extractedFields.account_number).toMatchObject({
       value: 'AC-42',
       confidence: 0.99,

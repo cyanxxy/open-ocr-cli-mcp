@@ -210,7 +210,8 @@ function providerErrorFromRecord(
   const status = typeof error?.status === 'number'
     ? error.status
     : numericCode ?? fallbackStatus;
-  const message = typeof error?.message === 'string'
+  // An empty provider message would leave the error with nothing to report.
+  const message = typeof error?.message === 'string' && error.message.trim()
     ? error.message
     : fallbackMessage;
   const type = typeof error?.type === 'string' && error.type ? error.type : undefined;
@@ -239,7 +240,34 @@ function nestedSystemErrorCode(error: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * undici's own headers/body timeouts (300 s by default in Node's fetch). They
+ * fire locally while the provider may still be generating, and billing, the
+ * response, so re-sending the request would pay for the same work twice.
+ */
+const LOCAL_TRANSPORT_TIMEOUT_CODES: ReadonlySet<string> = new Set([
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
+/** True when the cause chain holds an undici headers or body timeout. */
+export function isLocalTransportTimeoutError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (!isRecord(current)) break;
+    if (typeof current.code === 'string' && LOCAL_TRANSPORT_TIMEOUT_CODES.has(current.code.toUpperCase())) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
 function isRetryableNetworkError(error: unknown): boolean {
+  if (isLocalTransportTimeoutError(error)) return false;
   const code = nestedSystemErrorCode(error);
   if (code && [
     'EAI_AGAIN',
@@ -365,6 +393,14 @@ function reasoningBody(config: ProviderRuntimeConfig): Record<string, unknown> {
     return isKimiK3Route(config.provider, config.model) ? { reasoning_effort: kimiK3Effort() } : {};
   }
   if (config.provider === 'openrouter') {
+    // A route with no known reasoning contract may not reason at all, and its
+    // endpoints then do not list `reasoning` in supported_parameters. Schema and
+    // tool requests set `provider.require_parameters`, so sending it would leave
+    // no endpoint to route to. Such routes keep their own default unless the
+    // user chose a level explicitly.
+    if (!allowed && !isKimiK3Route(config.provider, config.model) && config.thinkingConfig?.explicit !== true) {
+      return {};
+    }
     return {
       // OpenRouter requires reasoning_details to be replayed unchanged during
       // tool use. Visibility is handled by progress policy, never transport.
@@ -761,8 +797,24 @@ async function streamedChatCompletion(
   let usage: unknown;
   let lastChunk: Record<string, unknown> = {};
   let receivedDone = false;
+  // Set once a chunk carries a choice: the provider started generating, and it
+  // bills those tokens even when the stream then fails or is cut off.
+  let generationStarted = false;
+  let usageRecorded = false;
   const annotations: unknown[] = [];
   let eventDataLines: string[] = [];
+
+  /**
+   * Record this response's usage exactly once. A stream that started
+   * generating but carried no usage is counted as unreported, which closes a
+   * paid `--max-cost` gate. A stream that failed before generating anything
+   * records nothing, like a non-200 response.
+   */
+  const recordStreamUsage = (): void => {
+    if (usageRecorded || (!generationStarted && usage === undefined)) return;
+    usageRecorded = true;
+    recordProviderUsage(usage !== undefined ? { usage } : {}, config, config.runtime);
+  };
 
   const consume = (data: string): void => {
     if (!data) return;
@@ -781,10 +833,11 @@ async function streamedChatCompletion(
     if (!isRecord(parsed)) return;
     lastChunk = parsed;
     if (parsed.usage !== undefined) usage = parsed.usage;
+    const choice = Array.isArray(parsed.choices) ? parsed.choices.find(isRecord) : undefined;
+    if (choice) generationStarted = true;
     if (isRecord(parsed.error)) {
       throw providerErrorFromRecord(parsed.error, 'Provider reported a streaming error');
     }
-    const choice = Array.isArray(parsed.choices) ? parsed.choices.find(isRecord) : undefined;
     if (!choice) return;
     // Kimi, OpenRouter, and OpenAI report final streaming usage at the chunk
     // root, on a last chunk whose `choices` is empty (handled above). Older
@@ -877,10 +930,10 @@ async function streamedChatCompletion(
     } catch {
       // Preserve the provider/protocol failure when transport cleanup also fails.
     }
-    if (usage !== undefined) recordProviderUsage({ usage }, config, config.runtime);
+    recordStreamUsage();
     throw error;
   }
-  if (usage !== undefined) recordProviderUsage({ usage }, config, config.runtime);
+  recordStreamUsage();
   if (config.provider === 'kimi' && !receivedDone) {
     throw new ProviderApiError(
       'Kimi stream ended without the terminal [DONE] marker and may be incomplete',
@@ -917,8 +970,15 @@ async function streamedChatCompletion(
     ...(reasoningDetails.length ? { reasoning_details: reasoningDetails } : {}),
     ...(annotations.length ? { annotations } : {}),
   };
+  // Same order as the non-streaming path: a refusal first, then the finish
+  // reason, so a reasoning-only stream that hit the token limit (or a content
+  // filter) is reported as that, not as an empty response.
+  if (!text && completedToolCalls.length === 0 && refusal.trim()) throw refusalError(refusal.trim());
+  assertFinishReason(finishReason);
+  if (finishReason === 'tool_calls' && completedToolCalls.length === 0) {
+    throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
+  }
   if (!text && completedToolCalls.length === 0) {
-    if (refusal.trim()) throw refusalError(refusal.trim());
     throw new ProviderApiError('Provider returned an empty response');
   }
   const raw = {
@@ -926,11 +986,6 @@ async function streamedChatCompletion(
     choices: [{ message: rawMessage, finish_reason: finishReason ?? null }],
     ...(usage !== undefined ? { usage } : {}),
   };
-  if (usage === undefined) recordProviderUsage(raw, config, config.runtime);
-  assertFinishReason(finishReason);
-  if (finishReason === 'tool_calls' && completedToolCalls.length === 0) {
-    throw new ProviderApiError('Provider ended with tool_calls but returned no tool calls');
-  }
   return { text, message: parseAssistantMessage(rawMessage), finishReason, raw };
 }
 

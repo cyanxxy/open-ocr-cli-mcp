@@ -71,7 +71,10 @@ describe('machine request execution', () => {
     expect(input.destroyed).toBe(true);
   });
 
-  it('loads only the explicit config when execution disables ambient config', async () => {
+  it('loads only the explicit config under ambient OPEN_OCR_NO_CONFIG', async () => {
+    // Ambient hermetic mode may still load one explicit file; `run --no-config`
+    // (execution.noConfig) refuses a configPath instead.
+    process.env.OPEN_OCR_NO_CONFIG = '1';
     await writeFile(path.join(directory, 'invoice.jpg'), JPEG_BYTES);
     await writeFile(path.join(directory, 'agent-config.json'), JSON.stringify({
       concurrency: 7,
@@ -94,7 +97,6 @@ describe('machine request execution', () => {
       cwd: directory,
       runId: 'explicit-config-hermetic-run',
       abortController: new AbortController(),
-      noConfig: true,
     });
 
     expect(execution.summary).toMatchObject({
@@ -183,6 +185,7 @@ describe('machine request execution', () => {
     await writeFile(path.join(directory, 'card.png'), JPEG_BYTES);
     // The preset arrives from file configuration, so the request itself parses
     // cleanly and only the merged view can catch the combination.
+    process.env.OPEN_OCR_NO_CONFIG = '1';
     await writeFile(path.join(directory, 'agent-config.json'), JSON.stringify({
       mode: 'template',
       preset: 'business-card',
@@ -201,7 +204,6 @@ describe('machine request execution', () => {
         cwd: directory,
         runId: 'csv-record-preset-run',
         abortController: new AbortController(),
-        noConfig: true,
       });
     } catch (error) {
       thrown = error;

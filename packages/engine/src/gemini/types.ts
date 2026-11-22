@@ -204,11 +204,16 @@ export interface PresetStreamingCallbacks {
 }
 
 /**
- * Available Gemini models used by this app.
+ * Available Gemini models used by this app. The first entry is the default.
+ * Gemini 4 Carbon, Hydrogen and Neon IDs match the @google/genai 3.6.1 model
+ * enum (2026-11-21).
  */
 export const GEMINI_MODELS = [
   'gemini-3.8-flash',
   'gemini-4-argon',
+  'gemini-4-carbon',
+  'gemini-4-hydrogen',
+  'gemini-4-neon',
   'gemini-3.5-flash-lite',
 ] as const;
 
@@ -218,12 +223,14 @@ export type GeminiModel = (typeof GEMINI_MODELS)[number];
  * Provider-neutral reasoning effort (uppercase in host config; lowercased at wire).
  * - MINIMAL: Lightest reasoning (3.5 Flash-Lite default)
  * - LOW: Light reasoning, faster response
- * - MEDIUM: Balanced reasoning (3.8 Flash and 4 Argon default)
- * - HIGH: Full reasoning (best for hard agent tasks)
- * - XHIGH / MAX: Compatible-provider efforts; CLI validation keeps them away from Gemini
+ * - MEDIUM: Balanced reasoning (3.8 Flash, 4 Argon and 4 Carbon default)
+ * - HIGH: Full reasoning (4 Hydrogen and 4 Neon default)
+ * - XHIGH: Deepest Gemini reasoning, on 4 Hydrogen and 4 Neon only
+ * - MAX: Compatible-provider effort; never valid for Gemini
  *
- * Official support:
- * - Gemini 3.8 Flash and 4 Argon: LOW, MEDIUM, HIGH
+ * Official support (the table in providers/registry.ts is authoritative):
+ * - Gemini 3.8 Flash, 4 Argon and 4 Carbon: LOW, MEDIUM, HIGH
+ * - Gemini 4 Hydrogen and 4 Neon: LOW, MEDIUM, HIGH, XHIGH
  * - Gemini 3.5 Flash-Lite: MINIMAL, LOW, MEDIUM, HIGH
  */
 export type ThinkingLevel = 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH' | 'MAX';

@@ -93,6 +93,38 @@ describe('agentSchema', () => {
     expect(normalizeAgentDocumentType('Invoice')).toBe('invoice');
   });
 
+  it.each([
+    ['Tax Invoice', 'invoice'], ['Commercial Invoice', 'invoice'], ['Sales Receipt', 'receipt'],
+    ['Resume/CV', 'resume'], ['Business Card Scan', 'business card'], ['Rental Agreement', 'contract'],
+  ])('resolves the qualified label %s through its words', (label, expected) => {
+    expect(normalizeAgentDocumentType(label)).toBe(expected);
+  });
+
+  it.each([
+    ['Invoice Receipt', 'invoice receipt'], ['Bill of Lading', 'bill of lading'], ['Annual Report', 'annual report'],
+  ])('keeps the ambiguous or unrelated label %s schema-less', (label, expected) => {
+    expect(normalizeAgentDocumentType(label)).toBe(expected);
+    expect(getAgentDocumentSchema(label)).toBeNull();
+  });
+
+  it('applies required fields to a qualified invoice label', () => {
+    const data = snapshot('Tax Invoice', {
+      vendor_name: { value: 'Northwind', confidence: 0.95, isValid: true },
+    });
+    expect(evaluateAgentCompletion(data, 0.95, 0.8)).toEqual({
+      complete: false, reason: 'missing-required-fields',
+    });
+  });
+
+  it('keeps separate facts as separate canonical fields', () => {
+    expect(normalizeAgentFieldName('invoice', 'amount_due')).toBe('amount_due');
+    expect(normalizeAgentFieldName('receipt', 'transaction_time')).toBe('transaction_time');
+    expect(normalizeAgentFieldName('resume', 'certifications')).toBe('certifications');
+    expect(getAgentDocumentSchema('invoice')?.optionalFields).toContain('amount_due');
+    expect(getAgentDocumentSchema('receipt')?.optionalFields).toContain('transaction_time');
+    expect(getAgentDocumentSchema('resume')?.optionalFields).toContain('certifications');
+  });
+
   it('maps alias field names to canonical schema names', () => {
     expect(normalizeAgentFieldName('business card', 'email_address')).toBe('email');
     expect(normalizeAgentFieldName('invoice', 'grand-total')).toBe('total_amount');

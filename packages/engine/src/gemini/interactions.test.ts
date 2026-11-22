@@ -209,9 +209,10 @@ describe('runModelInteraction', () => {
       { kind: 'model_output', text: 'ished', stepId: 'interaction-stream:1' },
     ]);
     expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
+    // SDK retries are off: retry policy stays behind the engine's rate gate.
     expect(mockInteractionCreate).toHaveBeenCalledWith(
       expect.objectContaining({ stream: true }),
-      undefined,
+      { retries: { strategy: 'none' } },
     );
   });
 
@@ -241,10 +242,10 @@ describe('runModelInteraction', () => {
       input: 'Extract text',
       runtime,
       onProgress: () => undefined,
-    })).rejects.toThrow('reached the output token limit');
+    })).rejects.toThrow('per-request output limit');
     expect(mockInteractionCreate).toHaveBeenCalledWith(
       expect.objectContaining({ stream: true, automatic_continuation: false }),
-      undefined,
+      { retries: { strategy: 'none' } },
     );
     // The billed hop is still accounted for.
     expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 12 });
@@ -261,8 +262,9 @@ describe('runModelInteraction', () => {
       apiKey: 'test-key',
       model: 'gemini-3.8-flash',
       input: 'Extract text',
-    })).rejects.toThrow('reached the output token limit');
+    })).rejects.toThrow(/per-request output limit(?!.*Increase the output-token limit)/u);
     expect(mockInteractionCreate.mock.calls[0]?.[0]).toMatchObject({ stream: false, automatic_continuation: false });
+    expect(mockInteractionCreate.mock.calls[0]?.[1]).toEqual({ retries: { strategy: 'none' } });
   });
 
   it('preserves output_text supplied only by the terminal streaming event', async () => {

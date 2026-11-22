@@ -70,15 +70,104 @@ function assertSupportedSchemaNode(value: unknown, pointer: string, depth: numbe
   }
 }
 
+/** Decode one JSON Pointer reference token. */
+function pointerToken(token: string): string {
+  return decodeURIComponent(token).replace(/~1/gu, '/').replace(/~0/gu, '~');
+}
+
+/**
+ * Refuse a `$ref` that leads back to a schema it is already applying to the
+ * same value, such as a root `{"$ref":"#"}` or `anyOf: [{"$ref":"#"}]`.
+ * Validating with one recurses without end, and it would only fail (with a
+ * stack overflow) after the provider call had been billed. A reference that
+ * first descends into the value (`properties`, `items`, `prefixItems`,
+ * `additionalProperties`) is ordinary recursion and stays allowed.
+ */
+function assertNoSameValueRefCycle(root: Record<string, unknown>): void {
+  const anchors = new Map<string, unknown>();
+  const collect = (value: unknown, depth: number): void => {
+    if (!isRecord(value) || depth > 64) return;
+    if (typeof value.$anchor === 'string') anchors.set(value.$anchor, value);
+    for (const key of ['$defs', 'properties'] as const) {
+      const children = value[key];
+      if (isRecord(children)) for (const child of Object.values(children)) collect(child, depth + 1);
+    }
+    for (const key of ['items', 'additionalProperties'] as const) collect(value[key], depth + 1);
+    for (const key of ['prefixItems', 'anyOf', 'oneOf'] as const) {
+      const children = value[key];
+      if (Array.isArray(children)) for (const child of children) collect(child, depth + 1);
+    }
+  };
+  collect(root, 0);
+  const resolve = (reference: string): unknown => {
+    if (reference === '#') return root;
+    if (!reference.startsWith('#/')) return anchors.get(reference.slice(1));
+    let current: unknown = root;
+    for (const token of reference.slice(2).split('/')) {
+      if (Array.isArray(current)) current = current[Number(pointerToken(token))];
+      else if (isRecord(current)) current = current[pointerToken(token)];
+      else return undefined;
+    }
+    return current;
+  };
+  // Depth-first over the edges that keep the same value: `$ref`, `anyOf`, `oneOf`.
+  const done = new Set<unknown>();
+  const visit = (node: unknown, path: Set<unknown>): void => {
+    if (!isRecord(node) || done.has(node)) return;
+    if (path.has(node)) {
+      throw new Error(
+        'Invalid JSON Schema: a "$ref" leads back to a schema that already applies to the same value, so validation would never end',
+      );
+    }
+    path.add(node);
+    if (typeof node.$ref === 'string') visit(resolve(node.$ref), path);
+    for (const key of ['anyOf', 'oneOf'] as const) {
+      const children = node[key];
+      if (Array.isArray(children)) for (const child of children) visit(child, path);
+    }
+    path.delete(node);
+    done.add(node);
+  };
+  const walk = (value: unknown, depth: number): void => {
+    if (!isRecord(value) || depth > 64) return;
+    visit(value, new Set());
+    for (const key of ['$defs', 'properties'] as const) {
+      const children = value[key];
+      if (isRecord(children)) for (const child of Object.values(children)) walk(child, depth + 1);
+    }
+    for (const key of ['items', 'additionalProperties'] as const) walk(value[key], depth + 1);
+    for (const key of ['prefixItems', 'anyOf', 'oneOf'] as const) {
+      const children = value[key];
+      if (Array.isArray(children)) for (const child of children) walk(child, depth + 1);
+    }
+  };
+  walk(root, 0);
+}
+
 function compileSchema(schema: Record<string, unknown>): CustomSchemaValidator {
   const cached = validators.get(schema);
   if (cached) return cached;
   // Schemas belong to one extraction request. A shared Ajv registry rejects
   // repeated $id values and strongly retains every schema in a long-lived MCP
   // process, even when this outer cache uses weak keys.
-  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  //
+  // Unknown keywords are already refused by assertSupportedSchemaNode, and Ajv's
+  // strictSchema still refuses the rest. strictTypes, strictTuples and
+  // strictRequired are off: they rejected valid schemas in the documented
+  // subset (an open `prefixItems` tuple, `anyOf: [{required: [...]}]`,
+  // `minimum` without `type`) with Ajv option names the caller cannot act on.
+  const ajv = new Ajv2020({
+    allErrors: true,
+    strict: true,
+    strictTypes: false,
+    strictTuples: false,
+    strictRequired: false,
+  });
   addFormats(ajv);
   ajv.addKeyword({ keyword: 'propertyOrdering', schemaType: 'array' });
+  // Ajv resolves `$anchor` references but does not register the keyword, so
+  // strict mode refused the anchor the subset advertises.
+  ajv.addKeyword('$anchor');
   const validate = ajv.compile(schema);
   const compiled = { ajv, validate };
   validators.set(schema, compiled);
@@ -102,6 +191,7 @@ export function validateCustomSchema(value: unknown): Record<string, unknown> {
   }
   const schema = JSON.parse(serialized) as Record<string, unknown>;
   assertSupportedSchemaNode(schema, '#', 0);
+  assertNoSameValueRefCycle(schema);
   // Accept `$schema` as document metadata, but omit it from provider requests.
   delete schema.$schema;
   try {

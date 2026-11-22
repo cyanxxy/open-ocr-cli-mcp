@@ -54,6 +54,12 @@ describe('olmOCR-style unit tests', () => {
     expect(runOcrUnitTest({ id: 'd', type: 'table', cell: 'Net total', right: '9' }, lineBreak)).toBe(true);
   });
 
+  it.each(['&#x110000;', '&#99999999;', '&#xD800;', '&#0;'])('decodes the invalid character reference %s as U+FFFD instead of throwing', (entity) => {
+    const html = `<table><tr><td>Total</td><td>${entity}</td></tr></table>`;
+    expect(() => scoreOcrUnitTests([{ id: 't', type: 'table', cell: 'Total' }], html)).not.toThrow();
+    expect(runOcrUnitTest({ id: 'r', type: 'table', cell: 'Total', right: '\ufffd' }, html)).toBe(true);
+  });
+
   it('scores the pass rate across tests and validates the stored shape', () => {
     const tests = [
       { id: 'a', type: 'present', text: 'Annual Report' },

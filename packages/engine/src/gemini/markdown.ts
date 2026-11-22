@@ -105,10 +105,25 @@ export function stripReasoningBlocks(text: string): string {
  */
 export function normalizeModelMarkdown(text: string): string {
   const lf = text.replace(/\r\n?/gu, '\n');
-  return stripReasoningBlocks(lf)
-    .replace(/^(?:[ \t]*\n)+/u, '')
-    .replace(/(?:\n[ \t]*)+$/u, '')
+  return trimTrailingBlankLines(stripReasoningBlocks(lf).replace(/^(?:[ \t]*\n)+/u, ''))
     .replace(/^[ \t]+$/u, '');
+}
+
+/**
+ * Drop trailing blank (whitespace-only) lines, keeping trailing spaces on the
+ * last non-blank line. Same result as `.replace(/(?:\n[ \t]*)+$/u, '')`, but a
+ * backward scan: that regex retries at every newline of a blank run that more
+ * text follows, which is quadratic in the run length.
+ */
+function trimTrailingBlankLines(text: string): string {
+  let cut = text.length;
+  for (;;) {
+    let scan = cut;
+    while (scan > 0 && (text[scan - 1] === ' ' || text[scan - 1] === '\t')) scan -= 1;
+    if (scan === 0 || text[scan - 1] !== '\n') break;
+    cut = scan - 1;
+  }
+  return text.slice(0, cut);
 }
 
 const ATX_HEADING = /^ {0,3}(#{1,6})(?=[ \t]|$)(.*)$/u;

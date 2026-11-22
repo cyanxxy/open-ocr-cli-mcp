@@ -14,6 +14,7 @@ import {
   PROVIDER_PROFILES,
   createChatCompletion,
   createProviderExecutionContext,
+  knownModelThinkingLevels,
   providerDefaultApiKeyEnv,
   providerDefaultBaseUrl,
   providerDefaultModel,
@@ -30,6 +31,8 @@ import {
   cliThinkingLevels,
   credentialSetupGuidance,
   defaultCliThinkingLevel,
+  mergeConfigLayers,
+  readUserConfig,
 } from './config';
 import { asCliExitError, CliExitError } from './errors';
 import {
@@ -186,7 +189,18 @@ async function writeConfig(configPath: string, config: CliConfigFile): Promise<v
   }
 }
 
-export async function validateProviderCredentials(config: ProviderRuntimeConfig): Promise<void> {
+/**
+ * The process-wide fetch dispatcher has no header or body timeout (see
+ * providerRuntime.ts), so the credential probe brings its own deadline: an
+ * endpoint that accepts the connection and never answers must not hang
+ * `init` or `doctor --check-credentials`.
+ */
+export const CREDENTIAL_PROBE_TIMEOUT_MS = 60_000;
+
+export async function validateProviderCredentials(
+  config: ProviderRuntimeConfig,
+  timeoutMs = CREDENTIAL_PROBE_TIMEOUT_MS,
+): Promise<void> {
   const runtime = config.runtime ?? createProviderExecutionContext();
   runtime.configureUsagePricing(config);
   // Credential validation proves endpoint access; it is not an extraction
@@ -194,35 +208,53 @@ export async function validateProviderCredentials(config: ProviderRuntimeConfig)
   // models cannot exhaust this small probe response before returning `OK`.
   const probeThinkingLevel = cliThinkingLevels(config.provider, config.model)[0]
     ?? defaultCliThinkingLevel(config.provider, config.model);
-  if (config.provider === 'gemini') {
-    const client = getGenAIClient(
-      geminiRequestApiKey(config),
+  const signal = AbortSignal.timeout(timeoutMs);
+  try {
+    if (config.provider === 'gemini') {
+      const client = getGenAIClient(
+        geminiRequestApiKey(config),
+        {
+          baseUrl: config.gateway === 'cloudflare' ? config.baseUrl : undefined,
+          headers: config.gateway === 'cloudflare' ? providerRequestHeaders(config) : undefined,
+        },
+      );
+      await waitForGeminiRequestSlot(signal, runtime);
+      const response = await client.models.generateContent({
+        model: config.model,
+        contents: 'Reply with OK.',
+        config: applyThinkingConfig(
+          { maxOutputTokens: 1024, abortSignal: signal },
+          config.model as GeminiModel,
+          { level: probeThinkingLevel },
+        ),
+      });
+      recordGeminiUsage(response, config.model as GeminiModel, runtime);
+      return;
+    }
+    await createChatCompletion({
+      ...config,
+      runtime,
+      thinkingConfig: { level: probeThinkingLevel },
+    }, {
+      messages: [{ role: 'user', content: 'Reply with OK.' }],
+      maxTokens: 1024,
+      signal,
+    });
+  } catch (error) {
+    if (!signal.aborted) throw error;
+    const seconds = Math.ceil(timeoutMs / 1000);
+    throw new CliExitError(
+      `The ${config.provider} endpoint did not answer the credential check within ${seconds} second${seconds === 1 ? '' : 's'}`,
+      1,
       {
-        baseUrl: config.gateway === 'cloudflare' ? config.baseUrl : undefined,
-        headers: config.gateway === 'cloudflare' ? providerRequestHeaders(config) : undefined,
+        cause: error,
+        code: 'TIMEOUT',
+        category: 'limit',
+        retryable: true,
+        hint: 'Check that the configured endpoint is reachable and responding, then retry.',
       },
     );
-    await waitForGeminiRequestSlot(undefined, runtime);
-    const response = await client.models.generateContent({
-      model: config.model,
-      contents: 'Reply with OK.',
-      config: applyThinkingConfig(
-        { maxOutputTokens: 1024 },
-        config.model as GeminiModel,
-        { level: probeThinkingLevel },
-      ),
-    });
-    recordGeminiUsage(response, config.model as GeminiModel, runtime);
-    return;
   }
-  await createChatCompletion({
-    ...config,
-    runtime,
-    thinkingConfig: { level: probeThinkingLevel },
-  }, {
-    messages: [{ role: 'user', content: 'Reply with OK.' }],
-    maxTokens: 1024,
-  });
 }
 
 export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Promise<InitResult> {
@@ -402,11 +434,17 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
       throw new Error('Cloudflare account ID and AI Gateway ID are required');
     }
 
+    // An OpenRouter route with no known reasoning contract keeps the model's own
+    // default unless a level is chosen: a `thinking` written by --yes would
+    // count as a choice and send `reasoning` to a model that may not take it.
+    const thinkingIsUnchosenDefault = flags.yes === true
+      && provider === 'openrouter'
+      && knownModelThinkingLevels(provider, model) === undefined;
     const config: CliConfigFile = {
       provider,
       gateway,
       model,
-      thinking,
+      ...(thinkingIsUnchosenDefault ? {} : { thinking }),
       concurrency,
       requestsPerMinute,
       ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
@@ -470,10 +508,21 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
     await writeConfig(configPath, config);
     writeOutput(`Created ${configPath}\n`);
     if (projectScoped) {
-      writeOutput(
-        `Project configuration uses the ${provider} default endpoint and ${apiKeyEnv}; `
-        + 'run `open-ocr-cli init --global` to set a custom endpoint, key variable, or gateway.\n',
-      );
+      // A project that keeps the user configuration's provider inherits its
+      // endpoint and key variable (see mergeConfigLayers); say so rather than
+      // claiming the provider defaults apply.
+      const userPath = path.join(runtime.homeDirectory ?? homedir(), '.config', 'open-ocr-cli', 'config.json');
+      const user = await readUserConfig(runtime.homeDirectory ?? homedir()).catch(() => ({}));
+      const effective = mergeConfigLayers(user, config);
+      const inherited = [
+        ...(effective.baseUrl !== undefined ? [`endpoint ${effective.baseUrl}`] : []),
+        ...(effective.apiKeyEnv !== undefined ? [`key variable ${effective.apiKeyEnv}`] : []),
+      ];
+      writeOutput(inherited.length > 0
+        ? `Project configuration keeps provider ${provider}, so it uses the ${inherited.join(' and ')} from ${userPath}; `
+          + 'run `open-ocr-cli init --global` to change them.\n'
+        : `Project configuration uses the ${provider} default endpoint and ${apiKeyEnv}; `
+          + 'run `open-ocr-cli init --global` to set a custom endpoint, key variable, or gateway.\n');
     }
     if (credentialStatus === 'valid') writeOutput(`${credentialEnvironmentVariable}: credential validated\n`);
     else if (credentialStatus === 'missing') {

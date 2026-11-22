@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import type { ProviderUsageSnapshot } from '@open-ocr/engine/providers';
 import { parseBatchLockOwner, type BatchLockOwner } from './jsonValidation';
-import { batchMetadataError, CliExitError } from './errors';
+import { CliExitError } from './errors';
 import { escapesRoot } from './fileBoundary';
 import { artifactFileExists, parseCliManifest } from './manifest';
 import type {
@@ -300,6 +300,30 @@ function hasHiddenArtifactSegment(outputDirectory: string, filePath: string): bo
   const relative = path.relative(outputDirectory, path.resolve(filePath));
   if (escapesRoot(relative)) return false;
   return relative.split(path.sep).some((segment) => segment.startsWith('.'));
+}
+
+/** Extensions a directory-layout artifact can carry. */
+const RECORDED_ARTIFACT_EXTENSIONS = ['.md', '.json', '.csv', '.steps.json'];
+
+/**
+ * True when a recorded artifact carries its input's agent instruction name
+ * (`CLAUDE.md` for `CLAUDE.png`): it was written by a release that did not add
+ * the `.ocr` suffix (see {@link neutralizeAgentInstructionPath}), a name this
+ * one never produces. The input's name decides, not a name read back off the
+ * artifact: this release writes `skill.steps.png` as `skill.steps.json`, which
+ * read alone looks like the steps file of an input named `skill`.
+ */
+function hasAgentInstructionArtifactName(
+  outputDirectory: string,
+  filePath: string,
+  inputRelativePath: string,
+): boolean {
+  const resolved = path.resolve(filePath);
+  if (escapesRoot(path.relative(outputDirectory, resolved))) return false;
+  const inputName = path.posix.parse(inputRelativePath.replaceAll('\\', '/')).name.toLowerCase();
+  if (!AGENT_INSTRUCTION_BASENAMES.has(inputName)) return false;
+  const name = path.basename(resolved).toLowerCase();
+  return RECORDED_ARTIFACT_EXTENSIONS.some((extension) => name === `${inputName}${extension}`);
 }
 
 function plannedArtifactExtensions(options: ResolvedCliOptions): ArtifactExtension[] {
@@ -681,6 +705,44 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Write a new file and flush it to stable storage before it is renamed or
+ * linked into place. A rename alone is atomic against a killed process but not
+ * against an OS crash or power loss: on filesystems without ext4's
+ * replace-via-rename heuristic (XFS, ext4 with noauto_da_alloc, many network
+ * filesystems) the rename can reach the disk before the data and leave an
+ * empty manifest behind.
+ */
+async function writeNewFileDurably(file: string, content: string): Promise<void> {
+  const handle = await fs.open(file, 'wx');
+  try {
+    await handle.writeFile(content, { encoding: 'utf8' });
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Flush a directory, so a rename or link made in it survives an OS crash.
+ *
+ * Best effort: Windows cannot open a directory for this, and some network
+ * filesystems refuse to sync one. Every error is ignored, because a lost
+ * directory sync can only lose the rename itself (the previous, complete file
+ * stays in place); the file contents were already synced before the rename.
+ */
+async function syncDirectory(directory: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(directory, 'r');
+    await handle.sync();
+  } catch {
+    // See above: never worse than not syncing.
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 async function writeExclusiveFallback(target: string, content: string): Promise<void> {
   // Some network/FUSE and non-NTFS filesystems do not support hard links. An
   // exclusive open preserves the no-clobber guarantee there. Unlike a hard
@@ -690,6 +752,7 @@ async function writeExclusiveFallback(target: string, content: string): Promise<
   let failure: unknown;
   try {
     await handle.writeFile(content, { encoding: 'utf8' });
+    await handle.sync();
   } catch (error) {
     failure = error;
   }
@@ -827,7 +890,9 @@ async function commitArtifacts(
         throw outputConflict(`Output already exists: ${target}. ${OUTPUT_CONFLICT_HINT}`);
       }
       const temporary = `${target}.${transactionId}.tmp`;
-      await fs.writeFile(temporary, content, { encoding: 'utf8', flag: 'wx' });
+      // Synced like the manifest (about 1 ms per artifact on a local SSD,
+      // small beside a provider call): a resumed entry trusts these files.
+      await writeNewFileDurably(temporary, content);
       staged.push({ target, temporary, content, replace, committed: false });
     }
 
@@ -849,6 +914,8 @@ async function commitArtifacts(
       entry.committed = true;
       if (!entry.replace) await fs.rm(entry.temporary, { force: true });
     }
+    // The new names are durable before the backups of the old ones go.
+    await Promise.all([...new Set(staged.map((entry) => path.dirname(entry.target)))].map(syncDirectory));
     await Promise.all(staged.map(async (entry) => {
       if (entry.backup) await fs.rm(entry.backup, { force: true }).catch(() => undefined);
     }));
@@ -885,7 +952,9 @@ async function commitArtifacts(
 /**
  * Commit one complete text file safely. Overwrite uses an atomic replacement.
  * No-overwrite prefers an atomic hard-link commit and falls back to a portable
- * exclusive write on filesystems that do not support hard links.
+ * exclusive write on filesystems that do not support hard links. The content
+ * is synced before the commit and the directory after it, so the manifest,
+ * summary and lock survive an OS crash as well as a killed process.
  */
 export async function writeTextFileAtomically(
   target: string,
@@ -895,7 +964,7 @@ export async function writeTextFileAtomically(
   await fs.mkdir(path.dirname(target), { recursive: true });
   const temporary = `${target}.${process.pid}-${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, content, { encoding: 'utf8', flag: 'wx' });
+    await writeNewFileDurably(temporary, content);
     if (overwrite) {
       await fs.rename(temporary, target);
     } else {
@@ -919,6 +988,7 @@ export async function writeTextFileAtomically(
     }
     throw error;
   }
+  await syncDirectory(path.dirname(target));
 }
 
 export async function writeArtifacts(
@@ -966,6 +1036,41 @@ export interface ManifestFingerprints {
  */
 export const MANIFEST_FLUSH_INTERVAL_MS = 1_000;
 
+/**
+ * A resume manifest that is not JSON at all: an OS crash during a write on a
+ * filesystem that commits the rename before the data, or a hand edit. The hint
+ * names the one file to delete instead of sending the person to a fresh
+ * directory, which would re-bill every finished document.
+ */
+export function unreadableManifestError(manifestPath: string, error: SyntaxError): CliExitError {
+  return new CliExitError(`Invalid JSON in ${manifestPath}: ${error.message}`, 2, {
+    cause: error,
+    code: 'INPUT_INVALID',
+    category: 'input',
+    retryable: false,
+    hint: `The resume manifest ${manifestPath} is not valid JSON (a crash during a write can leave it empty). `
+      + 'Delete it, or rerun extract with --overwrite, to restart this directory\'s resume state and its '
+      + 'cumulative --max-cost total.',
+  });
+}
+
+export interface ManifestLoadOptions {
+  /**
+   * What to do with a manifest that is not valid JSON, for a run that starts a
+   * fresh job anyway (`--overwrite`): `set-aside` renames it to
+   * `<manifest>.corrupt-<timestamp>` and starts empty; `ignore` starts empty
+   * and leaves it in place (a dry run writes nothing). By default it is refused.
+   */
+  unreadable?: 'set-aside' | 'ignore';
+}
+
+export interface ManifestLoadResult {
+  /** The manifest was not valid JSON and was treated as absent. */
+  unreadable?: true;
+  /** Where an unreadable manifest was moved (`unreadable: 'set-aside'`). */
+  setAsidePath?: string;
+}
+
 export class ManifestStore {
   private readonly manifestPath: string;
   private manifest: CliManifest = { ...EMPTY_MANIFEST, entries: {} };
@@ -984,17 +1089,28 @@ export class ManifestStore {
     return this.manifestPath;
   }
 
-  async load(): Promise<void> {
+  async load(options: ManifestLoadOptions = {}): Promise<ManifestLoadResult> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.manifestPath, 'utf8');
-      this.manifest = parseCliManifest(JSON.parse(raw) as unknown, this.manifestPath);
+      raw = await fs.readFile(this.manifestPath, 'utf8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-      if (error instanceof SyntaxError) {
-        throw batchMetadataError(`Invalid JSON in ${this.manifestPath}: ${error.message}`);
-      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
       throw error;
     }
+    let value: unknown;
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      if (options.unreadable === 'ignore') return { unreadable: true };
+      if (options.unreadable !== 'set-aside') throw unreadableManifestError(this.manifestPath, error);
+      const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
+      const setAsidePath = `${this.manifestPath}.corrupt-${stamp}`;
+      await fs.rename(this.manifestPath, setAsidePath);
+      return { unreadable: true, setAsidePath };
+    }
+    this.manifest = parseCliManifest(value, this.manifestPath);
+    return {};
   }
 
   /** Cumulative usage recorded by earlier runs, as loaded. */
@@ -1026,10 +1142,17 @@ export class ManifestStore {
    * as `resumed`. Re-extracting is the only outcome that can improve it.
    *
    * `pending` is an interrupted attempt and is never skipped either.
+   *
+   * `inputRelativePath` is the input's {@link ResolvedInput.relativePath}, which
+   * names its artifacts. It defaults to the key, an input's absolute path, which
+   * gives the same answer: the basename matches, and an input outside the
+   * working directory has hash-suffixed artifacts that never carried an
+   * instruction name. Stdin entries share one key, so pass it for them.
    */
   async completedEntry(
     key: string,
     fingerprints: string | ManifestFingerprints,
+    inputRelativePath = key,
   ): Promise<(ManifestEntry & { legacyFingerprint?: true }) | undefined> {
     const { current, legacy } = typeof fingerprints === 'string'
       ? { current: fingerprints, legacy: undefined }
@@ -1042,11 +1165,18 @@ export class ManifestStore {
       && entry.fingerprintVersion === undefined
       && entry.fingerprint === legacy;
     if (!matchesCurrent && !matchesLegacy) return undefined;
-    // Outputs from the 4.3.0-and-earlier layout (a hidden name such as `.mcp.json`) are
-    // not what this run would write: re-extract into the current layout. The
-    // old paths stay owned by the entry, so they never block the new write.
+    // Outputs from the 4.3.0-and-earlier layout are not what this run would
+    // write: a hidden name such as `.mcp.json`, or an agent instruction name
+    // such as `CLAUDE.md` (now `CLAUDE.ocr.md`). Re-extract into the current
+    // layout. The old paths stay owned by the entry, so they never block the
+    // new write.
     const outputDirectory = path.dirname(this.manifestPath);
-    if (entry.outputFiles.some((file) => hasHiddenArtifactSegment(outputDirectory, file))) return undefined;
+    if (entry.outputFiles.some((file) => (
+      hasHiddenArtifactSegment(outputDirectory, file)
+      || hasAgentInstructionArtifactName(outputDirectory, file, inputRelativePath)
+    ))) {
+      return undefined;
+    }
     if (!(await Promise.all(entry.outputFiles.map(artifactFileExists))).every(Boolean)) return undefined;
     return {
       ...entry,
@@ -1126,6 +1256,16 @@ export class ManifestStore {
     const failure = this.deferredFailure;
     this.deferredFailure = undefined;
     if (failure !== undefined) throw failure instanceof Error ? failure : new Error(errorMessage(failure));
+  }
+
+  /**
+   * Persist the current cumulative usage within
+   * {@link MANIFEST_FLUSH_INTERVAL_MS}, without changing any entry. Called as
+   * paid responses are recorded, so a hard kill during a long document loses
+   * at most that window of its spend from the total `--max-cost` is enforced on.
+   */
+  scheduleUsageWrite(): void {
+    this.scheduleDeferredWrite();
   }
 
   /** Number of manifest writes this store has completed. */

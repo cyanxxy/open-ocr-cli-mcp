@@ -403,9 +403,33 @@ describe('CLI batch status', () => {
     await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(invalidUsage));
     await expect(inspectBatchStatus('.', directory)).rejects.toThrow('Invalid batch summary');
 
-    const invalidModel = batchSummary([{ status: 'succeeded' }], { provider: 'gemini', model: 'unknown-model' });
+    const invalidModel = batchSummary([{ status: 'succeeded' }], { provider: 'gemini', model: ' ' });
     await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(invalidModel));
     await expect(inspectBatchStatus('.', directory)).rejects.toThrow('Invalid batch summary');
+  });
+
+  it('reports a summary recorded with a Gemini model this release no longer offers', async () => {
+    // gemini-3.7-flash was accepted by 4.2.0 and dropped in 4.3.0. The summary
+    // is a record of that run, so status reports it rather than refusing it.
+    const retired = batchSummary([{ status: 'succeeded' }], { provider: 'gemini', model: 'gemini-3.7-flash' });
+    await writeFile(path.join(directory, 'batch-summary.json'), JSON.stringify(retired));
+    const report = await inspectBatchStatus('.', directory);
+    expect(report.lastRun).toMatchObject({ provider: 'gemini', model: 'gemini-3.7-flash' });
+    const rendered = renderBatchStatus(report);
+    expect(rendered).toContain('with gemini/gemini-3.7-flash via');
+    expect(rendered).toContain('gemini-3.7-flash is no longer offered by this release');
+  });
+
+  it('names the unreadable manifest to delete instead of sending the batch to a fresh directory', async () => {
+    const manifestPath = path.join(directory, '.open-ocr-manifest.json');
+    await writeFile(manifestPath, '');
+    const failure = await inspectBatchStatus('.', directory).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: 'INPUT_INVALID' });
+    expect((failure as Error).message).toContain(`Invalid JSON in ${manifestPath}`);
+    const hint = (failure as { hint?: string }).hint ?? '';
+    expect(hint).toContain(manifestPath);
+    expect(hint).toContain('--overwrite');
+    expect(hint).not.toContain('fresh output directory');
   });
 
   it('rejects directories without batch metadata', async () => {

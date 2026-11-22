@@ -62,7 +62,25 @@ inputs:
 runs:
   using: composite
   steps:
+    # actions/setup-node prepends its Node.js to PATH for every later step of
+    # the calling job, so install Node.js 22 only when the job has no Node.js
+    # (with npx) that satisfies the CLI's engines range. A job that already set
+    # up a supported Node.js keeps it, both for this action and afterwards.
+    - name: Check for a supported Node.js
+      id: node
+      shell: bash
+      run: |
+        if command -v node >/dev/null 2>&1 && command -v npx >/dev/null 2>&1 \
+          && node "${{ github.action_path }}/scripts/github-action-node.mjs" --check "${{ github.action_path }}/packages/cli/package.json"; then
+          echo "Using Node.js $(node --version) from PATH."
+          echo "supported=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "No supported Node.js on PATH; installing Node.js 22."
+          echo "supported=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Set up Node.js
+      if: steps.node.outputs.supported != 'true'
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22.x'

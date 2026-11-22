@@ -29,7 +29,8 @@ This is an npm workspace with two packages and no web app:
 
 ## Local Setup
 
-Use Node.js 20.19+, 22.13+, or 24+; Node 24 is used for release builds.
+Use Node.js 20.19+, 22.13+, or 24+; Node 24 is used for release builds, and CI
+also tests Node 26.
 The root `packageManager` field pins the npm version used by the release gate.
 
 ```bash
@@ -48,6 +49,7 @@ Before opening a PR, run:
 npm run typecheck
 npm run lint
 npm run test:coverage
+node --test scripts/*.test.mjs
 npm run cli:smoke
 npm run evals:validate
 npm run evals:matrix:check

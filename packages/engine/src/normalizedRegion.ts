@@ -24,6 +24,10 @@ export function isNormalizedRegion(value: unknown): value is NormalizedRegion {
   return true;
 }
 
+/**
+ * Validate a region and return a fresh copy with only the six region keys, so
+ * extra keys a model adds ("label", "rotation") never reach stored results.
+ */
 export function assertNormalizedRegion(value: unknown, fieldName = 'region'): NormalizedRegion {
   if (!isNormalizedRegion(value)) {
     throw new TypeError(
@@ -31,5 +35,12 @@ export function assertNormalizedRegion(value: unknown, fieldName = 'region'): No
     );
   }
 
-  return value;
+  return {
+    page: value.page,
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    units: 'normalized',
+  };
 }

@@ -161,8 +161,8 @@ jobs:
       - name: Run tests with coverage
         run: npm run test:coverage
 
-      - name: Test release automation
-        run: node --test scripts/release-automation.test.mjs
+      - name: Test release and packaging scripts
+        run: node --test scripts/*.test.mjs
 
       - name: Validate AI eval fixtures and provider matrix
         run: npm run evals:validate && npm run evals:matrix:check
@@ -212,11 +212,21 @@ jobs:
             open-ocr-cli.rb \
             release-notes.md > SHA256SUMS
 
+      # Install the exact tarball the way the attached formula's std_npm_args
+      # does, delete the build directory as Homebrew does, then run the CLI.
+      - name: Smoke-test Homebrew-style installation
+        run: node scripts/smoke-homebrew-install.mjs "${{ steps.pack.outputs.tarball }}"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Warns on the release run when the pinned base image misses a newer
+      # Node.js security release on its line.
+      - name: Check container base image Node.js release
+        run: node scripts/check-container-node.mjs
 
       - name: Validate multi-platform container build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

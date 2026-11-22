@@ -34,6 +34,16 @@ export interface ProviderTokenPrice {
   outputPerMillionUsd: number;
 }
 
+export interface ProviderThinkingConfig extends ThinkingConfig {
+  /**
+   * True when the level was chosen by the user (a flag, OPEN_OCR_THINKING, or a
+   * matching config-file `thinking`) rather than filled in as a default. An
+   * OpenRouter route with no known reasoning contract receives `reasoning` only
+   * when this is true.
+   */
+  explicit?: boolean;
+}
+
 export interface ProviderRuntimeConfig {
   provider: ProviderId;
   gateway: GatewayId;
@@ -41,7 +51,7 @@ export interface ProviderRuntimeConfig {
   apiKeyEnv: string;
   model: string;
   baseUrl: string;
-  thinkingConfig?: ThinkingConfig;
+  thinkingConfig?: ProviderThinkingConfig;
   /** Controls emitted observability only; never controls reasoning continuity. */
   progress?: AgentProgressLevel;
   gatewayToken?: string;
@@ -84,4 +94,10 @@ export interface ProviderUsageSnapshot {
    * when non-zero: token and cost totals then undercount the real spend.
    */
   unreportedUsageRequests?: number;
+  /**
+   * The subset of {@link unreportedUsageRequests} sent at non-zero prices, so
+   * their spend is unknown. Present only when non-zero. A resumed job under
+   * `--max-cost` uses it to fail closed (see `setPriorUsageUnknown`).
+   */
+  unmeteredPaidRequests?: number;
 }

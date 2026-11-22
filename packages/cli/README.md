@@ -12,7 +12,8 @@ open-ocr-cli extract invoice.pdf
 
 **Agents:** `open-ocr-cli capabilities --json`, then
 `open-ocr-cli run --request job.json --response-format jsonl`.
-**MCP:** `open-ocr-cli mcp` (protocol 2026-07-28).
+**MCP:** `open-ocr-cli mcp` (protocol 2026-07-28). If Claude Code's `/mcp`
+cannot connect to it, start Claude Code with `MCP_PROTOCOL_NEGOTIATION=auto`.
 The package ships an agent skill in `skills/open-ocr/` and schemas in `schemas/`.
 
 [CLI reference](https://github.com/cyanxxy/open-ocr-cli-mcp/blob/main/docs/cli-reference.md) ·

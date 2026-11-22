@@ -830,3 +830,45 @@ describe('protocol validation messages', () => {
     expect(payload.message).toContain("inputs[0]: unknown field 'unexpected'");
   });
 });
+
+describe('request validation messages for many inputs', () => {
+  const request = (inputs: unknown[]): Record<string, unknown> => ({ protocolVersion: 2, operation: 'extract', inputs });
+  const messageOf = (value: unknown): string => {
+    try {
+      parseOcrJobRequest(value);
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return '';
+  };
+
+  it('reports each input under its own index', () => {
+    const first = messageOf(request([{ kind: 'path', path: 'b.pdf' }, { type: 'path' }]));
+    expect(first).toContain("inputs[0]: unknown field 'kind' — did you mean 'type'?");
+    expect(first).toContain("inputs[1]: missing required field 'path'");
+
+    const second = messageOf(request([{ type: 'path' }, { kind: 'path', path: 'b.pdf' }]));
+    expect(second).toContain("inputs[0]: missing required field 'path'");
+    expect(second).toContain("inputs[1]: unknown field 'kind' — did you mean 'type'?");
+  });
+
+  it('describes thousands of identical mistakes quickly', () => {
+    const inputs = Array.from({ length: 5_000 }, (_, index) => ({ kind: 'path', path: `docs/file-${index}.pdf` }));
+    const started = Date.now();
+    const message = messageOf(request(inputs));
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(message).toContain("inputs[0]: unknown field 'kind' — did you mean 'type'?");
+    expect(message).toMatch(/\+\d+ more issues/u);
+  });
+
+  it('caps the length of provider.model', () => {
+    expect(() => parseOcrJobRequest({
+      ...request([{ type: 'path', path: 'a.pdf' }]),
+      provider: { id: 'openrouter', model: 'x'.repeat(257) },
+    })).toThrow(expect.objectContaining({ code: 'CONFIG_INVALID' }) as Error);
+    expect(parseOcrJobRequest({
+      ...request([{ type: 'path', path: 'a.pdf' }]),
+      provider: { id: 'openrouter', model: 'x'.repeat(256) },
+    }).provider?.model).toHaveLength(256);
+  });
+});

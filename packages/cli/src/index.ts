@@ -4,9 +4,12 @@ import process from 'node:process';
 
 import { cliExitCode, renderCliError } from './errors';
 import { main, PRIMARY_CLI_NAME } from './main';
+import { installFetchDispatcher } from './providerRuntime';
 import { installStdoutPipeGuard, STDOUT_CLOSED_EXIT_CODE, stdoutClosedByReader } from './stdout';
 
 installStdoutPipeGuard();
+// Before any request: every command, `mcp` included, starts here.
+installFetchDispatcher();
 
 main().catch((error: unknown) => {
   process.stderr.write(renderCliError(error, PRIMARY_CLI_NAME));

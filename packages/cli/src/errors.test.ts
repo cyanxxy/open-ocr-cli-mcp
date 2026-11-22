@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { findSchemaCompatibilityIssues } from '@open-ocr/engine/gemini/schemaCompat';
 import { OcrError, OcrErrorType } from '@open-ocr/engine/gemini/types';
 import { ProviderApiError } from '@open-ocr/engine/providers';
+import { assertCompleteGeminiResponse, GEMINI_PER_REQUEST_LIMIT_PHRASE } from '@open-ocr/engine/gemini/client';
 import {
   asCliExitError,
   CliExitError,
@@ -15,6 +16,7 @@ import {
   ocrErrorPayload,
   renderCliError,
 } from './errors';
+import { assertOcrJobEvent, toOcrRunFailure } from './protocol';
 
 describe('CLI exit errors', () => {
   it('recognizes only a direct closed-pipe stream error', () => {
@@ -605,5 +607,59 @@ describe('OpenAI-compatible provider error bodies', () => {
     }
     expect(ocrErrorPayload(new ProviderApiError('Forbidden', 403, 'permission_denied'), 1))
       .toMatchObject({ code: 'PERMISSION_DENIED' });
+  });
+});
+
+describe('truncation at the per-request output limit', () => {
+  it('never advises a higher --max-tokens for a CONTINUATION or requires_continuation stop', () => {
+    let continuation: unknown;
+    try {
+      assertCompleteGeminiResponse({ candidates: [{ finishReason: 'CONTINUATION' }] }, 'Gemini OCR');
+    } catch (error) {
+      continuation = error;
+    }
+    const interaction = new Error(
+      `Gemini interaction stopped at the model's ${GEMINI_PER_REQUEST_LIMIT_PHRASE} (status requires_continuation) `
+      + 'and returned incomplete output.',
+    );
+    for (const error of [continuation, interaction, new ProviderApiError(String((continuation as Error).message), 400)]) {
+      const payload = ocrErrorPayload(error, 1);
+      expect(payload).toMatchObject({ code: 'PROVIDER_FAILURE', retryable: false });
+      expect(payload.hint).not.toContain('--max-tokens');
+      expect(payload.hint).toContain('per-request output limit');
+    }
+    const maxTokens = ocrErrorPayload(new Error(
+      'Gemini OCR reached the output token limit and returned incomplete output. Increase the output-token limit or lower the thinking level and retry.',
+    ), 1);
+    expect(maxTokens.hint).toContain('--max-tokens');
+  });
+});
+
+describe('errors without a message', () => {
+  it('always yields a non-empty message that error-v2 accepts', () => {
+    const provider = ocrErrorPayload(new ProviderApiError('', 500), 1);
+    expect(provider).toMatchObject({ code: 'PROVIDER_FAILURE', message: 'Provider request failed with HTTP 500' });
+    const wrapped = ocrErrorPayload(new Error('', { cause: new ProviderApiError('', 503) }), 1);
+    expect(wrapped.message).toBe('Provider request failed with HTTP 503');
+    const bare = ocrErrorPayload(new Error(''));
+    expect(bare.message).toBe('Error with no message (CONFIG_INVALID)');
+    const typed = ocrErrorPayload(new CliExitError('  ', 2, { code: 'INPUT_INVALID', category: 'input', retryable: false }));
+    expect(typed).toMatchObject({ code: 'INPUT_INVALID', category: 'input', message: 'CliExitError with no message (INPUT_INVALID)' });
+    for (const payload of [provider, wrapped, bare, typed]) {
+      expect(() => toOcrRunFailure('run_1', payload)).not.toThrow();
+    }
+  });
+});
+
+describe('self-validation of CLI output', () => {
+  it('reports a result or event that breaks its own contract as INTERNAL, not SCHEMA_INVALID', () => {
+    let thrown: unknown;
+    try {
+      assertOcrJobEvent({ protocolVersion: 2, type: 'run.started', runId: 'run_1' });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ code: 'INTERNAL', category: 'internal', retryable: false, exitCode: 1 });
+    expect((thrown as Error).message).toMatch(/^Invalid OCR event/u);
   });
 });

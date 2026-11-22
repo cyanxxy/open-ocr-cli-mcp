@@ -58,11 +58,15 @@ export interface RegionCropResult {
   height: number;
 }
 
-/** Runtime adapter supplied by a host that supports region re-OCR. */
+/**
+ * Runtime adapter supplied by a host that supports region re-OCR. `signal` is
+ * the run's abort signal; a host should stop rasterizing when it aborts.
+ */
 export type RegionCropper = (
   fileData: string,
   mimeType: string,
   region: NormalizedRegion,
+  signal?: AbortSignal,
 ) => Promise<RegionCropResult>;
 
 export type RegionStructuredExtractor = (
@@ -135,6 +139,8 @@ export interface AgentLoopConfig {
   iterationPauseMs?: number;
   /** Re-throw terminal provider failures after emitting progress, for machine-facing callers. */
   throwOnFailure?: boolean;
+  /** Pages in the document (PDF page count, 1 for an image). Defaults to 1. */
+  pageCount?: number;
 }
 
 /**

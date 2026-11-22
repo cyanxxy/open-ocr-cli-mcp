@@ -45,13 +45,27 @@ Bedrock, Claude Platform on AWS, Google Cloud's Agent Platform, and Microsoft
 Foundry (unless a host platform that embeds Claude Code sets
 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`), sessions signed in through a Claude
 apps gateway, and sessions with telemetry or feature-flag fetching turned off.
-Usually nothing needs to be set, but Anthropic can keep a specific server on
-the earlier protocol with a feature flag Claude Code fetches, and
-`MCP_SDK_GENERATION=v1` or `MCP_PROTOCOL_NEGOTIATION=legacy` keeps a session on
-the earlier handshake. This server rejects that handshake; if `/mcp` shows it
-failing to connect, use the [CLI protocol](#portable-cli-integration) or the
-[portable skill](#portable-skill) instead. Use `/mcp` to verify connection and
-discovery.
+Usually nothing needs to be set. This server rejects the earlier handshake,
+though, and several things keep a session on it: `MCP_SDK_GENERATION=v1`,
+`MCP_PROTOCOL_NEGOTIATION=legacy`, a feature flag Anthropic can use to keep a
+specific server on the earlier protocol, and a cached skip. With
+`MCP_PROTOCOL_NEGOTIATION` unset, Claude Code can skip asking a stdio server
+about 2026-07-28 for up to **7 days**, for example after the server exited when
+asked: an older open-ocr-cli build, an unsupported Node.js version, a broken
+install, or any other failed launch. Fixing the cause does not end the skip.
+
+Use `/mcp` to verify connection and discovery. If it shows open-ocr failing to
+connect:
+
+1. Start Claude Code with `MCP_PROTOCOL_NEGOTIATION=auto` (Claude Code 2.1.221
+   or later) so it asks the server again, for example
+   `MCP_PROTOCOL_NEGOTIATION=auto claude`. Exporting it in your shell profile
+   keeps Claude Code asking every time. On a build that does not use the v2
+   runtime yet (before 2.1.232, or before 2.1.274 in the sessions listed
+   above), also set `MCP_SDK_GENERATION=v2`. The [portable skill](#portable-skill)
+   gives hosts the same pair.
+2. If it still fails, use the [CLI protocol](#portable-cli-integration) or the
+   portable skill, which need no MCP support.
 
 Two client limits bound a tool call:
 
@@ -71,8 +85,9 @@ Two client limits bound a tool call:
 Claude may background a long call, but that host feature does not turn it into
 an MCP Tasks operation. These settings come from
 [Claude Code's MCP documentation](https://code.claude.com/docs/en/mcp#mcp-client-runtimes)
-([time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls)),
-checked **2026-11-01**; an actual Claude OCR session was not run in this audit.
+([time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls))
+and its [environment variables](https://code.claude.com/docs/en/env-vars),
+checked **2026-11-21**; an actual Claude OCR session was not run in this audit.
 
 Claude Code saves a successful text result over 50,000 characters to a file and
 keeps only the first and last 5,000 characters of error text over about 11,000.
@@ -206,8 +221,15 @@ confirmation before provider calls. The server plans the request locally first,
 so the prompt names the real document count after folder and glob expansion,
 the resolved provider/model, the effective cost ceiling, the destination host
 (the endpoint or gateway the documents go to), and the environment variable
-whose value is sent as the credential; a request that would send nothing is
-answered without a prompt. If the plan changes before the confirmed retry
+whose value is sent as the credential. The count covers only documents the run
+would actually send: documents a resume would skip as already complete in the
+output directory are left out and reported in one extra sentence. A request
+that would send nothing (every valid document resumed, or the directory's
+recorded spend already at the cost ceiling) runs without a prompt and returns
+the existing artifacts or a `cost_limited` result. The model ID in the prompt is
+escaped and shortened, and a model ID longer than 256 characters or holding
+control, line-separator, or bidirectional-formatting characters is refused
+before any prompt. If the plan changes before the confirmed retry
 (documents, route, credential variable, or any other resolved option, for
 example an edited configuration file) the server asks again. The client must support form
 elicitation through the current protocol's continuation mechanism. An answer
@@ -241,7 +263,10 @@ the server does not let tool arguments override the operator:
   argument picks a provider, which then uses its own documented endpoint and
   default key variable; the `gateway: "cloudflare"` argument uses only the
   operator's `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_AI_GATEWAY_ID` (or user
-  configuration) and token variable.
+  configuration) and token variable. A `configPath` or project file that
+  switches the provider also drops the operator's model, endpoint, key
+  variable, and other settings written for the old provider, so the
+  operator's `apiKeyEnv` is never sent to the provider the caller switched to.
 - **Prices.** `inputPricePerMillionUsd` and `outputPricePerMillionUsd` decide
   whether the operator's `maxCostUsd` ceiling and the fail-closed check for a
   paid response without usage can trip, so a `configPath` file or project
@@ -254,9 +279,14 @@ the server does not let tool arguments override the operator:
   symbolic links followed; a link that points outside is refused. An input that
   exists as a file or directory is read as that path even when its name has
   glob characters (`Scan (1).pdf`, `inv[2].pdf`); only a path that does not
-  exist is expanded as a glob. A glob may not contain `..`, and an absolute glob
-  must start with the working directory or have a literal prefix that resolves
-  inside it; every matched file is checked again after expansion.
+  exist is expanded as a glob. A glob may not contain a `..` segment in any
+  spelling (braces such as `.{.,}`, classes such as `.[.]`, or escapes), and an
+  absolute glob must start with the working directory or have a literal prefix
+  that resolves inside it; every matched file is checked again after
+  expansion, and a match outside is refused without naming it. On Windows, a
+  UNC or device path (`\\host\share\...`, `\\?\...`) whose root is not the
+  working directory's own is refused from its spelling, before any filesystem
+  access can contact another host.
   `outputDirectory` (and a `configPath` `output`) may not be inside a hidden
   directory such as `.git` or `.claude`, except the default
   `.open-ocr-results`. Configuration and schema files must be regular files.

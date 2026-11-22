@@ -1058,3 +1058,160 @@ describe('OpenAI-compatible transport', () => {
     expect(strictBody.response_format.json_schema).toMatchObject({ strict: true });
   });
 });
+
+describe('local transport timeouts', () => {
+  it('never retries an undici headers or body timeout, which leaves the provider still working', () => {
+    for (const code of ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']) {
+      const timeout = new TypeError('fetch failed', { cause: Object.assign(new Error('Headers Timeout Error'), { code }) });
+      expect(isRetryableProviderError(timeout), code).toBe(false);
+      expect(isRetryableProviderError(new Error('wrapped', { cause: timeout })), code).toBe(false);
+    }
+    for (const code of ['UND_ERR_SOCKET', 'ECONNRESET']) {
+      const transient = new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code }) });
+      expect(isRetryableProviderError(transient), code).toBe(true);
+    }
+  });
+});
+
+describe('empty provider error messages', () => {
+  it('falls back to the HTTP status when the error body message is empty', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(Response.json(
+      { error: { message: '' } },
+      { status: 500 },
+    ))));
+    await expect(createChatCompletion(config(), {
+      messages: [{ role: 'user', content: 'Extract' }],
+      maxTokens: 10,
+    })).rejects.toMatchObject({ name: 'ProviderApiError', status: 500, message: 'Provider request failed with HTTP 500' });
+  });
+
+  it('falls back to a fixed sentence for an empty streamed error message', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      `data: ${JSON.stringify({ error: { message: '   ', code: 'server_error' } })}\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))));
+    await expect(createChatCompletion(config(), {
+      messages: [{ role: 'user', content: 'Extract' }],
+      maxTokens: 10,
+      onDelta: () => undefined,
+    })).rejects.toMatchObject({ message: 'Provider reported a streaming error' });
+  });
+});
+
+describe('streamed responses that end abnormally', () => {
+  const paidOpenRouter = (runtime: ReturnType<typeof createProviderExecutionContext>) => config({
+    provider: 'openrouter',
+    model: 'anthropic/claude-sonnet-5.5',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    runtime,
+  });
+  const streamOf = (chunks: unknown[], done = true) => new Response(
+    chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + (done ? 'data: [DONE]\n\n' : ''),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+  const streamed = (cfg: ProviderRuntimeConfig) => createChatCompletion(cfg, {
+    messages: [{ role: 'user', content: 'Extract' }],
+    maxTokens: 10,
+    onDelta: () => undefined,
+  });
+
+  it('counts a truncated stream without usage as unreported, which closes a paid cap', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 1 });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([{ choices: [{ delta: { content: 'partial' } }] }]))));
+    await expect(streamed(paidOpenRouter(runtime))).rejects.toThrow('without a terminal finish reason');
+    expect(runtime.getUsage()).toMatchObject({ requests: 1, unreportedUsageRequests: 1 });
+    expect(runtime.wasUsageUnknownUnderCostLimit()).toBe(true);
+    expect(runtime.hasReachedCostLimit()).toBe(true);
+  });
+
+  it('counts a stream cut off by a transport error after generation started', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 1 });
+    const encoder = new TextEncoder();
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { reasoning: 'thinking' } }] })}\n\n`));
+          return;
+        }
+        controller.error(new TypeError('terminated', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }));
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }))));
+    await expect(streamed(paidOpenRouter(runtime))).rejects.toThrow('terminated');
+    expect(runtime.getUsage()).toMatchObject({ unreportedUsageRequests: 1 });
+    expect(runtime.hasReachedCostLimit()).toBe(true);
+  });
+
+  it('records a truncated stream that carried usage exactly once', async () => {
+    const runtime = createProviderExecutionContext();
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta: { content: 'partial' } }] },
+      { choices: [], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } },
+    ]))));
+    await expect(streamed(config({ runtime }))).rejects.toThrow('without a terminal finish reason');
+    expect(runtime.getUsage()).toMatchObject({ requests: 1, totalTokens: 5 });
+    expect(runtime.getUsage()).not.toHaveProperty('unreportedUsageRequests');
+  });
+
+  it('records nothing for a stream that failed before generating anything', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 1 });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { error: { code: 'RESOURCE_EXHAUSTED', message: 'capacity exhausted' } },
+    ], false))));
+    await expect(streamed(paidOpenRouter(runtime))).rejects.toThrow('capacity exhausted');
+    expect(runtime.getUsage()).not.toHaveProperty('unreportedUsageRequests');
+    expect(runtime.hasReachedCostLimit()).toBe(false);
+  });
+
+  it('records a complete stream without usage once', async () => {
+    const runtime = createProviderExecutionContext();
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] },
+    ]))));
+    await expect(streamed(config({ runtime }))).resolves.toMatchObject({ text: 'done' });
+    expect(runtime.getUsage()).toMatchObject({ requests: 1, unreportedUsageRequests: 1 });
+  });
+
+  it.each([
+    ['openrouter reasoning', { reasoning: 'long reasoning' }],
+    ['kimi reasoning_content', { reasoning_content: 'long reasoning' }],
+  ])('reports a %s-only stream that hit max_tokens as truncation, not an empty response', async (_label, delta) => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta }] },
+      { choices: [{ delta: {}, finish_reason: 'length' }] },
+      { choices: [], usage: { prompt_tokens: 2, completion_tokens: 10, total_tokens: 12 } },
+    ]))));
+    await expect(streamed(config())).rejects.toThrow('output token limit');
+  });
+
+  it('reports a reasoning-only stream stopped by a content filter as filtered', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta: { reasoning_content: 'considering' } }] },
+      { choices: [{ delta: {}, finish_reason: 'content_filter' }] },
+    ]))));
+    await expect(streamed(config())).rejects.toThrow('content filter');
+  });
+
+  it('still reports a streamed refusal that ends in content_filter as a refusal', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta: { refusal: 'I cannot help with that.' } }] },
+      { choices: [{ delta: {}, finish_reason: 'content_filter' }] },
+    ]))));
+    await expect(streamed(config())).rejects.toMatchObject({ code: 'MODEL_REFUSAL' });
+  });
+
+  it('counts a usage-less empty stream as unreported under a paid cap', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 1 });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamOf([
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+    ]))));
+    await expect(streamed(paidOpenRouter(runtime))).rejects.toThrow('empty response');
+    expect(runtime.getUsage()).toMatchObject({ unreportedUsageRequests: 1 });
+    expect(runtime.hasReachedCostLimit()).toBe(true);
+  });
+});

@@ -2,7 +2,7 @@ import { lookup } from 'node:dns/promises';
 import http, { type IncomingMessage, type RequestOptions } from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
-import type { Readable } from 'node:stream';
+import { pipeline, type Readable, type Transform } from 'node:stream';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 
 import { isPublicIpAddress, parseSupportedHttpUrl } from '@open-ocr/engine/urlValidation';
@@ -15,13 +15,60 @@ import { CliExitError } from './errors';
  * as `PROVIDER_FAILURE`/`provider` — telling an agent to read a provider message
  * that does not exist, for a request no provider ever saw.
  */
-function urlInputError(message: string, hint: string, retryable = false): CliExitError {
+function urlInputError(message: string, hint: string, retryable = false, cause?: unknown): CliExitError {
   return new CliExitError(message, 2, {
+    ...(cause === undefined ? {} : { cause }),
     code: 'INPUT_INVALID',
     category: 'input',
     retryable,
     hint,
   });
+}
+
+/** Transport failures a later attempt can get past: a reset, a refused or dropped connection, a slow resolver. */
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH',
+  'ENETUNREACH', 'ENETDOWN', 'ERR_STREAM_PREMATURE_CLOSE', 'URL_NETWORK_IDLE',
+  // A compressed body cut off mid-stream.
+  'Z_BUF_ERROR',
+]);
+
+function errorCode(error: unknown): string | undefined {
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * Type a raw DNS, connect, TLS, socket, or decoding failure as the input
+ * problem it is, keeping the original as `cause`. Aborts, the deadline, and
+ * errors this module already typed pass through untouched.
+ */
+function transportError(error: unknown, value: string, signal: AbortSignal): unknown {
+  if (error instanceof CliExitError || signal.aborted) return error;
+  const name = typeof error === 'object' && error !== null ? (error as { name?: unknown }).name : undefined;
+  if (name === 'AbortError' || name === 'TimeoutError') return error;
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  const detail = code !== undefined && !code.startsWith('URL_') && !message.includes(code)
+    ? `${message || code} (${code})`
+    : message || code || 'unknown error';
+  if (code === 'ENOTFOUND') {
+    return urlInputError(
+      `Could not retrieve ${value}: ${detail}`,
+      'Check the URL; its host name does not resolve.',
+      false,
+      error,
+    );
+  }
+  const retryable = code !== undefined && RETRYABLE_TRANSPORT_CODES.has(code);
+  return urlInputError(
+    `Could not retrieve ${value}: ${detail}`,
+    retryable
+      ? 'The connection to the source site failed; retry later or use a different URL.'
+      : 'The source site could not be fetched (a TLS or certificate failure, or a malformed response); check the URL.',
+    retryable,
+    error,
+  );
 }
 
 const MAX_REDIRECTS = 5;
@@ -69,18 +116,44 @@ async function resolvedPublicAddresses(hostname: string): Promise<Array<{ addres
   return addresses.map((entry) => ({ address: entry.address, family: entry.family as 4 | 6 }));
 }
 
-function decodedStream(response: IncomingMessage): Readable {
+function decoderFor(response: IncomingMessage): Transform | undefined {
   const encoding = String(response.headers['content-encoding'] ?? '').toLowerCase();
-  if (encoding === 'gzip') return response.pipe(createGunzip());
-  if (encoding === 'deflate') return response.pipe(createInflate());
-  if (encoding === 'br') return response.pipe(createBrotliDecompress());
-  return response;
+  if (encoding === 'gzip') return createGunzip();
+  if (encoding === 'deflate') return createInflate();
+  if (encoding === 'br') return createBrotliDecompress();
+  return undefined;
+}
+
+/**
+ * The response body, decompressed when it is encoded.
+ *
+ * Joined with `pipeline`, not `pipe`: `pipe` forwards neither a source error
+ * nor a premature close, so a compressed response whose connection dropped
+ * mid-body left the decoder waiting until the total deadline, and was then
+ * misreported (and retried) as a slow site. `pipeline` destroys every stream
+ * when one fails, which also releases the socket when the decoder is destroyed
+ * for an oversized body.
+ */
+function decodedStream(response: IncomingMessage): Readable {
+  const decoder = decoderFor(response);
+  if (!decoder) return response;
+  pipeline(response, decoder, () => undefined);
+  return decoder;
+}
+
+function prematureClose(): CliExitError {
+  return urlInputError(
+    'URL response ended before its body was complete',
+    'The connection to the source site dropped; retry later or use a different URL.',
+    true,
+  );
 }
 
 function readBounded(stream: Readable, signal?: AbortSignal): Promise<Uint8Array> {
   return new Promise<Uint8Array>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let ended = false;
     const cleanup = (): void => signal?.removeEventListener('abort', onAbort);
     const onAbort = (): void => {
       stream.destroy(signal?.reason instanceof Error
@@ -102,7 +175,10 @@ function readBounded(stream: Readable, signal?: AbortSignal): Promise<Uint8Array
       chunks.push(buffer);
     });
     stream.once('error', (error) => { cleanup(); reject(error); });
-    stream.once('end', () => { cleanup(); resolve(Buffer.concat(chunks)); });
+    stream.once('end', () => { ended = true; cleanup(); resolve(Buffer.concat(chunks)); });
+    // A stream destroyed without an error (or closed before `end`) would
+    // otherwise leave this promise pending until the total deadline.
+    stream.once('close', () => { cleanup(); if (!ended) reject(prematureClose()); });
   });
 }
 
@@ -126,7 +202,18 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
         'Accept-Encoding': 'gzip, deflate, br',
         'User-Agent': 'open-ocr-cli (+https://github.com/cyanxxy/open-ocr-cli-mcp)',
       },
-      lookup: (_hostname, _options, callback) => callback(null, selected.address, selected.family),
+      // Pinned to the validated answers. Node's connect asks for every address
+      // (`all: true`, for happy eyeballs) unless a family is fixed, and then
+      // expects an array: answering in the single-address form failed every
+      // hostname URL with ERR_INVALID_IP_ADDRESS. Every address handed over
+      // here was checked by `resolvedPublicAddresses`.
+      lookup: (_hostname, lookupOptions, callback) => {
+        if (lookupOptions.all) {
+          callback(null, addresses.map(({ address, family }) => ({ address, family })));
+          return;
+        }
+        callback(null, selected.address, selected.family);
+      },
       // SNI carries names, never addresses; sending an IP literal as the server
       // name is rejected by conforming servers.
       ...(url.protocol === 'https:' && isIP(host) === 0 ? { servername: host } : {}),
@@ -134,7 +221,11 @@ async function requestOnce(url: URL, signal?: AbortSignal): Promise<IncomingMess
     const client = url.protocol === 'https:' ? https : http;
     const request = client.request(options, resolve);
     request.setTimeout(NETWORK_IDLE_TIMEOUT_MS, () => {
-      request.destroy(new Error(`URL network operation was idle for ${NETWORK_IDLE_TIMEOUT_MS / 1000} seconds`));
+      const idle: NodeJS.ErrnoException = new Error(
+        `URL network operation was idle for ${NETWORK_IDLE_TIMEOUT_MS / 1000} seconds`,
+      );
+      idle.code = 'URL_NETWORK_IDLE';
+      request.destroy(idle);
     });
     const onAbort = (): void => {
       request.destroy(signal?.reason instanceof Error
@@ -193,10 +284,18 @@ async function fetchFollowingRedirects(
       'Use a public http(s) URL without embedded credentials.',
     );
   }
-  const response = await requestOnce(url, signal);
+  let response: IncomingMessage;
+  try {
+    response = await requestOnce(url, signal);
+  } catch (error) {
+    throw transportError(error, value, signal);
+  }
   const status = response.statusCode ?? 0;
   if (status >= 300 && status < 400) {
-    response.resume();
+    // The body of a redirect or an error is never used. Draining it with
+    // `resume()` kept a hostile endless body streaming into this process after
+    // the fetch had returned, outliving the total deadline.
+    response.destroy();
     const location = response.headers.location;
     if (!location) {
       throw urlInputError(
@@ -210,10 +309,21 @@ async function fetchFollowingRedirects(
         'Request the final URL directly.',
       );
     }
-    return fetchFollowingRedirects(new URL(location, url).toString(), signal, redirectCount + 1);
+    let next: string;
+    try {
+      next = new URL(location, url).toString();
+    } catch (error) {
+      throw urlInputError(
+        `URL redirect from ${value} has an invalid Location`,
+        'Request the redirect target directly.',
+        false,
+        error,
+      );
+    }
+    return fetchFollowingRedirects(next, signal, redirectCount + 1);
   }
   if (status < 200 || status >= 300) {
-    response.resume();
+    response.destroy();
     // A 5xx or 429 from the *source site* is worth retrying; a 4xx is the URL
     // being wrong, which retrying cannot fix.
     throw urlInputError(
@@ -232,9 +342,16 @@ async function fetchFollowingRedirects(
       'Use a smaller source document.',
     );
   }
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBounded(decodedStream(response), signal);
+  } catch (error) {
+    response.destroy();
+    throw transportError(error, value, signal);
+  }
   return {
     url: url.toString(),
     contentType: String(response.headers['content-type'] ?? 'application/octet-stream').split(';')[0].trim().toLowerCase(),
-    bytes: await readBounded(decodedStream(response), signal),
+    bytes,
   };
 }

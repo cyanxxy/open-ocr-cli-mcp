@@ -70,7 +70,19 @@ export function agenticExtractionResult(memory: AgentMemory): AgenticExtractionR
       ...(field.isValid !== undefined ? { valid: field.isValid } : {}),
       ...(field.validationMessage !== undefined ? { validationMessage: field.validationMessage } : {}),
       ...(field.validation_rule !== undefined ? { validationRule: field.validation_rule } : {}),
-      ...(field.location !== undefined ? { location: field.location } : {}),
+      // Exactly the published region keys: the engine already returns a fresh
+      // region, but a model-added key here would break the result schema
+      // after the paid run, so the projection does not rely on it.
+      ...(field.location !== undefined ? {
+        location: {
+          page: field.location.page,
+          x: field.location.x,
+          y: field.location.y,
+          width: field.location.width,
+          height: field.location.height,
+          units: field.location.units,
+        },
+      } : {}),
     }]),
   );
   return {
@@ -139,6 +151,7 @@ function finalizeAgentTrace(steps: AgentStep[]): AgentStep[] {
 async function runAgentic(
   input: ResolvedInput,
   dataUrl: string,
+  pageCount: number,
   options: ResolvedCliOptions,
   signal: AbortSignal,
   onStep: (step: AgentStep) => void,
@@ -149,6 +162,15 @@ async function runAgentic(
   // Measured from the document's own deadline, not restarted here, so the
   // agent stops first and keeps its partial fields (see agentBudgetDeadline).
   const maxDurationMs = Math.max(1, budgetDeadline - Date.now());
+  const loopConfig = {
+    maxIterations: options.maxIterations,
+    confidenceThreshold: options.confidenceThreshold,
+    maxTokens: options.maxTokens,
+    maxDurationMs,
+    throwOnFailure: true,
+    // Read when the input was validated: the PDF page count, 1 for an image.
+    pageCount,
+  };
   const generator = options.provider === 'gemini' ? agentLoop(
     { name: input.name, type: input.mimeType },
     dataUrl,
@@ -165,24 +187,12 @@ async function runAgentic(
       regionCropper: nodeRegionCropper,
       runtime,
     },
-    {
-      maxIterations: options.maxIterations,
-      confidenceThreshold: options.confidenceThreshold,
-      maxTokens: options.maxTokens,
-      maxDurationMs,
-      throwOnFailure: true,
-    },
+    loopConfig,
   ) : providerAgentLoop(
     { name: input.name, type: input.mimeType },
     dataUrl,
     config,
-    {
-      maxIterations: options.maxIterations,
-      confidenceThreshold: options.confidenceThreshold,
-      maxTokens: options.maxTokens,
-      maxDurationMs,
-      throwOnFailure: true,
-    },
+    loopConfig,
     nodeRegionCropper,
     signal,
   );
@@ -215,7 +225,7 @@ async function extractOnce(
   runtime: ProviderExecutionContext,
   budgetDeadline: number,
 ): Promise<OcrArtifacts> {
-  const { dataUrl } = await readAndValidateInput(input);
+  const { dataUrl, pageCount } = await readAndValidateInput(input);
   const clientConfig = providerRuntimeConfig(options, runtime);
 
   if (options.mode === 'template') {
@@ -237,7 +247,7 @@ async function extractOnce(
     };
   }
   if (options.mode === 'agentic') {
-    return runAgentic(input, dataUrl, options, signal, onStep, runtime, budgetDeadline);
+    return runAgentic(input, dataUrl, pageCount, options, signal, onStep, runtime, budgetDeadline);
   }
 
   const instructions: ExtractionInstruction[] = options.instructions.map((prompt) => ({ prompt }));

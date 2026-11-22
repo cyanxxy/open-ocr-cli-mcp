@@ -1,4 +1,8 @@
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS build
+# Node.js 24.22.3 (the 2026-11-10 security release) on Debian bookworm-slim.
+# The tag names the exact Node.js release and the digest pins the image bytes.
+# Dependabot proposes tag and digest updates for both stages; update the
+# Node.js version named in these comments with them.
+FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 # Every workspace manifest must be present for `npm ci` to reconcile the
@@ -9,7 +13,8 @@ RUN npm ci --workspace=open-ocr-cli --include-workspace-root=false
 COPY . .
 RUN npm run cli:build
 
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS runtime
+# Same Node.js 24.22.3 bookworm-slim image as the build stage.
+FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/cyanxxy/open-ocr-cli-mcp"
 LABEL org.opencontainers.image.description="Agent-first OCR CLI and MCP server"
 ENV NODE_ENV=production

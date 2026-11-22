@@ -293,16 +293,34 @@ export async function runEvalCase(evalCase: EvalCase, clientConfig: ProviderRunt
       // The runtime error below remains the actionable failure if loading the
       // reference also fails.
     }
+    let result: ReturnType<typeof evaluateEvalCase>;
+    try {
+      result = evaluateEvalCase(evalCase, output, groundTruth, execution);
+    } catch {
+      // Scoring this output is what threw: score an empty output instead, so
+      // the case is reported as failed (with the runtime error above) and the
+      // run still writes the summary and artifacts of every paid case.
+      result = evaluateEvalCase(evalCase, { markdown: '' }, groundTruth, execution);
+    }
     return {
-      result: evaluateEvalCase(evalCase, output, groundTruth, execution),
+      result,
       artifact: { evalCase, output, repeatIndex },
     };
   }
 }
 
-function resolveThinkingLevel(provider: ProviderId, model: string): ThinkingLevel {
+/**
+ * The eval run's thinking config. A level set with OPEN_OCR_THINKING (or
+ * GEMINI_THINKING_LEVEL) is explicit, as it is in the CLI, so it is sent even
+ * on an OpenRouter route with no known reasoning contract.
+ */
+export function resolveEvalThinkingConfig(
+  provider: ProviderId,
+  model: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonNullable<ProviderRuntimeConfig['thinkingConfig']> {
   const allowedLevels = cliThinkingLevels(provider, model);
-  const envLevel = (process.env.OPEN_OCR_THINKING ?? process.env.GEMINI_THINKING_LEVEL)?.toUpperCase();
+  const envLevel = (env.OPEN_OCR_THINKING ?? env.GEMINI_THINKING_LEVEL)?.toUpperCase();
 
   if (envLevel) {
     if (!allowedLevels.includes(envLevel as ThinkingLevel)) {
@@ -310,9 +328,9 @@ function resolveThinkingLevel(provider: ProviderId, model: string): ThinkingLeve
         `OPEN_OCR_THINKING must be one of ${allowedLevels.join(', ')} for ${provider}/${model}`,
       );
     }
-    return envLevel as ThinkingLevel;
+    return { level: envLevel as ThinkingLevel, includeThoughts: false, explicit: true };
   }
-  return defaultCliThinkingLevel(provider, model);
+  return { level: defaultCliThinkingLevel(provider, model), includeThoughts: false };
 }
 
 export function resolveEvalTokenPrices(
@@ -366,7 +384,7 @@ async function main() {
   }
   const suite = resolveSuiteName();
   const repeatCount = resolveRepeatCount();
-  const thinkingLevel = resolveThinkingLevel(provider, model);
+  const thinkingConfig = resolveEvalThinkingConfig(provider, model);
   const evalCases = await loadEvalCases(suite);
   if (evalCases.length === 0) {
     const setupHint = suite === 'benchmark' ? ' Run `npm run evals:setup` first.' : '';
@@ -380,10 +398,7 @@ async function main() {
     apiKeyEnv,
     model,
     baseUrl,
-    thinkingConfig: {
-      level: thinkingLevel,
-      includeThoughts: false,
-    },
+    thinkingConfig,
     gatewayToken: process.env.CLOUDFLARE_AI_GATEWAY_TOKEN,
     gatewayTokenEnv: 'CLOUDFLARE_AI_GATEWAY_TOKEN',
     cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,

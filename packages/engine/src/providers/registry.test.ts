@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   estimateProviderRequestCostUsd,
+  GEMINI_MODELS,
   isKimiK3Route,
   isLocalBaseUrl,
   knownModelThinkingLevels,
@@ -174,6 +175,64 @@ describe('provider registry routing', () => {
     expect(providerTokenPrice({ provider: 'kimi', model: 'gemini-3.8-flash' }, 0)).toBeUndefined();
     expect(providerTokenPrice({ provider: 'openrouter', model: 'openai/gpt-6.1-sol' }, 272_000)).toEqual({
       inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 15,
+    });
+  });
+});
+
+describe('Gemini 4 models and thinking table (checked 2026-11-21)', () => {
+  const expected: Record<(typeof GEMINI_MODELS)[number], { levels: string[]; defaultLevel: string }> = {
+    'gemini-3.8-flash': { levels: ['LOW', 'MEDIUM', 'HIGH'], defaultLevel: 'MEDIUM' },
+    'gemini-4-argon': { levels: ['LOW', 'MEDIUM', 'HIGH'], defaultLevel: 'MEDIUM' },
+    'gemini-4-carbon': { levels: ['LOW', 'MEDIUM', 'HIGH'], defaultLevel: 'MEDIUM' },
+    'gemini-4-hydrogen': { levels: ['LOW', 'MEDIUM', 'HIGH', 'XHIGH'], defaultLevel: 'HIGH' },
+    'gemini-4-neon': { levels: ['LOW', 'MEDIUM', 'HIGH', 'XHIGH'], defaultLevel: 'HIGH' },
+    'gemini-3.5-flash-lite': { levels: ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'], defaultLevel: 'MINIMAL' },
+  };
+
+  it('keeps 3.8 Flash as the default and selects every current Gemini 4 model', () => {
+    expect(GEMINI_MODELS[0]).toBe('gemini-3.8-flash');
+    expect(GEMINI_MODELS).toEqual(expect.arrayContaining(['gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-neon']));
+  });
+
+  it.each(GEMINI_MODELS)('has an explicit thinking contract for %s on direct and OpenRouter routes', (model) => {
+    expect(knownModelThinkingLevels('gemini', model)).toEqual(expected[model].levels);
+    expect(providerDefaultThinkingLevel('gemini', model)).toBe(expected[model].defaultLevel);
+    expect(knownModelThinkingLevels('openrouter', `google/${model}`)).toEqual(expected[model].levels);
+    expect(providerDefaultThinkingLevel('openrouter', `google/${model}:nitro`)).toBe(expected[model].defaultLevel);
+    expect(providerTokenPrice({ provider: 'gemini', model }, 0)).toBeDefined();
+  });
+
+  it('fails closed for a Gemini model outside the table', () => {
+    expect(knownModelThinkingLevels('gemini', 'gemini-4-unlisted')).toBeUndefined();
+    expect(knownModelThinkingLevels('openrouter', 'google/gemini-4-unlisted')).toBeUndefined();
+  });
+
+  it('prices Gemini 4 Carbon, Hydrogen and Neon, including Carbon\'s 2026-12-01 change', () => {
+    const carbon = { provider: 'gemini', model: 'gemini-4-carbon' } as const;
+    expect(providerTokenPrice(carbon, 0, Date.UTC(2026, 10, 30, 23, 59, 59))).toEqual({
+      inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10,
+    });
+    expect(providerTokenPrice(carbon, 0, Date.UTC(2026, 11, 1))).toEqual({
+      inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20,
+    });
+    expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-4-hydrogen' }, 0)).toEqual({
+      inputPerMillionUsd: 1.5, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 7.5,
+    });
+    expect(providerTokenPrice({ provider: 'gemini', model: 'gemini-4-neon' }, 0)).toEqual({
+      inputPerMillionUsd: 3, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 15,
+    });
+  });
+});
+
+describe('Claude Fable 5.2 on OpenRouter', () => {
+  it('is suggested beside Fable 5.1 with Fable\'s effort contract and Anthropic list price', () => {
+    const models = providerProfile('openrouter').models;
+    expect(models).toContain('anthropic/claude-fable-5.2');
+    expect(models).toContain('anthropic/claude-fable-5.1');
+    expect(knownModelThinkingLevels('openrouter', 'anthropic/claude-fable-5.2')).toEqual(['LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX']);
+    expect(providerDefaultThinkingLevel('openrouter', 'anthropic/claude-fable-5.2')).toBe('HIGH');
+    expect(providerTokenPrice({ provider: 'openrouter', model: 'anthropic/claude-fable-5.2' }, 0)).toEqual({
+      inputPerMillionUsd: 8, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 40,
     });
   });
 });

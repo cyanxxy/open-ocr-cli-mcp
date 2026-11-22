@@ -29,9 +29,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both advertised minimums plus the current LTS line. The
-        # expensive static/coverage gates only need to run once on Node 24.
-        node-version: [20.19.0, 22.13.0, 24.x]
+        # Exercise both advertised minimums, Node 24 (Maintenance LTS since
+        # 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
+        # static/coverage gates only need to run once on Node 24.
+        node-version: [20.19.0, 22.13.0, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
@@ -49,8 +50,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Test release automation
-        run: node --test scripts/release-automation.test.mjs
+      - name: Test release and packaging scripts
+        run: node --test scripts/*.test.mjs
 
       # The release workflow rejects a version whose changelog section lacks
       # headings or a comparison link; check it before merge, not after tagging.
@@ -126,8 +127,44 @@ jobs:
       - name: Smoke-test GitHub Action wrapper
         run: npm run action:smoke
 
+      - name: Pack CLI for the Homebrew and local action smokes
+        id: cli-package
+        shell: bash
+        run: |
+          tarball=$(npm pack ./packages/cli --pack-destination "$RUNNER_TEMP" | tail -n 1)
+          echo "tarball=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
+          echo "node=$(node --version)" >> "$GITHUB_OUTPUT"
+
+      # The attached formula installs with std_npm_args; mirror it before release.
+      - name: Smoke-test Homebrew-style installation
+        run: node scripts/smoke-homebrew-install.mjs "${{ steps.cli-package.outputs.tarball }}"
+
+      # The composite action must not replace a supported Node.js the job
+      # already set up: setup-node's PATH change lasts for the rest of the job.
+      - name: Run local action on the job's Node.js
+        uses: ./
+        env:
+          OPEN_OCR_ACTION_PACKAGE: ${{ steps.cli-package.outputs.tarball }}
+        with:
+          inputs: evals/corpus/raster/invoice.png
+          provider: kimi
+          output: ${{ runner.temp }}/action-output
+          dry-run: 'true'
+
+      - name: Verify the action kept the job's Node.js
+        shell: bash
+        env:
+          EXPECTED_NODE: ${{ steps.cli-package.outputs.node }}
+        run: |
+          actual=$(node --version)
+          if [[ "$actual" != "$EXPECTED_NODE" ]]; then
+            echo "The action switched the job from Node.js $EXPECTED_NODE to $actual" >&2
+            exit 1
+          fi
+
       # Keep Build Application's required check name stable while validating
-      # both the current build runtime and the oldest supported consumer.
+      # the current build runtime, the oldest supported consumer, and the
+      # Active LTS line.
       - name: Setup minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -135,6 +172,15 @@ jobs:
           package-manager-cache: false
 
       - name: Smoke-test engine-strict CLI installation on Node 20
+        run: npm run cli:install-smoke
+
+      - name: Setup Active LTS Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.x'
+          package-manager-cache: false
+
+      - name: Smoke-test engine-strict CLI installation on Node 26
         run: npm run cli:install-smoke
 
   # Release workflows publish a multi-architecture image. CI performs the
@@ -157,3 +203,8 @@ jobs:
 
       - name: Verify non-root work directory is writable
         run: docker run --rm --entrypoint sh open-ocr-cli:ci -c 'test -w /work'
+
+      # Fails when the image runs another Node.js than its pinned tag names, and
+      # warns when that release misses a newer security release on its line.
+      - name: Check container Node.js release
+        run: node scripts/check-container-node.mjs --image-version "$(docker run --rm --entrypoint node open-ocr-cli:ci -p process.version)"

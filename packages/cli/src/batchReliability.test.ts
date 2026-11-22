@@ -344,6 +344,66 @@ describe('crash-safe resume', () => {
     expect(manifest.entries[input.absolutePath!].fingerprintVersion).toBe(2);
   });
 
+  it('re-extracts a 4.3.0 artifact named like an agent instruction file into the .ocr name', async () => {
+    const docs = await seedDocs(['CLAUDE.jpg']);
+    const options = batchOptions();
+    const [input] = (await discoverInputSet([docs], options)).inputs;
+    const out = path.join(directory, 'out');
+    const legacy = path.join(out, 'docs', 'CLAUDE.md');
+    await mkdir(path.dirname(legacy), { recursive: true });
+    await writeFile(legacy, '# old');
+    await writeFile(path.join(out, '.open-ocr-manifest.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [input.absolutePath!]: {
+          fingerprint: inputFingerprint(input, modeFingerprint(options)),
+          status: 'succeeded',
+          outputFiles: [legacy],
+          completedAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    }));
+    const extractDocument = markdownExtractor();
+    const service = new OcrJobService({ extractDocument });
+    const execution = await run(service, [docs], options);
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(execution.summary.results[0].outputFiles).toEqual([path.join(out, 'docs', 'CLAUDE.ocr.md')]);
+    await expect(readFile(path.join(out, 'docs', 'CLAUDE.ocr.md'), 'utf8')).resolves.toContain('# CLAUDE.jpg');
+    // Upgraded to the current layout, so the next resume skips it there.
+    const again = await run(service, [docs], options);
+    expect(again.summary.results[0]).toMatchObject({
+      skipReason: 'resumed', outputFiles: [path.join(out, 'docs', 'CLAUDE.ocr.md')],
+    });
+    expect(extractDocument).toHaveBeenCalledOnce();
+  });
+
+  it('sets an unreadable manifest aside under --overwrite instead of refusing every run', async () => {
+    const docs = await seedDocs(['a.jpg']);
+    const out = path.join(directory, 'out');
+    const service = new OcrJobService({ extractDocument: markdownExtractor() });
+    await run(service, [docs], batchOptions());
+    // What an OS crash on a filesystem that commits the rename before the data leaves.
+    await writeFile(path.join(out, '.open-ocr-manifest.json'), '');
+
+    const refused = await run(service, [docs], batchOptions()).catch((error: unknown) => error);
+    expect(refused).toMatchObject({ code: 'INPUT_INVALID' });
+    expect((refused as { hint?: string }).hint).toContain(path.join(out, '.open-ocr-manifest.json'));
+
+    const dryWarnings: string[] = [];
+    const dry = await run(service, [docs], batchOptions({ overwrite: true, dryRun: true }), dryWarnings);
+    expect(dry.summary.failed).toBe(0);
+    expect(dryWarnings.join('\n')).toContain('would move it aside');
+    await expect(readFile(path.join(out, '.open-ocr-manifest.json'), 'utf8')).resolves.toBe('');
+
+    const warnings: string[] = [];
+    const overwritten = await run(service, [docs], batchOptions({ overwrite: true }), warnings);
+    expect(overwritten.summary.succeeded).toBe(1);
+    expect(warnings.join('\n')).toContain('was not valid JSON; moved it to');
+    const { readdir } = await import('node:fs/promises');
+    expect((await readdir(out)).some((name) => name.startsWith('.open-ocr-manifest.json.corrupt-'))).toBe(true);
+    expect(await inspectBatchStatus(out, directory)).toMatchObject({ healthy: true });
+  });
+
   it('points --no-resume conflicts at --overwrite or a new output, not at resuming', async () => {
     const docs = await seedDocs(['x.jpg']);
     const service = new OcrJobService({ extractDocument: markdownExtractor() });
@@ -418,6 +478,84 @@ describe('spend accounting across runs', () => {
     expect(execution.summary.usage.unreportedUsageRequests).toBe(1);
     expect(execution.result.usage.unreportedUsageRequests).toBe(1);
     expect(warnings.join('\n')).toContain('fail closed');
+  });
+
+  const unmetered = (inputPrice: number) => vi.fn<OcrDocumentExtractor>(async (input, _options, _signal, _step, runtime) => {
+    await runtime.waitForRequestSlot();
+    runtime.recordUsage({}, {
+      provider: 'openai-compatible', model: 'm', inputPricePerMillionUsd: inputPrice, outputPricePerMillionUsd: inputPrice,
+    });
+    return { artifacts: { markdown: `# ${input.name}` }, attempts: 1 };
+  });
+
+  it('keeps a capped job closed on resume when earlier runs sent paid requests that reported no usage', async () => {
+    const docs = await seedDocs(['p1.jpg', 'p2.jpg', 'p3.jpg']);
+    const extractDocument = unmetered(1);
+    const service = new OcrJobService({ extractDocument });
+    const first = await run(service, [docs], batchOptions({ maxCost: '5' }));
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(first.summary.costLimitReached).toBe(true);
+    // Resume bookkeeping, not part of the published usage.
+    expect(first.summary.cumulativeUsage?.unmeteredPaidRequests).toBe(1);
+    expect(first.result.usage).not.toHaveProperty('unmeteredPaidRequests');
+
+    // The same command again: the recorded total ($0) is not the job's spend.
+    const warnings: string[] = [];
+    const second = await run(service, [docs], batchOptions({ maxCost: '5' }), warnings);
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(second.summary.results.map((result) => result.skipReason)).toEqual(['resumed', 'cost-limit', 'cost-limit']);
+    expect(second.summary.costLimitReached).toBe(true);
+    expect(warnings.join('\n')).toContain('Earlier runs of');
+    expect(warnings.join('\n')).toContain('paid request(s) whose provider reported no token usage');
+    expect(second.summary.results[1].errorDetails).toMatchObject({ code: 'COST_LIMIT' });
+    expect(second.summary.results[1].errorDetails?.hint).toContain('raising --max-cost cannot help');
+
+    // Raising the cap does not reopen it either.
+    await run(service, [docs], batchOptions({ maxCost: '50' }));
+    expect(extractDocument).toHaveBeenCalledOnce();
+
+    // --overwrite starts a new job and a new total.
+    await run(service, [docs], batchOptions({ maxCost: '5', overwrite: true }));
+    expect(extractDocument).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an earlier free route without usage block a later capped run', async () => {
+    const docs = await seedDocs(['f1.jpg']);
+    const free = unmetered(0);
+    await run(new OcrJobService({ extractDocument: free }), [docs], batchOptions({ maxCost: '5' }));
+    const manifest = JSON.parse(await readFile(path.join(directory, 'out', '.open-ocr-manifest.json'), 'utf8')) as {
+      usage?: Record<string, number>;
+    };
+    // The shape a manifest from an earlier release has: a gap count, no paid count.
+    expect(manifest.usage?.unreportedUsageRequests).toBe(1);
+    expect(manifest.usage?.unmeteredPaidRequests).toBeUndefined();
+
+    await writeFile(path.join(docs, 'f2.jpg'), JPEG_BYTES);
+    const extractDocument = costing(0.01);
+    const second = await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ maxCost: '5' }));
+    expect(extractDocument).toHaveBeenCalledOnce();
+    expect(second.summary).toMatchObject({ succeeded: 1, skipped: 1, costLimitReached: false });
+  });
+
+  it('persists a capped document\'s spend as each paid response arrives, not only when it finishes', async () => {
+    const docs = await seedDocs(['long.jpg']);
+    const manifestPath = path.join(directory, 'out', '.open-ocr-manifest.json');
+    let recordedWhileRunning: number | undefined;
+    const pause = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, MANIFEST_FLUSH_INTERVAL_MS + 300));
+    const extractDocument = vi.fn<OcrDocumentExtractor>(async (input, _options, _signal, _step, runtime) => {
+      // An agentic document paying for one response per iteration.
+      for (let iteration = 0; iteration < 2; iteration += 1) {
+        runtime.recordUsage({ usage: { input_tokens: 1, total_tokens: 1, cost: 4.5 } });
+        await pause();
+      }
+      // What a SIGKILL here would leave for the next resume's --max-cost check.
+      recordedWhileRunning = (JSON.parse(await readFile(manifestPath, 'utf8')) as {
+        usage?: { estimatedCostUsd: number };
+      }).usage?.estimatedCostUsd;
+      return { artifacts: { markdown: `# ${input.name}` }, attempts: 1 };
+    });
+    await run(new OcrJobService({ extractDocument }), [docs], batchOptions({ maxCost: '100' }));
+    expect(recordedWhileRunning).toBeCloseTo(9);
   });
 });
 

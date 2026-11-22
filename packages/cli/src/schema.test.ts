@@ -162,3 +162,51 @@ describe('custom JSON schemas', () => {
     })).toBeUndefined();
   });
 });
+
+describe('the documented keyword subset', () => {
+  it('accepts $anchor references and validates through them', () => {
+    const schema = validateCustomSchema({
+      $defs: { x: { $anchor: 'foo', type: 'string' } },
+      type: 'object',
+      properties: { a: { $ref: '#foo' } },
+    });
+    expect(() => assertCustomSchemaOutput(schema, { a: 'z' })).not.toThrow();
+    expect(() => assertCustomSchemaOutput(schema, { a: 1 })).toThrow(expect.objectContaining({ code: 'OUTPUT_INVALID' }) as Error);
+  });
+
+  it.each([
+    ['an open prefixItems tuple', { type: 'array', prefixItems: [{ type: 'string' }] }],
+    ['anyOf with required', {
+      type: 'object',
+      properties: { a: { type: 'string' }, b: { type: 'string' } },
+      anyOf: [{ required: ['a'] }, { required: ['b'] }],
+    }],
+    ['minimum without type', { minimum: 0 }],
+    ['properties without type', { properties: { a: { type: 'string' } } }],
+  ])('accepts %s', (_label, schema) => {
+    expect(() => validateCustomSchema(schema)).not.toThrow();
+  });
+
+  it.each([
+    ['a root self-reference', { $ref: '#' }],
+    ['a self-reference through anyOf', { anyOf: [{ $ref: '#' }, { type: 'string' }] }],
+    ['a two-step cycle', { $defs: { a: { $ref: '#/$defs/b' }, b: { $ref: '#/$defs/a' } }, $ref: '#/$defs/a' }],
+  ])('refuses %s before any provider call', (_label, schema) => {
+    let thrown: unknown;
+    try {
+      validateCustomSchema(schema);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(ocrErrorPayload(thrown).code).toBe('SCHEMA_INVALID');
+  });
+
+  it('still accepts recursion that descends into the value', () => {
+    const tree = validateCustomSchema({
+      $defs: { node: { type: 'object', properties: { children: { type: 'array', items: { $ref: '#/$defs/node' } } } } },
+      $ref: '#/$defs/node',
+    });
+    expect(() => assertCustomSchemaOutput(tree, { children: [{ children: [] }] })).not.toThrow();
+  });
+});

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { ProviderRuntimeConfig } from './types';
 import { getProviderUsage, recordProviderUsage, resetProviderUsage } from './usage';
+import { estimateProviderRequestCostUsd } from './registry';
 import { createProviderExecutionContext, ProviderCostLimitError } from './runtime';
 
 const openRouterConfig: ProviderRuntimeConfig = {
@@ -177,5 +178,124 @@ describe('provider usage accounting', () => {
     runtime.recordUsage({ usage: { total_tokens: 1, cost: 0.00000001 } });
     expect(runtime.hasReachedCostLimit()).toBe(true);
     await expect(runtime.waitForRequestSlot()).rejects.toBeInstanceOf(ProviderCostLimitError);
+  });
+});
+
+describe('OpenRouter BYOK cost accounting', () => {
+  const byokUsage = (extra: Record<string, unknown>) => ({
+    usage: { prompt_tokens: 1_000_000, completion_tokens: 100_000, total_tokens: 1_100_000, ...extra },
+  });
+
+  it('adds the upstream provider charge to the OpenRouter fee', () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 5 });
+    runtime.recordUsage(byokUsage({
+      cost: 0.06,
+      is_byok: true,
+      cost_details: { upstream_inference_cost: 1.2 },
+    }), openRouterConfig);
+    expect(runtime.getUsage().estimatedCostUsd).toBe(1.26);
+  });
+
+  it('accepts the split upstream input and output charges', () => {
+    const runtime = createProviderExecutionContext();
+    runtime.recordUsage(byokUsage({
+      cost: 0.06,
+      is_byok: true,
+      cost_details: { upstream_inference_input_cost: 0.75, upstream_inference_output_cost: 0.45 },
+    }), openRouterConfig);
+    expect(runtime.getUsage().estimatedCostUsd).toBe(1.26);
+  });
+
+  it('counts a waived fee plus the upstream charge on an unlisted model and trips the cap', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 1 });
+    runtime.recordUsage(byokUsage({
+      cost: 0,
+      is_byok: true,
+      cost_details: { upstream_inference_cost: 1.2 },
+    }), { ...openRouterConfig, model: 'some/unlisted-model' });
+    expect(runtime.getUsage().estimatedCostUsd).toBe(1.2);
+    expect(runtime.hasReachedCostLimit()).toBe(true);
+    await expect(runtime.waitForRequestSlot()).rejects.toBeInstanceOf(ProviderCostLimitError);
+  });
+
+  it('never treats a BYOK fee without an upstream figure as the whole charge', () => {
+    const runtime = createProviderExecutionContext();
+    runtime.recordUsage(byokUsage({ cost: 0.06, is_byok: true }), openRouterConfig);
+    const localEstimate = estimateProviderRequestCostUsd(openRouterConfig, 1_000_000, 100_000, 0);
+    expect(localEstimate).toBeGreaterThan(0.06);
+    expect(runtime.getUsage().estimatedCostUsd).toBeGreaterThanOrEqual(localEstimate);
+    expect(runtime.getUsage().estimatedCostUsd).toBeCloseTo(0.06 + localEstimate, 8);
+  });
+
+  it('leaves non-BYOK usage with a null upstream figure unchanged', () => {
+    const runtime = createProviderExecutionContext();
+    runtime.recordUsage(byokUsage({
+      cost: 0.06,
+      is_byok: false,
+      cost_details: { upstream_inference_cost: null },
+    }), openRouterConfig);
+    expect(runtime.getUsage().estimatedCostUsd).toBe(0.06);
+  });
+});
+
+describe('unmetered paid usage across resumed runs', () => {
+  const paid = { provider: 'openai-compatible', model: 'm', inputPricePerMillionUsd: 1, outputPricePerMillionUsd: 2 } as const;
+  const free = { provider: 'openai-compatible', model: 'm', inputPricePerMillionUsd: 0, outputPricePerMillionUsd: 0 } as const;
+
+  it('counts unreported responses at paid prices, capped or not, and only those', () => {
+    const runtime = createProviderExecutionContext();
+    runtime.recordUsage({}, paid);
+    runtime.recordUsage({}, free);
+    expect(runtime.getUsage()).toMatchObject({ unreportedUsageRequests: 2, unmeteredPaidRequests: 1 });
+    expect(runtime.wasUsageUnknownUnderCostLimit()).toBe(false);
+
+    const freeOnly = createProviderExecutionContext({ maxCostUsd: 1 });
+    freeOnly.recordUsage({}, free);
+    expect(freeOnly.getUsage()).not.toHaveProperty('unmeteredPaidRequests');
+    expect(freeOnly.hasReachedCostLimit()).toBe(false);
+  });
+
+  it('fails closed for a capped rerun whose earlier run left spend unknown, across resetUsage', async () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 5 });
+    runtime.setPriorUsageUnknown();
+    runtime.resetUsage();
+    expect(runtime.hasReachedCostLimit()).toBe(true);
+    expect(runtime.wasUsageUnknownUnderCostLimit()).toBe(true);
+    await expect(runtime.waitForRequestSlot()).rejects.toMatchObject({ usageUnknown: true, limitUsd: 5 });
+    expect(runtime.wasCostLimitDenied()).toBe(true);
+
+    runtime.configure({ maxCostUsd: 5 });
+    expect(runtime.hasReachedCostLimit()).toBe(false);
+  });
+
+  it('ignores prior unknown spend when no cap is set', async () => {
+    const runtime = createProviderExecutionContext();
+    runtime.setPriorUsageUnknown();
+    expect(runtime.hasReachedCostLimit()).toBe(false);
+    await expect(runtime.waitForRequestSlot()).resolves.toBeUndefined();
+  });
+});
+
+describe('usage listener', () => {
+  it('runs synchronously after every recorded response and never throws into the caller', () => {
+    const runtime = createProviderExecutionContext({ maxCostUsd: 100 });
+    const seen: number[] = [];
+    runtime.setUsageListener(() => {
+      seen.push(runtime.getUsage().estimatedCostUsd);
+    });
+    runtime.recordUsage({ usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 4.5 } }, openRouterConfig);
+    runtime.recordUsage({}, openRouterConfig);
+    runtime.recordUsageParts([{ usage: { total_input_tokens: 1, total_tokens: 1, cost: 4.5 } }], openRouterConfig);
+    expect(seen).toEqual([4.5, 4.5, 9]);
+
+    runtime.setUsageListener(() => {
+      throw new Error('disk full');
+    });
+    expect(() => runtime.recordUsage({ usage: { total_tokens: 1, cost: 1 } }, openRouterConfig)).not.toThrow();
+    expect(runtime.getUsage().estimatedCostUsd).toBe(10);
+
+    runtime.setUsageListener(undefined);
+    runtime.recordUsage({ usage: { total_tokens: 1, cost: 1 } }, openRouterConfig);
+    expect(seen).toHaveLength(3);
   });
 });

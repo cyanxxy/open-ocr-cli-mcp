@@ -53,7 +53,7 @@ import {
   type OcrMachineResult,
   type OcrRunResult,
 } from './protocol';
-import type { ResolvedCliOptions } from './types';
+import type { OcrJobResult, ResolvedCliOptions } from './types';
 
 const thinkingLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const contentFormats = ['markdown', 'json', 'csv', 'all'] as const;
@@ -348,7 +348,7 @@ const sharedFields = {
     .describe('Model provider. Defaults to the configured provider, otherwise gemini.'),
   gateway: z.enum(GATEWAY_IDS).optional()
     .describe('API route: direct, or through Cloudflare AI Gateway.'),
-  model: z.string().min(1).optional()
+  model: z.string().min(1).max(256).optional()
     .describe('Provider model ID. Read supported model IDs and their capabilities from ocr_capabilities.'),
   thinking: z.enum(thinkingLevels).optional()
     .describe('Reasoning effort. Supported levels are provider- and model-specific; read them from ocr_capabilities.'),
@@ -690,11 +690,13 @@ function ocrFailure(message: string, code: 'CONFIG_INVALID' | 'CANCELLED', hint:
  * Asking a person to approve "1 document with the configured provider" while
  * forty go to a provider they were never shown is the failure this replaces.
  */
-interface ConfirmationPlan {
+export interface ConfirmationPlan {
   /** Documents that passed local validation and will be sent. */
   sources: string[];
   /** Inputs that failed local validation and will not be sent. */
   rejected: number;
+  /** Valid documents the live run would not send (resumed unchanged, or past the recorded cost ceiling). */
+  notSent: number;
   provider: string;
   gateway: string;
   model: string;
@@ -743,10 +745,21 @@ function optionsDigest(options: ResolvedCliOptions): string {
   return createHash('sha256').update(JSON.stringify(stable)).digest('base64url');
 }
 
-function confirmationPlan(result: OcrRunResult, options: ResolvedCliOptions): ConfirmationPlan {
+/**
+ * `documents` is the dry run's `summary.results`, in the protocol result's
+ * order: only it carries `plannedSkip`, the documents a resume or the recorded
+ * cost ceiling would keep the live run from sending.
+ */
+function confirmationPlan(
+  result: OcrRunResult,
+  documents: readonly OcrJobResult[],
+  options: ResolvedCliOptions,
+): ConfirmationPlan {
+  const valid = documents.filter((document) => !document.errorDetails);
   return {
-    sources: result.documents.filter((document) => !document.error).map((document) => document.source),
-    rejected: result.documents.filter((document) => document.error).length,
+    sources: valid.filter((document) => !document.plannedSkip).map((document) => document.input.displayPath),
+    rejected: documents.length - valid.length,
+    notSent: valid.filter((document) => document.plannedSkip).length,
     provider: result.provider,
     gateway: result.gateway,
     model: result.model,
@@ -757,7 +770,8 @@ function confirmationPlan(result: OcrRunResult, options: ResolvedCliOptions): Co
   };
 }
 
-function confirmationMessage(plan: ConfirmationPlan): string {
+/** The elicitation text a person approves (exported for tests). */
+export function confirmationMessage(plan: ConfirmationPlan): string {
   const documents = plan.sources.length;
   const noun = documents === 1 ? 'document' : 'documents';
   const route = plan.gateway === 'cloudflare' ? ' via Cloudflare AI Gateway' : '';
@@ -766,6 +780,9 @@ function confirmationMessage(plan: ConfirmationPlan): string {
     : `estimated cost capped at $${plan.costLimitUsd}`;
   const rejected = plan.rejected > 0
     ? ` ${plan.rejected} other input(s) failed local validation and will not be sent.`
+    : '';
+  const notSent = plan.notSent > 0
+    ? ` ${plan.notSent} other document(s) are already complete in the output directory and will not be sent.`
     : '';
   // Deliberately not "this calls a paid API": free tiers, local
   // OpenAI-compatible endpoints and preflight failures all exist, and a prompt
@@ -776,8 +793,12 @@ function confirmationMessage(plan: ConfirmationPlan): string {
   // Names a person can check against what they expect: the host the documents
   // and the credential go to, and which environment variable is sent. A
   // redirected endpoint or a borrowed secret is visible here before approval.
-  return `Run OCR on ${documents} ${noun} with ${plan.provider}/${plan.model}${route} (${ceiling})? `
-    + `This sends them to ${oneLine(plan.destination)}${credentials} and may incur charges.${rejected}`;
+  // The model ID can come from the caller: escaped and bounded like the
+  // destination, so line breaks or bidirectional overrides in it cannot forge
+  // or push out of view the ceiling and destination a person checks.
+  return `Run OCR on ${documents} ${noun} with ${oneLine(plan.provider)}/${oneLine(truncateText(plan.model, 120))}`
+    + `${route} (${ceiling})? `
+    + `This sends them to ${oneLine(plan.destination)}${credentials} and may incur charges.${rejected}${notSent}`;
 }
 
 function confirmationRequestHash(request: OcrJobRequest): string {
@@ -793,7 +814,7 @@ async function planMcpRequest(
   request: OcrJobRequest,
   context: McpRequestContext,
   cwd: string,
-): Promise<{ result: OcrMachineResult; options?: ResolvedCliOptions }> {
+): Promise<{ result: OcrMachineResult; documents?: OcrJobResult[]; options?: ResolvedCliOptions }> {
   const abortController = new AbortController();
   const relayAbort = (): void => abortController.abort(context.mcpReq.signal.reason);
   if (context.mcpReq.signal.aborted) relayAbort();
@@ -810,7 +831,7 @@ async function planMcpRequest(
       boundary: 'mcp',
       onResolvedOptions: (resolved) => { options = resolved; },
     });
-    return { result: execution.result, options };
+    return { result: execution.result, documents: execution.summary.results, options };
   } catch (error) {
     return { result: toOcrRunFailure(randomUUID(), ocrErrorPayload(error, cliExitCode(error))) };
   } finally {
@@ -858,11 +879,24 @@ async function confirmationGate(
   // A request that fails before any document could be sent (bad config, no
   // inputs) or whose every document fails local validation bills nothing:
   // return that outcome instead of asking a person to approve it.
-  const { result: planned, options: plannedOptions } = await planMcpRequest(request, context, cwd);
-  if (!('documents' in planned) || planned.documents.every((document) => document.error) || !plannedOptions) {
+  const {
+    result: planned,
+    documents: plannedDocuments,
+    options: plannedOptions,
+  } = await planMcpRequest(request, context, cwd);
+  if (
+    !('documents' in planned)
+    || planned.documents.every((document) => document.error)
+    || !plannedOptions
+    || !plannedDocuments
+  ) {
     return mcpResult(planned);
   }
-  const plan = confirmationPlan(planned, plannedOptions);
+  const plan = confirmationPlan(planned, plannedDocuments, plannedOptions);
+  // Every valid document is one a resume skips as unchanged (or the recorded
+  // spend already meets the ceiling): the live run sends nothing, so it runs
+  // without a prompt and returns the existing artifacts.
+  if (plan.sources.length === 0) return undefined;
   const ask = async (): Promise<InputRequiredResult> => inputRequired({
     inputRequests: {
       [CONFIRM_KEY]: inputRequired.elicit({

@@ -132,8 +132,11 @@ function readConfidence(raw: unknown, field: string): ConfidenceReading {
  *
  * Partial extraction remains valid: `fields` may be `{}` and individual preset
  * rules may be omitted — those become validationErrors later, not schema failures.
+ * Only fields the preset defines are shape-checked: normalizePresetPayload
+ * ignores any other key and lists it in a warning, so a malformed extra field
+ * must not fail the whole extraction.
  */
-function assertValidPresetPayload(value: unknown): RawPresetPayload {
+function assertValidPresetPayload(value: unknown, definedFields: ReadonlySet<string>): RawPresetPayload {
   if (!isRecord(value)) {
     throw presetSchemaError('the response', `must be a JSON object (got ${describeReceived(value)})`);
   }
@@ -171,6 +174,7 @@ function assertValidPresetPayload(value: unknown): RawPresetPayload {
   }
 
   for (const [name, field] of Object.entries(value.fields)) {
+    if (!definedFields.has(name)) continue;
     const path = `fields.${name}`;
     if (!isRecord(field) || !('value' in field)) {
       throw presetSchemaError(path, `must be an object with "value" and "confidence" (got ${describeReceived(field)})`);
@@ -188,11 +192,14 @@ function assertValidPresetPayload(value: unknown): RawPresetPayload {
   return value;
 }
 
-function parsePresetPayload(rawText: string): RawPresetPayload {
+function parsePresetPayload(rawText: string, preset: ExtractionPreset): RawPresetPayload {
   // The shared tolerant extractor parses a bare response directly (so
   // primitives/arrays reach shape validation with a clear schema error) and
   // otherwise unwraps fences, prose, and inline reasoning.
-  return assertValidPresetPayload(parseJsonPayload<unknown>(rawText, 'Preset extraction'));
+  return assertValidPresetPayload(
+    parseJsonPayload<unknown>(rawText, 'Preset extraction'),
+    new Set(preset.rules.map((rule) => rule.field)),
+  );
 }
 
 /** ISO 4217 currencies with three minor-unit digits. */
@@ -211,9 +218,21 @@ interface ParsedLocaleNumber {
   decimals: number;
   /** Set when one separator followed by exactly three digits had to be guessed. */
   ambiguity?: { chosen: 'grouping' | 'decimal'; alternative: number };
+  /** Set when a "-" or "(" ... ")" away from the amount was not read as a sign. */
+  ignoredSign?: true;
 }
 
 const GROUPING_SPACE = /[\s\u00a0\u202f'\u2019]/u;
+
+/** "-5", "-$5", "$-5", "Rs.-500", "-USD 5": a minus not attached to a word, next to the amount. */
+const LEADING_MINUS = /(?:^|[^\p{L}\p{N}])-\s*(?:\p{Sc}|[A-Z]{3}\.?)?\s*$/u;
+/** "USD-5.00": a currency code directly followed by a minus. */
+const CURRENCY_THEN_MINUS = /^\s*(?:\p{Sc}|[A-Z]{3}\.?)\s*-\s*$/u;
+/** "5.00-": a minus right after the amount. */
+const TRAILING_MINUS = /^-(?:\s|$)/u;
+/** "(27.00)", "($27.00)", "(27.00 EUR)": parentheses around the amount alone. */
+const ACCOUNTING_OPEN = /\(\s*(?:\p{Sc}|[A-Za-z]{3})?\s*$/u;
+const ACCOUNTING_CLOSE = /^\s*(?:\p{Sc}|[A-Za-z]{3})?\s*\)/u;
 
 /**
  * Currency abbreviations that are written with a trailing period, lower-cased
@@ -277,9 +296,15 @@ function parseLocaleNumber(
     }
   }
 
-  const negative = prefix.includes('-')
-    || /^\s*-/u.test(suffix)
-    || (prefix.includes('(') && suffix.includes(')'));
+  // A sign is read only next to the amount. A hyphenated label ("Sub-total",
+  // "T-shirt"), a dash before a remark ("50.00 - Visa") or a parenthesised
+  // remark ("(approx. $27.00)") keeps the magnitude and is reported instead.
+  const negative = LEADING_MINUS.test(prefix)
+    || CURRENCY_THEN_MINUS.test(prefix)
+    || TRAILING_MINUS.test(suffix)
+    || (ACCOUNTING_OPEN.test(prefix) && ACCOUNTING_CLOSE.test(suffix));
+  const ignoredSign = !negative
+    && (prefix.includes('-') || /^\s*-/u.test(suffix) || (prefix.includes('(') && suffix.includes(')')));
 
   if (GROUPING_SPACE.test(core)) {
     if (!/^\d{1,3}(?:[\s\u00a0\u202f'\u2019]\d{3})+(?:[.,]\d+)?$/u.test(core)) return null;
@@ -339,7 +364,7 @@ function parseLocaleNumber(
   const magnitude = Number(normalized);
   if (!Number.isFinite(magnitude)) return null;
   const value = negative && magnitude !== 0 ? -magnitude : magnitude;
-  return { value, decimals, ...(ambiguity ? { ambiguity } : {}) };
+  return { value, decimals, ...(ambiguity ? { ambiguity } : {}), ...(ignoredSign ? { ignoredSign: true } : {}) };
 }
 
 /** Decimal places a number literal was written with, e.g. 3 for 1.234. */
@@ -428,6 +453,9 @@ export function normalizeFieldValue(
         ? `if it is a decimal separator the value is ${parsed.ambiguity.alternative}`
         : `if it is a thousands separator the value is ${parsed.ambiguity.alternative}`;
       warn(`${label}: "${text}" has one separator followed by exactly three digits, which is ambiguous; ${chosen}; ${alternative}.`);
+    }
+    if (parsed.ignoredSign) {
+      warn(`${label}: "${text}" has a "-" or "(" that is not next to the amount, so it is not read as a minus sign; read as ${render(parsed.value)}.`);
     }
     return type === 'number' ? parsed.value : render(parsed.value);
   }
@@ -759,7 +787,8 @@ export function escapeMarkdown(value: string): string {
   // audit T-05: a GFM table cell must stay on one line and must not let the
   // model's content open code spans or inject raw HTML. We strip C0/C1
   // control chars (CR/LF survive), collapse line breaks to a space, then
-  // escape backslashes, backticks, pipes, and angle brackets.
+  // escape backslashes, backticks, pipes, square brackets (so model text
+  // cannot form a link or a remote image), and angle brackets.
   return value
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
@@ -767,6 +796,7 @@ export function escapeMarkdown(value: string): string {
     .replace(/\\/g, '\\\\')
     .replace(/`/g, '\\`')
     .replace(/\|/g, '\\|')
+    .replace(/[[\]]/g, '\\$&')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -784,11 +814,24 @@ function fieldValueToString(value: PrimitiveFieldValue): string {
   return String(value);
 }
 
+/**
+ * Escape untrusted text for a paragraph of its own. On top of escapeMarkdown
+ * (which already turns ">" into "&gt;"), a line-start marker is escaped so the
+ * text cannot open a heading, list, or rule ("# Fields", "1. item", "---").
+ */
+function escapeMarkdownParagraph(value: string): string {
+  return escapeMarkdown(value)
+    .trim()
+    .replace(/^(\d+)([.)])(?=\s|$)/u, '$1\\$2')
+    .replace(/^[#+\-*=_~]/u, '\\$&');
+}
+
 export function buildPresetMarkdown(result: PresetStructuredOutput, preset: ExtractionPreset): string {
   const sections: string[] = [
     `# ${preset.label} Extraction`,
     '',
-    result.summary,
+    // The summary is model output, so it is escaped like every cell (T-05).
+    escapeMarkdownParagraph(result.summary),
     '',
     '## Fields',
     '',
@@ -967,7 +1010,7 @@ export function buildPresetResponseSchema(preset: ExtractionPreset): Record<stri
 }
 
 export function presetRunResultFromText(rawText: string, preset: ExtractionPreset): PresetRunResult {
-  const normalized = normalizePresetPayload(parsePresetPayload(rawText), preset);
+  const normalized = normalizePresetPayload(parsePresetPayload(rawText, preset), preset);
   return {
     presetId: preset.id,
     markdown: buildPresetMarkdown(normalized, preset),

@@ -61,6 +61,31 @@ describe('money parsing keeps sign and magnitude', () => {
   });
 
   it.each([
+    ['Sub-total: 1,250.00', '1250.00'],
+    ['Netto-Betrag 50,00 €', '50.00'],
+    ['Pre-tax 50.00', '50.00'],
+    ['T-shirt 15.00', '15.00'],
+    ['e-Rechnung 10,00', '10.00'],
+    ['50.00 - Visa', '50.00'],
+    ['(approx. $27.00)', '27.00'],
+    ['(EUR) 50.00 (net)', '50.00'],
+  ])('does not read a hyphen or parenthesis away from the amount in %s as a sign', (raw, expected) => {
+    const { value, warnings } = currency(raw);
+    expect(value).toBe(expected);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/not next to the amount, so it is not read as a minus sign/);
+  });
+
+  it.each(['-$5', 'USD -5.00', 'USD-5.00', '5.00-', '(27.00)', '($27.00)', '(27.00 EUR)', 'Balance: -5.00'])(
+    'still reads the sign next to the amount in %s without a warning',
+    (raw) => {
+      const { value, warnings } = currency(raw);
+      expect(Number(value)).toBeLessThan(0);
+      expect(warnings).toEqual([]);
+    },
+  );
+
+  it.each([
     ['Rs.500', '500.00'],
     ['Rs 500', '500.00'],
     ['rs.1,500.00', '1500.00'],

@@ -72,9 +72,21 @@ describe('assertCompleteGeminiResponse', () => {
       .not.toThrow();
   });
 
-  it('reports an uncontinued CONTINUATION stop (@google/genai >= 2.26) as truncated output', () => {
-    expect(() => assertCompleteGeminiResponse({ candidates: [{ finishReason: 'CONTINUATION' }] }))
-      .toThrow(/reached the output token limit/i);
+  it('reports an uncontinued CONTINUATION stop (@google/genai >= 2.26) as the per-request limit', () => {
+    let message = '';
+    try {
+      assertCompleteGeminiResponse({ candidates: [{ finishReason: 'CONTINUATION' }] });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('per-request output limit');
+    expect(message).toMatch(/incomplete output/i);
+    // A higher output-token limit cannot get past this stop, so never advise one.
+    expect(message).not.toContain('reached the output token limit');
+    expect(message).not.toContain('Increase the output-token limit');
+    expect(message).not.toContain('max-tokens');
+    expect(() => assertCompleteGeminiResponse({ candidates: [{ finishReason: 'MAX_TOKENS' }] }))
+      .toThrow(/reached the output token limit.*Increase the output-token limit/i);
   });
 
   it('rejects a candidate without a terminal finish reason', () => {
@@ -126,6 +138,47 @@ describe('Gemini error classification', () => {
     expect(isFatalGeminiError(denied)).toBe(true);
   });
 
+  it('classifies engine OUTPUT_INVALID errors by type, whatever digits their message quotes', () => {
+    for (const message of [
+      'Re-OCR returned invalid JSON: Expected \',\' or \'}\' after property value in JSON at position 403 (line 1 column 404)',
+      'Re-OCR returned invalid JSON: Unexpected token in JSON at position 503 (line 1 column 504)',
+      'Extraction requested JSON but the response did not match the OCR schema: sections[401].content[0] must be a string',
+      'Re-OCR returned invalid JSON: quota network timeout unavailable',
+    ]) {
+      const error = new OcrError(OcrErrorType.OUTPUT_INVALID, message, undefined, { cause: new SyntaxError('bad') });
+      expect(isFatalGeminiError(error), message).toBe(false);
+      expect(isRetryableGeminiError(error), message).toBe(false);
+      // A retry layer that copies the message is classified by the same type.
+      const restated = new Error(message, { cause: error });
+      expect(isFatalGeminiError(restated), message).toBe(false);
+      expect(isRetryableGeminiError(restated), message).toBe(false);
+    }
+    const missingKey = new OcrError(OcrErrorType.API_KEY_MISSING, 'API key is required for Gemini AI');
+    expect(isFatalGeminiError(missingKey)).toBe(true);
+    expect(isRetryableGeminiError(missingKey)).toBe(false);
+  });
+
+  it('reads a status from status-shaped text only, not from bare digits', () => {
+    expect(isFatalGeminiError(new Error('Unexpected token at position 403'))).toBe(false);
+    expect(isRetryableGeminiError(new Error('Unexpected token at position 503'))).toBe(false);
+    expect(isRetryableGeminiError(new Error('page 1429 of the document'))).toBe(false);
+    expect(isFatalGeminiError(new Error('401 Request had invalid authentication credentials'))).toBe(true);
+    expect(isFatalGeminiError(new Error('request failed: [403 Forbidden]'))).toBe(true);
+    expect(isFatalGeminiError(new Error('Request failed with status code 401'))).toBe(true);
+    expect(isRetryableGeminiError(new Error('429 Too Many Requests'))).toBe(true);
+    expect(isRetryableGeminiError(new Error('upstream answered HTTP 502'))).toBe(true);
+    expect(isRetryableGeminiError(new Error('{"error":{"code":503}}'))).toBe(true);
+  });
+
+  it('never retries an undici headers or body timeout, but still retries a socket reset', () => {
+    for (const code of ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']) {
+      const timeout = new TypeError('fetch failed', { cause: Object.assign(new Error('timeout'), { code }) });
+      expect(isRetryableGeminiError(timeout), code).toBe(false);
+    }
+    const reset = new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
+    expect(isRetryableGeminiError(reset)).toBe(true);
+  });
+
   it('treats a credential-specific Gemini HTTP 400 as fatal without classifying every 400 that way', () => {
     expect(isFatalGeminiError(Object.assign(
       new Error('API key not valid. Please pass a valid API key.'),
@@ -168,6 +221,18 @@ describe('applyThinkingConfig', () => {
       temperature: 0.2,
       thinkingConfig: { thinkingLevel: 'MEDIUM', includeThoughts: true },
     });
+  });
+
+  it('sends XHIGH to Gemini 4 Hydrogen and Neon and defaults them to HIGH', () => {
+    for (const model of ['gemini-4-hydrogen', 'gemini-4-neon'] as const) {
+      expect(applyThinkingConfig({}, model, { level: 'XHIGH' }).thinkingConfig.thinkingLevel).toBe('XHIGH');
+      expect(applyThinkingConfig({}, model).thinkingConfig.thinkingLevel).toBe('HIGH');
+      expect(() => applyThinkingConfig({}, model, { level: 'MINIMAL' })).toThrow('minimal is not supported');
+    }
+    expect(applyThinkingConfig({}, 'gemini-4-carbon').thinkingConfig.thinkingLevel).toBe('MEDIUM');
+    expect(() => applyThinkingConfig({}, 'gemini-4-carbon', { level: 'XHIGH' })).toThrow('xhigh is not supported');
+    expect(() => applyThinkingConfig({}, 'gemini-4-argon', { level: 'XHIGH' })).toThrow('xhigh is not supported');
+    expect(() => applyThinkingConfig({}, 'gemini-4-hydrogen', { level: 'MAX' })).toThrow('max is not supported');
   });
 
   it('allows minimal on Flash-Lite but rejects it on Argon instead of silently upgrading it', () => {

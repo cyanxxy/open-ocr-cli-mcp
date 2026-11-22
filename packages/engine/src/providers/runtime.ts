@@ -24,11 +24,17 @@ interface UsageMeasurement {
   cachedTokens: number;
   totalTokens: number;
   exactCost?: number;
+  /**
+   * OpenRouter BYOK: `cost` is the OpenRouter fee only and the upstream
+   * provider's charge was not reported, so `exactCost` is not the whole spend.
+   */
+  exactCostExcludesUpstream?: boolean;
   usesOpenAITokenAccounting: boolean;
 }
 
 interface MutableUsage extends ProviderUsageSnapshot {
   unreportedUsageRequests: number;
+  unmeteredPaidRequests: number;
 }
 
 function emptyUsage(): MutableUsage {
@@ -42,6 +48,7 @@ function emptyUsage(): MutableUsage {
     totalTokens: 0,
     estimatedCostUsd: 0,
     unreportedUsageRequests: 0,
+    unmeteredPaidRequests: 0,
   };
 }
 
@@ -70,6 +77,21 @@ function optionalNumberAt(record: Record<string, unknown>, ...keys: string[]): n
 function nestedNumber(record: Record<string, unknown>, key: string, ...nestedKeys: string[]): number {
   const nested = record[key];
   return isRecord(nested) ? numberAt(nested, ...nestedKeys) : 0;
+}
+
+/**
+ * The upstream provider's charge on an OpenRouter BYOK request, which the user
+ * pays on their own key: `cost_details.upstream_inference_cost`, or its
+ * input/output split. OpenRouter reports it as 0 or null for non-BYOK requests.
+ */
+function upstreamInferenceCost(candidate: Record<string, unknown>): number | undefined {
+  const details = candidate.cost_details;
+  if (!isRecord(details)) return undefined;
+  const total = optionalNumberAt(details, 'upstream_inference_cost');
+  if (total !== undefined) return total;
+  const input = optionalNumberAt(details, 'upstream_inference_input_cost');
+  const output = optionalNumberAt(details, 'upstream_inference_output_cost');
+  return input === undefined && output === undefined ? undefined : (input ?? 0) + (output ?? 0);
 }
 
 function usageMeasurement(response: unknown): UsageMeasurement | undefined {
@@ -110,15 +132,23 @@ function usageMeasurement(response: unknown): UsageMeasurement | undefined {
     'totalTokenCount', 'total_token_count', 'totalTokens', 'total_tokens',
   );
   const usesOpenAITokenAccounting = 'completion_tokens' in candidate || 'output_tokens' in candidate;
+  const reportedCost = optionalNumberAt(candidate, 'cost', 'estimated_cost', 'estimated_cost_usd');
+  // On an OpenRouter BYOK request `cost` is the OpenRouter fee only; the
+  // upstream charge is reported separately and is part of the real spend.
+  const upstreamCost = upstreamInferenceCost(candidate);
+  const hasUpstreamCost = upstreamCost !== undefined && upstreamCost > 0;
+  const exactCostExcludesUpstream = candidate.is_byok === true && !hasUpstreamCost;
   return {
     inputTokens,
     outputTokens,
     thoughtTokens,
     toolTokens,
     cachedTokens,
+    // Gemini reports tool-use (URL context) tokens apart from the prompt.
     totalTokens: reportedTotal
-      || inputTokens + outputTokens + (usesOpenAITokenAccounting ? 0 : thoughtTokens),
-    exactCost: optionalNumberAt(candidate, 'cost', 'estimated_cost', 'estimated_cost_usd'),
+      || inputTokens + outputTokens + (usesOpenAITokenAccounting ? 0 : thoughtTokens + toolTokens),
+    exactCost: hasUpstreamCost ? (reportedCost ?? 0) + upstreamCost : reportedCost,
+    ...(exactCostExcludesUpstream ? { exactCostExcludesUpstream } : {}),
     usesOpenAITokenAccounting,
   };
 }
@@ -138,6 +168,9 @@ function combineUsageMeasurements(responses: readonly unknown[]): UsageMeasureme
     totalTokens: combined.totalTokens + measurement.totalTokens,
     ...(allHaveExactCost
       ? { exactCost: (combined.exactCost ?? 0) + (measurement.exactCost ?? 0) }
+      : {}),
+    ...(combined.exactCostExcludesUpstream || measurement.exactCostExcludesUpstream
+      ? { exactCostExcludesUpstream: true }
       : {}),
     usesOpenAITokenAccounting:
       combined.usesOpenAITokenAccounting || measurement.usesOpenAITokenAccounting,
@@ -228,6 +261,9 @@ export class ProviderExecutionContext {
   private priorCostUsd = 0;
   /** A paid, cost-capped response arrived without usage: the cap cannot be verified. */
   private usageUnknownUnderCap = false;
+  /** An earlier run of the same resumable job sent paid requests whose spend is unknown. */
+  private priorUsageUnknown = false;
+  private usageListener: (() => void) | undefined;
   private intervalMs = 0;
   private maxCostUsd: number | undefined;
   private previousRequestAt = 0;
@@ -249,6 +285,7 @@ export class ProviderExecutionContext {
     this.usagePricing = undefined;
     this.priorCostUsd = 0;
     this.usageUnknownUnderCap = false;
+    this.priorUsageUnknown = false;
   }
 
   /**
@@ -257,6 +294,35 @@ export class ProviderExecutionContext {
    */
   setPriorCostUsd(costUsd: number): void {
     this.priorCostUsd = Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0;
+  }
+
+  /**
+   * An earlier run of a resumed job sent paid requests that reported no usage,
+   * so the job's cumulative spend is unknown. Under `--max-cost` this closes the
+   * gate for this run the same way an unmetered response would. Like the prior
+   * cost, it survives {@link resetUsage} and is cleared only by {@link configure}.
+   */
+  setPriorUsageUnknown(): void {
+    this.priorUsageUnknown = this.maxCostUsd !== undefined;
+  }
+
+  /**
+   * Called synchronously after every recorded response, measured or unreported,
+   * so a host can persist spend as it accrues. Pass undefined to remove it.
+   * A listener that throws is ignored: accounting must never fail a request.
+   */
+  setUsageListener(listener: (() => void) | undefined): void {
+    this.usageListener = listener;
+  }
+
+  private notifyUsageListener(): void {
+    const listener = this.usageListener;
+    if (!listener) return;
+    try {
+      listener();
+    } catch {
+      // A persistence hook must not turn a recorded response into a failure.
+    }
   }
 
   /** Per-job prices for transports that report usage with only provider/model. */
@@ -277,12 +343,13 @@ export class ProviderExecutionContext {
   }
 
   getUsage(): ProviderUsageSnapshot {
-    const { unreportedUsageRequests, ...usage } = this.usage;
+    const { unreportedUsageRequests, unmeteredPaidRequests, ...usage } = this.usage;
     return {
       ...usage,
       requests: Math.max(this.attempts, this.measuredRequests),
       estimatedCostUsd: Number(this.usage.estimatedCostUsd.toFixed(8)),
       ...(unreportedUsageRequests > 0 ? { unreportedUsageRequests } : {}),
+      ...(unmeteredPaidRequests > 0 ? { unmeteredPaidRequests } : {}),
     };
   }
 
@@ -290,15 +357,20 @@ export class ProviderExecutionContext {
     return this.costLimitDenied;
   }
 
-  /** True once a capped, paid response arrived with no usage (see {@link recordUsage}). */
+  /**
+   * True once a capped, paid response arrived with no usage (see
+   * {@link recordUsage}), or an earlier run left the spend unknown (see
+   * {@link setPriorUsageUnknown}).
+   */
   wasUsageUnknownUnderCostLimit(): boolean {
-    return this.usageUnknownUnderCap;
+    return this.usageUnknownUnderCap || this.priorUsageUnknown;
   }
 
   /** Compare against unrounded internal cost; public snapshots are display-rounded. */
   hasReachedCostLimit(): boolean {
     return this.maxCostUsd !== undefined
-      && (this.usageUnknownUnderCap || this.priorCostUsd + this.usage.estimatedCostUsd >= this.maxCostUsd);
+      && (this.wasUsageUnknownUnderCostLimit()
+        || this.priorCostUsd + this.usage.estimatedCostUsd >= this.maxCostUsd);
   }
 
   /**
@@ -321,9 +393,12 @@ export class ProviderExecutionContext {
 
   private recordUnreportedUsage(config?: UsagePricingConfig): void {
     this.usage.unreportedUsageRequests += 1;
-    if (this.maxCostUsd !== undefined && isPaidPricing(this.effectivePricing(config))) {
-      this.usageUnknownUnderCap = true;
+    if (isPaidPricing(this.effectivePricing(config))) {
+      // Persisted by hosts so a resumed capped job knows its spend is unknown.
+      this.usage.unmeteredPaidRequests += 1;
+      if (this.maxCostUsd !== undefined) this.usageUnknownUnderCap = true;
     }
+    this.notifyUsageListener();
   }
 
   private effectivePricing(config?: UsagePricingConfig): UsagePricingConfig | undefined {
@@ -367,7 +442,9 @@ export class ProviderExecutionContext {
     const localEstimate = effectivePricing
       ? estimateProviderRequestCostUsd(
         effectivePricing,
-        measurement.inputTokens,
+        // Gemini bills tool-use tokens (URL context page content) as input but
+        // reports them apart from the prompt. OpenAI-style usage has none.
+        measurement.inputTokens + (measurement.usesOpenAITokenAccounting ? 0 : measurement.toolTokens),
         measurement.outputTokens,
         measurement.usesOpenAITokenAccounting ? 0 : measurement.thoughtTokens,
         measurement.cachedTokens,
@@ -377,7 +454,11 @@ export class ProviderExecutionContext {
       + measurement.outputTokens
       + measurement.thoughtTokens
       + measurement.totalTokens;
-    if (measurement.exactCost !== undefined && measurement.exactCost > 0) {
+    if (measurement.exactCostExcludesUpstream) {
+      // OpenRouter BYOK without an upstream figure: the reported cost is the
+      // OpenRouter fee only, so add the local estimate of the provider charge.
+      this.usage.estimatedCostUsd += (measurement.exactCost ?? 0) + localEstimate;
+    } else if (measurement.exactCost !== undefined && measurement.exactCost > 0) {
       // Non-zero provider cost is authoritative (OpenRouter-style billing).
       this.usage.estimatedCostUsd += measurement.exactCost;
     } else if (measurement.exactCost === 0 && tokenActivity > 0 && localEstimate > 0) {
@@ -390,6 +471,7 @@ export class ProviderExecutionContext {
     } else if (effectivePricing) {
       this.usage.estimatedCostUsd += localEstimate;
     }
+    this.notifyUsageListener();
   }
 
   private assertRequestAllowed(signal?: AbortSignal, options: ProviderRequestSlotOptions = {}): void {
@@ -401,7 +483,7 @@ export class ProviderExecutionContext {
       && this.hasReachedCostLimit()
     ) {
       this.costLimitDenied = true;
-      throw new ProviderCostLimitError(maxCostUsd, this.usageUnknownUnderCap);
+      throw new ProviderCostLimitError(maxCostUsd, this.wasUsageUnknownUnderCostLimit());
     }
   }
 

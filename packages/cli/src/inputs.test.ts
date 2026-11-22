@@ -11,6 +11,7 @@ import {
   describeDiscoverySkips,
   detectMimeType,
   discoverInputSet,
+  inputContentSha256,
   inputFingerprint,
   readAndValidateInput,
   readStdin,
@@ -147,16 +148,41 @@ describe('CLI input discovery', () => {
     expect(() => detectMimeType('stdin', undefined, nonImageBmff)).toThrow('Unsupported document extension');
     expect(() => detectMimeType('stdin', undefined, avif)).toThrow('Unsupported document extension');
     expect(() => detectMimeType('stdin', undefined, mixedAvif)).toThrow('Unsupported document extension');
-    await expect(readAndValidateInput(stdinInput(nonImageBmff, 'image/heif'))).rejects.toMatchObject({
+    for (const bytes of [nonImageBmff, avif, mixedAvif]) {
+      await expect(readAndValidateInput(stdinInput(bytes, 'image/heif'))).rejects.toMatchObject({
+        code: 'INPUT_INVALID',
+        category: 'input',
+      });
+    }
+    // image/heic stays strict: a plain mif1 file is HEIF, not HEVC-coded.
+    await expect(readAndValidateInput(stdinInput(bmffBytes('mif1', ['mif1']), 'image/heic'))).rejects.toMatchObject({
       code: 'INPUT_INVALID',
-      category: 'input',
     });
-    await expect(readAndValidateInput(
-      stdinInput(bmffBytes('heic', ['mif1']), 'image/heif'),
-    )).rejects.toMatchObject({
-      code: 'INPUT_INVALID',
-      category: 'input',
-    });
+  });
+
+  it('stops hashing an input as soon as the run is cancelled', async () => {
+    const file = path.join(directory, 'large.jpg');
+    await writeFile(file, Buffer.concat([Buffer.from(JPEG_BYTES), Buffer.alloc(4 * 1024 * 1024)]));
+    const [input] = await discoverInputs([file], options);
+    await expect(inputContentSha256(input)).resolves.toMatch(/^[0-9a-f]{64}$/u);
+    const controller = new AbortController();
+    controller.abort(new Error('Cancelled by user'));
+    await expect(inputContentSha256(input, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('accepts HEVC-coded HEIF images named .heif, as encoders commonly write them', async () => {
+    // HEVC-coded images are HEIF files too (ISO/IEC 23008-12), and a .heif
+    // name is valid for them whatever brand the encoder put first.
+    await expect(readAndValidateInput(stdinInput(bmffBytes('heic', ['mif1']), 'image/heif'))).resolves.toBeDefined();
+    const files = {
+      'generic.heif': bmffBytes('mif1', ['mif1', 'heic']),
+      'libheif.heif': bmffBytes('heic', ['mif1', 'heic']),
+      'pure.heif': bmffBytes('mif1', ['mif1']),
+    };
+    for (const [name, bytes] of Object.entries(files)) await writeFile(path.join(directory, name), bytes);
+    const found = await discoverInputs(Object.keys(files).map((name) => path.join(directory, name)), options);
+    expect(found.map((input) => input.mimeType)).toEqual(['image/heif', 'image/heif', 'image/heif']);
+    for (const input of found) await expect(readAndValidateInput(input)).resolves.toBeDefined();
   });
 
   it('expands directories recursively, sorts files, and applies exclusions', async () => {

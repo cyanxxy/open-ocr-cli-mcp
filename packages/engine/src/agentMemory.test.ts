@@ -69,6 +69,16 @@ function createMemory(): AgentMemory {
   };
 }
 
+describe('createInitialMemory', () => {
+  it('records the document page count and falls back to 1 for an unusable count', () => {
+    expect(createInitialMemory('s', 'doc.pdf', 12).documentAnalysis.pageCount).toBe(12);
+    expect(createInitialMemory('s', 'doc.pdf').documentAnalysis.pageCount).toBe(1);
+    for (const pageCount of [0, -2, 1.5, Number.NaN]) {
+      expect(createInitialMemory('s', 'doc.pdf', pageCount).documentAnalysis.pageCount).toBe(1);
+    }
+  });
+});
+
 describe('applyMemoryUpdate', () => {
   it('retains direct prototype-named fields as own data properties without changing the prototype', () => {
     const memory = createInitialMemory('s', 'doc.pdf');

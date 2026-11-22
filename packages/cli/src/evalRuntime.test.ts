@@ -3,7 +3,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getProviderUsage, type ProviderRuntimeConfig } from '@open-ocr/engine/providers';
 import { validateEvalCase } from '@open-ocr/engine/evals';
-import { formatEvalError, resolveEvalTokenPrices, runEvalCase } from '../../../evals/run';
+import { formatEvalError, resolveEvalThinkingConfig, resolveEvalTokenPrices, runEvalCase } from '../../../evals/run';
 
 const mocks = vi.hoisted(() => ({ generateContent: vi.fn(), createInteraction: vi.fn() }));
 
@@ -101,6 +101,26 @@ describe('eval price overrides', () => {
       })).toThrow('finite nonnegative');
     },
   );
+});
+
+describe('eval thinking config', () => {
+  it('marks a level chosen with OPEN_OCR_THINKING or GEMINI_THINKING_LEVEL as explicit, like the CLI', () => {
+    expect(resolveEvalThinkingConfig('openrouter', 'acme/unlisted-model', { OPEN_OCR_THINKING: 'high' }))
+      .toEqual({ level: 'HIGH', includeThoughts: false, explicit: true });
+    expect(resolveEvalThinkingConfig('gemini', 'gemini-3.8-flash', { GEMINI_THINKING_LEVEL: 'low' }))
+      .toEqual({ level: 'LOW', includeThoughts: false, explicit: true });
+  });
+
+  it('leaves the default level implicit so unlisted OpenRouter routes keep their own default', () => {
+    const thinking = resolveEvalThinkingConfig('openrouter', 'acme/unlisted-model', {});
+    expect(thinking.explicit).toBeUndefined();
+    expect(thinking.includeThoughts).toBe(false);
+  });
+
+  it('rejects a level the model does not support', () => {
+    expect(() => resolveEvalThinkingConfig('gemini', 'gemini-3.8-flash', { OPEN_OCR_THINKING: 'xhigh' }))
+      .toThrow('OPEN_OCR_THINKING must be one of');
+  });
 });
 
 describe('eval error diagnostics', () => {

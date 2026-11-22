@@ -289,6 +289,7 @@ export async function* providerAgentLoop(
   const memory = createInitialMemory(
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
     file.name,
+    config.pageCount,
   );
   const deadline = createAgentDeadline(config.maxDurationMs ?? 120_000, signal);
   signal = deadline.signal;

@@ -130,7 +130,13 @@ weighted assertion score separate from macro-averaged quality metrics.
 Markdown is converted to visible text before OCR scoring. Normalized scoring
 uses Unicode NFKC, canonical quotes/dashes, collapsed whitespace, and lowercase
 text. Strict CER retains case, punctuation, and line boundaries after Markdown
-markers are removed.
+markers are removed. Both the reference and the prediction drop those markers
+(emphasis characters, line-start heading, list and quote markers, `<...>`
+spans), so a prediction that reproduces a reference holding `____`, `1. ` or
+`a < b` literally still scores 0. Character counts are Unicode code points, so
+an emoji or CJK Extension B character counts once.
+
+Table-cell F1 ignores empty cells only; a label cell such as `Total:` is scored.
 
 ## Public datasets
 

@@ -53,7 +53,10 @@ describe('extractTextFromFile — output contract', () => {
 
   it('disables SDK automatic continuation and reports a CONTINUATION stop as truncated', async () => {
     const generateContent = mockGenerate({ text: 'partial', candidates: [{ finishReason: 'CONTINUATION' }] });
-    await expect(extractTextFromFile(FILE_DATA, 'image/png', CLIENT)).rejects.toThrow(/output token limit/i);
+    const truncated = await extractTextFromFile(FILE_DATA, 'image/png', CLIENT).catch((error: unknown) => error as Error);
+    expect(truncated).toBeInstanceOf(Error);
+    expect((truncated as Error).message).toMatch(/per-request output limit.*incomplete output/i);
+    expect((truncated as Error).message).not.toMatch(/max-tokens|Increase the output-token limit/u);
     expect(generateContent.mock.calls[0][0].config.automaticContinuation).toBe(false);
 
     const schemaCall = mockGenerate({ text: '{"a":1}', candidates: [{ finishReason: 'STOP' }] });

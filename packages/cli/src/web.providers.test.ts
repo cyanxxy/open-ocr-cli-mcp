@@ -65,6 +65,30 @@ afterEach(() => {
 });
 
 describe('compatible-provider Web OCR', () => {
+  it('sends an SVG URL as text instead of failing with no readable text', async () => {
+    const url = 'https://example.com/chart.svg';
+    mocks.secureFetch.mockResolvedValueOnce({
+      url,
+      contentType: 'image/svg+xml',
+      bytes: new TextEncoder().encode(
+        '<svg xmlns="http://www.w3.org/2000/svg"><title>Quarterly Revenue</title><text>Revenue Q3: $1.2M</text></svg>',
+      ),
+    });
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content: 'Revenue Q3: $1.2M' } }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await runWebExtraction([url], 'combined', options(), new AbortController().signal);
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string) as {
+      messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+    };
+    const parts = body.messages[0].content;
+    expect(parts.every((part) => part.type === 'text')).toBe(true);
+    expect(parts.map((part) => part.text).join('\n')).toContain('Revenue Q3: $1.2M');
+  });
+
   it('runs URL extraction through the shared job lifecycle and usage context', async () => {
     const url = 'https://example.com/article';
     mocks.secureFetch.mockResolvedValueOnce({
