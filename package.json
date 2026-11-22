@@ -51,7 +51,7 @@
   },
   "scripts": {
     "lint": "eslint .",
-    "typecheck": "npm run typecheck -w @open-ocr/engine && tsc --noEmit -p tsconfig.node.json && npm run typecheck -w open-ocr-cli",
+    "typecheck": "bun check -b",
     "cli": "node --import tsx packages/cli/src/index.ts",
     "cli:build": "npm run build -w open-ocr-cli",
     "cli:smoke": "npm run cli:build && node packages/cli/dist/index.js --help",

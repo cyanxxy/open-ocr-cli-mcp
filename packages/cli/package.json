@@ -52,7 +52,7 @@
   ],
   "scripts": {
     "build": "node ../../scripts/sync-cli-skills.mjs && tsup",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "bun check",
     "prepack": "npm run build"
   },
   "openOcrBuild": {

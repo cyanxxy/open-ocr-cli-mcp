@@ -19,7 +19,8 @@ const version = JSON.parse(readFileSync(path.join(root, 'packages', 'cli', 'pack
 
 /** Every check: a short name and the shell command that runs it from the repository root. */
 export const CHECKS = [
-  { name: 'types', command: 'npm run -s typecheck' },
+  // TypeScript 7 semantics, every project in the root tsconfig references.
+  { name: 'types', command: 'bun check -b' },
   { name: 'lint', command: 'npm run -s lint' },
   { name: 'scripts', command: 'node --test scripts/*.test.mjs' },
   {

@@ -21,7 +21,7 @@
     "./*": "./src/*.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "bun check"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

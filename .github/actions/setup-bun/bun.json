@@ -1,0 +1,9 @@
+{
+  "comment": "The exact Bun build CI and local tooling use. bun lint exists only in canary builds, so this pins one dated canary from npm, where every published version is immutable (GitHub's canary release tag moves). Update version and both integrity values together: npm view @oven/bun-linux-x64@<version> dist.integrity",
+  "version": "1.4.5-canary.20261121.1",
+  "build": "1.4.6-canary.1+b15f51302",
+  "platforms": {
+    "linux-x64": "sha512-T7q+fycJnWH7jFTXjsAKcXp49UXXL/RFROOUVxMjxDqnNeU8MB/uCreHvIENSykFQJp2d6hIeU/08PZNyvSCcg==",
+    "linux-aarch64": "sha512-26VPonDVYBk67i4y+3ZuuA8cWbSUgSd97KZ8JkM5canjnsyRouee1UAW19SLjpVQxxPldbJfFGSk/i1jOtXyiA=="
+  }
+}
