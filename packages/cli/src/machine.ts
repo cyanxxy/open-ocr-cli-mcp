@@ -58,6 +58,8 @@ export interface ExecuteOcrJobOptions {
   boundary?: 'mcp';
   /** Observe the fully resolved options, e.g. to describe a run for confirmation. */
   onResolvedOptions?: (options: ResolvedCliOptions) => void;
+  /** Display paths a person approved; the run sends no other document (see OcrJobServiceRuntime). */
+  sendOnly?: ReadonlySet<string>;
 }
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -517,6 +519,7 @@ export async function executeOcrJobRequest(
       deliveryMode,
       progress: options.progress,
       enableSingleInputResume: deliveryMode === 'reference',
+      sendOnly: execution.sendOnly,
     });
   }
   // Under MCP every match is confined before discovery stats or opens it.
@@ -540,5 +543,6 @@ export async function executeOcrJobRequest(
     deliveryMode,
     progress: options.progress,
     enableSingleInputResume: deliveryMode === 'reference',
+    sendOnly: execution.sendOnly,
   });
 }

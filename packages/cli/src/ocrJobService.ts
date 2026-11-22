@@ -132,6 +132,13 @@ export interface OcrJobServiceRuntime {
    * the stderr diagnostics channel.
    */
   priorWarnings?: readonly string[];
+  /**
+   * Display paths of the documents a person approved (MCP confirmation). When
+   * set, the run sends no other document: one that appeared after the plan was
+   * approved fails as CANCELLED instead of being sent unapproved. Resumed and
+   * skipped documents are not sends and are unaffected.
+   */
+  sendOnly?: ReadonlySet<string>;
 }
 
 export interface OcrJobServiceResult {
@@ -906,6 +913,23 @@ export class OcrJobService {
               const { legacyFingerprint: _legacy, ...entry } = completedEntry;
               await manifest?.update(key, { ...entry, fingerprint, fingerprintVersion: 2 }, { defer: true });
             }
+          } else if (runtime.sendOnly && !runtime.sendOnly.has(input.displayPath)) {
+            result = {
+              status: 'failed', input, provider: options.provider, gateway: options.gateway,
+              mode: options.mode, model: options.model, startedAt: jobStartedAt,
+              completedAt: new Date().toISOString(), durationMs: performance.now() - jobStart,
+              attempts: 0,
+              ...documentFailure(new CliExitError(
+                `${input.displayPath} was not part of the confirmed plan and was not sent`,
+                1,
+                {
+                  code: 'CANCELLED',
+                  category: 'cancelled',
+                  retryable: true,
+                  hint: 'Re-run the tool to confirm the documents now in the folder.',
+                },
+              )),
+            };
           } else {
             const timeoutController = new AbortController();
             const relayAbort = (): void => timeoutController.abort(runtime.abortController.signal.reason);

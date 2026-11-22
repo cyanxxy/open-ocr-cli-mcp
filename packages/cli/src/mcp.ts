@@ -858,7 +858,7 @@ async function confirmationGate(
   context: McpRequestContext,
   guard: ConfirmationGuard,
   cwd: string,
-): Promise<InputRequiredResult | ReturnType<typeof mcpResult> | undefined> {
+): Promise<InputRequiredResult | ReturnType<typeof mcpResult> | ConfirmedRun | undefined> {
   // A dry run neither bills nor writes, so there is nothing to confirm.
   if (request.dryRun) return undefined;
   if (process.env[CONFIRM_ENV] !== '1') return undefined;
@@ -895,8 +895,9 @@ async function confirmationGate(
   const plan = confirmationPlan(planned, plannedDocuments, plannedOptions);
   // Every valid document is one a resume skips as unchanged (or the recorded
   // spend already meets the ceiling): the live run sends nothing, so it runs
-  // without a prompt and returns the existing artifacts.
-  if (plan.sources.length === 0) return undefined;
+  // without a prompt and returns the existing artifacts. It is held to that:
+  // a document that appears in the folder before the live run is not sent.
+  if (plan.sources.length === 0) return { sendOnly: new Set() };
   const ask = async (): Promise<InputRequiredResult> => inputRequired({
     inputRequests: {
       [CONFIRM_KEY]: inputRequired.elicit({
@@ -956,7 +957,18 @@ async function confirmationGate(
   // configuration or the ceiling changed since, the person approved something
   // else: ask again with the new numbers (the MRTR pattern allows re-asking).
   if (state.planHash !== confirmationPlanHash(plan)) return ask();
-  return undefined;
+  // The live run discovers its inputs again. Only the approved documents may
+  // be sent, so one added between this check and that discovery is not.
+  return { sendOnly: new Set(plan.sources) };
+}
+
+/** Proceed with the live run, sending only the documents in `sendOnly`. */
+interface ConfirmedRun {
+  sendOnly: ReadonlySet<string>;
+}
+
+function isConfirmedRun(value: unknown): value is ConfirmedRun {
+  return typeof value === 'object' && value !== null && 'sendOnly' in value;
 }
 
 /**
@@ -1182,6 +1194,7 @@ async function executeMcpRequest(
   context: McpRequestContext,
   cwd: string,
   artifacts: McpArtifactRegistry,
+  sendOnly?: ReadonlySet<string>,
 ): Promise<ReturnType<typeof mcpResult>> {
   const runId = randomUUID();
   // Both spellings of "read the document from stdin" have to be refused here.
@@ -1242,6 +1255,7 @@ async function executeMcpRequest(
       // The MCP caller is untrusted relative to the operator: confine its
       // paths, refuse routing from its configPath, and cap it by the operator.
       boundary: 'mcp',
+      sendOnly,
     });
     const artifactWarnings = await artifacts.remember(execution.result);
     if (artifactWarnings.length > 0) {
@@ -1266,8 +1280,8 @@ async function executeMcpTool(
   try {
     const request = buildRequest();
     const gate = await confirmationGate(request, context, confirmationGuard, cwd);
-    if (gate) return gate;
-    return await executeMcpRequest(request, context, cwd, artifacts);
+    if (gate && !isConfirmedRun(gate)) return gate;
+    return await executeMcpRequest(request, context, cwd, artifacts, gate?.sendOnly);
   } catch (error) {
     const runId = randomUUID();
     const payload = ocrErrorPayload(error, cliExitCode(error));

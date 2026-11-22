@@ -56,6 +56,13 @@ field names, and template signs. Review the first section before upgrading.
   would send and says how many are already complete in the output directory.
   A request that would send nothing (every valid document resumed, or the
   recorded spend already at the ceiling) runs without a prompt.
+- MCP: an `OPEN_OCR_MCP_CONFIRM` approval now binds the run to the documents
+  it listed. A document that appears in the folder after the plan (between
+  approval and the run, or before a run planned to send nothing) fails as
+  `CANCELLED` instead of being sent unasked; re-run to confirm it.
+- `interactive` passes `--thinking` only for a level the person picked or one
+  the configuration or environment set. Accepting the offered default on an
+  unlisted OpenRouter route now sends no `reasoning` field, as the CLI does.
 - `run --no-config` refuses a request that names `configPath`
   (`CONFIG_INVALID`), as documented; it used to load that file. Ambient
   `OPEN_OCR_NO_CONFIG=1` still allows one explicit file.

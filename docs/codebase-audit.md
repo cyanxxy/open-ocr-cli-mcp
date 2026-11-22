@@ -247,14 +247,17 @@ credential probes had no deadline once undici's 300 s defaults were removed
   project that can set `output` can commit those files directly, and `.git`
   stays refused), and D1-3 (`^2.32.0` cannot resolve to `@google/genai` 3.x,
   and the D1-2 fix already pins `apiVersion`).
-- Known gaps left open: `interactive` always passes the chosen `--thinking`,
-  so it counts as explicit on an unlisted OpenRouter route; `evals/run.ts`
-  does not pass a page count, so agentic eval artifacts still report 1; the
+- Gaps found after the first pass and closed in the same change set:
+  `interactive` passed the default `--thinking` as if chosen, so it counted as
+  explicit on an unlisted OpenRouter route; `evals/run.ts` passed no page
+  count, so agentic eval artifacts reported 1; and under
+  `OPEN_OCR_MCP_CONFIRM=1` the live run discovered its inputs again after the
+  plan, so a file added to the folder in between was sent without approval
+  (on both the prompted and the no-prompt path). The approval now binds the
+  run to the documents it listed; a regression test reproduces the race and
+  showed the late file reaching the provider before the fix. Still open: the
   Dockerfile comments naming the Node.js version are not updated by
-  Dependabot. With `OPEN_OCR_MCP_CONFIRM=1`, a request that would send
-  nothing runs without a prompt, so a file added to the folder between the
-  plan and that run is sent unasked; only someone who can already write to
-  the folder can do that, within milliseconds.
+  Dependabot.
 
 ### Limits
 
@@ -270,11 +273,10 @@ Fable 5.1's, its fallback price is Anthropic's list price, and the new
 catalog. Passing checks
 establish tested behavior, not the absence of every defect.
 
-Verification: all **1429 tests in 79 files** pass on Node **22.23.5** (the
-1416-test set before the review fixes also passed on **20.19.0**); 10 of the
-79 test files are new. Coverage passes its gate at **89.12% statements**,
-**81.83% branches**, **93.09% functions**, and **92.10% lines** (thresholds
-83 / 74 / 89 / 87). Full
+Verification: all **1431 tests in 79 files** pass on Node **22.23.5** (the
+1429-test set also passed on **20.19.0**); 10 of the 79 test files are new.
+Coverage passes its gate at **89.08% statements**, **81.84% branches**,
+**93.10% functions**, and **92.05% lines** (thresholds 83 / 74 / 89 / 87). Full
 TypeScript checks and ESLint pass with no warnings. The **26 release and
 packaging script tests** in 5 files pass on Node 22.23.5 and 20.19.0 (and on
 26.13.1 in the tooling lane). Evaluation corpus validation passes (**24

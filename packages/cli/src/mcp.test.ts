@@ -917,6 +917,62 @@ describe('Open OCR MCP server', () => {
       expect(capped.result?.structuredContent).toMatchObject({ status: 'cost_limited' });
     });
 
+    it('does not send a document that appears after a run was planned to send nothing', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      clearCredentials();
+      vi.stubEnv('GEMINI_API_KEY', 'test-key');
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-late-'));
+      cleanupPaths.push(directory);
+      const scans = path.join(directory, 'scans');
+      await mkdir(scans);
+      const [a, late] = ['a.jpg', 'late.jpg'].map((name) => path.join(scans, name));
+      await writeFile(a, JPEG_BYTES);
+      const out = path.join(directory, 'out');
+      const toolArgs = { inputs: [{ type: 'path' as const, path: scans }], outputDirectory: out, noConfig: true };
+
+      // A previous run finished a, so the plan below would send nothing.
+      let resolved: ResolvedCliOptions | undefined;
+      await machine.executeOcrJobRequest(buildExtractMcpRequest({ ...toolArgs, dryRun: true }), {
+        cwd: directory, runId: 'plan-for-seed', abortController: new AbortController(),
+        boundary: 'mcp', noConfig: true, onResolvedOptions: (options) => { resolved = options; },
+      });
+      const seedOptions = { ...resolved!, dryRun: false };
+      await new OcrJobService({
+        extractDocument: (input) => Promise.resolve({
+          artifacts: { markdown: `# ${input.name}`, json: { title: input.name, sections: [] } },
+          attempts: 1,
+        }),
+      }).run((await discoverInputSet([a], seedOptions)).inputs, seedOptions, {
+        runId: 'seed', abortController: new AbortController(),
+      });
+
+      // A file lands in the folder after the plan and before the live run
+      // discovers its inputs again.
+      const real = machine.executeOcrJobRequest;
+      const extract = vi.fn();
+      vi.spyOn(machine, 'executeOcrJobRequest').mockImplementation(async (request, options) => {
+        if (!request.dryRun) {
+          await writeFile(late, JPEG_BYTES);
+          expect(options.sendOnly).toEqual(new Set());
+          extract();
+        }
+        return real(request, options);
+      });
+
+      const { request } = await driveServer(directory);
+      const reply = await request(1, 'tools/call', { name: 'ocr_extract', arguments: toolArgs, _meta: modernMeta() });
+      expect(reply.result?.resultType).toBe('complete');
+      expect(reply.result?.inputRequests).toBeUndefined();
+      expect(extract).toHaveBeenCalledTimes(1);
+      const documents = (reply.result?.structuredContent as {
+        documents: Array<{ source: string; skipReason?: string; error?: { code: string; message: string } }>;
+      }).documents;
+      const lateDocument = documents.find((document) => document.source.endsWith('late.jpg'));
+      expect(lateDocument?.error).toMatchObject({ code: 'CANCELLED' });
+      expect(lateDocument?.error?.message).toContain('was not part of the confirmed plan');
+      expect(documents.find((document) => document.source.endsWith('a.jpg'))?.skipReason).toBe('resumed');
+    });
+
     it('bounds a caller-supplied model ID in the confirmation prompt', async () => {
       vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
       clearCredentials();

@@ -1,3 +1,4 @@
+import { stat } from 'node:fs/promises';
 import process from 'node:process';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -38,6 +39,7 @@ import {
   type ProviderUsageSnapshot,
 } from '@open-ocr/engine/providers';
 import { getExtractionPreset } from '@open-ocr/engine/templates';
+import { readAndValidateInput } from '../packages/cli/src/inputs';
 import { nodeRegionCropper } from '../packages/cli/src/nodeRegionCropper';
 import { cliThinkingLevels, defaultCliThinkingLevel } from '../packages/cli/src/config';
 import {
@@ -46,6 +48,7 @@ import {
   loadEvalCases,
   loadEvalGroundTruth,
   loadEvalSuiteConfig,
+  repoRoot,
   resolveRepeatCount,
   resolveSuiteName,
   writeEvalArtifacts,
@@ -163,10 +166,30 @@ interface AgenticEvalOutput {
   toolCalls: number;
 }
 
+/**
+ * Page count as the CLI reads it, so agentic eval artifacts report the same
+ * `pageCount` a CLI run of the same document would.
+ */
+async function evalInputPageCount(relativePath: string, mimeType: string): Promise<number> {
+  const absolutePath = path.resolve(repoRoot, relativePath);
+  const stats = await stat(absolutePath);
+  const { pageCount } = await readAndValidateInput({
+    absolutePath,
+    displayPath: relativePath,
+    relativePath,
+    name: path.basename(relativePath),
+    mimeType,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+  });
+  return pageCount;
+}
+
 async function runAgenticEvalCase(evalCase: EvalCase, clientConfig: ProviderRuntimeConfig): Promise<AgenticEvalOutput> {
   const { dataUrl, mimeType } = await fileToDataUrl(evalCase.inputPath);
   const file = { name: path.basename(evalCase.inputPath), type: mimeType };
   const loopConfig = {
+    pageCount: await evalInputPageCount(evalCase.inputPath, mimeType),
     maxIterations: evalCase.agentConfig?.maxIterations ?? 4,
     confidenceThreshold: evalCase.agentConfig?.confidenceThreshold ?? 0.65,
     maxTokens: isKimiK3Route(clientConfig.provider, clientConfig.model)

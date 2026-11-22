@@ -202,11 +202,17 @@ async function providerArguments(
     'API key environment variable',
     providerContextMatches ? config.apiKeyEnv ?? profileApiKeyEnvironment(provider) : profileApiKeyEnvironment(provider),
   );
+  // Accepting the offered default when nothing configured a level is not
+  // choosing one: omitting the flag resolves the same level, and on an
+  // OpenRouter route without a known reasoning contract it leaves the
+  // reasoning field out, as the CLI does. With a configured level the flag is
+  // always passed, so the person's pick wins over the environment.
+  const thinkingChosen = configuredThinking !== undefined || thinking !== defaultThinking;
   const args = [
     '--provider', provider,
     '--gateway', gateway,
     '--model', model,
-    '--thinking', thinking,
+    ...(thinkingChosen ? ['--thinking', thinking] : []),
     '--api-key-env', apiKeyEnv,
   ];
   if (provider === 'openai-compatible') {
