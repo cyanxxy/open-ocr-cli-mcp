@@ -525,11 +525,19 @@ async function dedupeByRealPath(paths: string[]): Promise<{
   return { unique, duplicates };
 }
 
-/** Resolve every requested input, reporting what discovery dropped along the way. */
+/**
+ * Resolve every requested input, reporting what discovery dropped along the way.
+ *
+ * `confineMatches` sees every matched file before any of them is stat'ed or
+ * opened for MIME sniffing, so a boundary that refuses there (the MCP server
+ * working directory) never touches the content of a file outside it, even
+ * when a glob walked through a symbolic link part-way down.
+ */
 export async function discoverInputSet(
   rawInputs: string[],
   options: ResolvedCliOptions,
   signal?: AbortSignal,
+  confineMatches?: (absolutePaths: readonly string[]) => Promise<void>,
 ): Promise<InputDiscovery> {
   signal?.throwIfAborted();
   if (rawInputs.length === 0) throw inputError('Provide at least one file, directory, glob, or - for stdin');
@@ -574,6 +582,8 @@ export async function discoverInputSet(
   const uniqueAbsolute = (paths: string[]): string[] => [...new Set(paths.map((entry) => path.resolve(entry)))]
     .sort((a, b) => a.localeCompare(b));
   const { unique, duplicates } = await dedupeByRealPath(uniqueAbsolute(expanded.flatMap((entry) => entry.files)));
+  await confineMatches?.(unique);
+  signal?.throwIfAborted();
   // Refuse oversized unions before opening every matched input for MIME sniffing.
   if (unique.length > options.maxFiles) {
     throw inputError(`Matched ${unique.length} files, exceeding --max-files ${options.maxFiles}`);
@@ -729,7 +739,10 @@ function magicBytesMatch(bytes: Uint8Array, mimeType: string): boolean {
     case 'image/heic':
       return sniffHeifMimeType(bytes) === 'image/heic';
     case 'image/heif':
-      return sniffHeifMimeType(bytes) === 'image/heif';
+      // image/heif covers every HEIF image (ISO/IEC 23008-12), HEVC-coded ones
+      // included: encoders write a `heic` brand into `.heif` files. AVIF and
+      // other ISO-BMFF media still sniff as undefined.
+      return sniffHeifMimeType(bytes) !== undefined;
     default:
       return false;
   }
@@ -747,7 +760,12 @@ function startsWithAt(bytes: Uint8Array, offset: number, signature: readonly num
   return signature.every((byte, index) => bytes[offset + index] === byte);
 }
 
-export async function readAndValidateInput(input: ResolvedInput): Promise<{ bytes: Uint8Array; dataUrl: string }> {
+export async function readAndValidateInput(input: ResolvedInput): Promise<{
+  bytes: Uint8Array;
+  dataUrl: string;
+  /** Pages in the document: the PDF page count, 1 for an image. */
+  pageCount: number;
+}> {
   const { bytes: maxBytes, label } = maxFileSizeForMime(input.mimeType);
   let bytes: Uint8Array;
   if (input.stdinBytes) {
@@ -802,6 +820,7 @@ export async function readAndValidateInput(input: ResolvedInput): Promise<{ byte
     throw inputError(`${input.displayPath} does not match its declared type (${input.mimeType})`);
   }
 
+  let pageCount = 1;
   if (input.mimeType === 'application/pdf') {
     const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
     const loadingTask = pdfjs.getDocument({
@@ -819,6 +838,7 @@ export async function readAndValidateInput(input: ResolvedInput): Promise<{ byte
       if (pdf.numPages > FILE_CONSTRAINTS.MAX_PDF_PAGES) {
         throw inputError(`${input.displayPath} has ${pdf.numPages} pages; the maximum is ${FILE_CONSTRAINTS.MAX_PDF_PAGES}`);
       }
+      pageCount = pdf.numPages;
     } catch (error) {
       if (error instanceof CliExitError) throw error;
       throw inputError(
@@ -836,6 +856,7 @@ export async function readAndValidateInput(input: ResolvedInput): Promise<{ byte
   return {
     bytes,
     dataUrl: `data:${input.mimeType};base64,${Buffer.from(bytes).toString('base64')}`,
+    pageCount,
   };
 }
 
@@ -844,13 +865,19 @@ export async function readAndValidateInput(input: ResolvedInput): Promise<{ byte
  * size and mtime: an edit that preserves both (a copy that restores
  * timestamps, a same-length rewrite within mtime resolution) must not be
  * skipped as unchanged.
+ *
+ * `signal` stops the read: a batch of gigabytes is hashed before any work
+ * starts, and a cancel must not wait for the whole pass. An aborted read
+ * rejects with the stream's AbortError.
  */
-export async function inputContentSha256(input: ResolvedInput): Promise<string> {
+export async function inputContentSha256(input: ResolvedInput, signal?: AbortSignal): Promise<string> {
   const hash = createHash('sha256');
   if (input.stdinBytes) return hash.update(input.stdinBytes).digest('hex');
   if (!input.absolutePath) return hash.digest('hex');
   try {
-    for await (const chunk of createReadStream(input.absolutePath)) hash.update(chunk as Buffer);
+    for await (const chunk of createReadStream(input.absolutePath, signal ? { signal } : {})) {
+      hash.update(chunk as Buffer);
+    }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     // An unreadable input still gets a fingerprint, one that can match no

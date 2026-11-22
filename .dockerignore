@@ -1,6 +1,8 @@
 .git
 .github
-node_modules
+# Patterns are anchored at the context root; `**/` also excludes workspace
+# installs such as packages/cli/node_modules, not only ./node_modules.
+**/node_modules
 **/dist
 coverage
 tmp

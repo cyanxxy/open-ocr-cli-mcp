@@ -44,10 +44,30 @@ export class AttemptTimeoutError extends Error {
   }
 }
 
+/** The engine's `OcrError` type on the error or its cause chain, if any. */
+function engineErrorType(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; typeof current === 'object' && current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const record = current as Record<string, unknown>;
+    if (record.name === 'OcrError' && typeof record.type === 'string') return record.type;
+    current = record.cause;
+  }
+  return undefined;
+}
+
 function isRetryableFailure(options: ResolvedCliOptions, error: unknown): boolean {
   if (error instanceof AttemptTimeoutError) return true;
   if (isQuotaExhaustedError(error)) return false;
   if (error instanceof CliExitError) return error.retryable;
+  // A deliberate per-type rule, the same verdict errors.ts reports: the model
+  // answered in the wrong shape (OUTPUT_INVALID, `retryable: true`), and a new
+  // sample often conforms, so --retries applies on every provider. The engine's
+  // own classifiers leave engine-typed errors alone, because reading digits out
+  // of their messages made the answer depend on a JSON parse position.
+  if (engineErrorType(error) === 'OUTPUT_INVALID') return true;
   return isRetryableExtractionError(options.provider, error);
 }
 

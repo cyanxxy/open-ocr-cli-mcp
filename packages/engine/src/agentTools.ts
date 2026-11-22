@@ -88,12 +88,74 @@ function parseRegionFieldPayload(rawText: string): Record<string, unknown>[] {
   });
 }
 
+type ExtractedField = AgentMemory['extractedFields'][string];
+
+interface BatchCandidate {
+  field_name: string;
+  rawFieldName: string;
+  field: ExtractedField;
+}
+
+interface BatchReviewRound {
+  acceptedFields: Record<string, ExtractedField>;
+  reviews: Array<{ isValid: boolean; message: string }>;
+}
+
+/**
+ * Field dependencies are shallow (a due date on the invoice date, a subtotal
+ * on the item amounts), so the batch review settles in two or three rounds.
+ * The cap only guards against a future check that never settles.
+ */
+const MAX_BATCH_REVIEW_ROUNDS = 8;
+
+/**
+ * One review round: every candidate is checked against the stored fields plus
+ * the fields the previous round accepted, then merged with the deterministic
+ * validity/confidence/recency reducer.
+ */
+function reviewBatchRound(
+  candidates: readonly BatchCandidate[],
+  memory: Readonly<AgentMemory>,
+  previouslyAccepted: Record<string, ExtractedField>,
+): BatchReviewRound {
+  const acceptedFields: Record<string, ExtractedField> = {};
+  const reviews = candidates.map(({ field_name, field }) => {
+    // The same review applyCodeDrivenReviews runs later (format, consistency
+    // and cross-reference) runs before the merge decision, so a value that
+    // will be flagged invalid never replaces a known-valid one (A-13).
+    const review = reviewField(field_name, field, {
+      ...memory.extractedFields,
+      ...previouslyAccepted,
+      [field_name]: field,
+    });
+    const preparedField: ExtractedField = {
+      ...field,
+      isValid: review.isValid,
+      validationMessage: review.message,
+    };
+    const currentField = Object.hasOwn(acceptedFields, field_name)
+      ? acceptedFields[field_name]
+      : Object.hasOwn(memory.extractedFields, field_name) ? memory.extractedFields[field_name] : undefined;
+    if (!currentField || shouldReplaceField(currentField, preparedField)) {
+      acceptedFields[field_name] = currentField ? mergeField(currentField, preparedField) : preparedField;
+    }
+    return review;
+  });
+  return { acceptedFields, reviews };
+}
+
+function sameReviews(left: BatchReviewRound, right: BatchReviewRound): boolean {
+  return left.reviews.every((review, index) => (
+    review.isValid === right.reviews[index].isValid && review.message === right.reviews[index].message
+  ));
+}
+
 function normalizeStructuredFields(
   entries: Record<string, unknown>[],
   memory: Readonly<AgentMemory>,
 ) {
-  const acceptedFields: Record<string, AgentMemory['extractedFields'][string]> = {};
-  const extractedSummaries: Array<Record<string, unknown>> = [];
+  const candidates: BatchCandidate[] = [];
+  const extractedAt = Date.now();
 
   for (const [index, entry] of entries.entries()) {
     // One malformed entry still rejects the whole batch (memory is updated
@@ -121,41 +183,40 @@ function normalizeStructuredFields(
       ? checked(() => assertNormalizedRegion(entry.location, 'location'))
       : undefined;
 
-    const validationResult = validation_rule
-      ? validateFieldValue(field_value, validation_rule)
-      : validateFieldFormat(field_value, field_name);
-
-    const preparedField = {
-      value: field_value,
-      confidence,
-      validation_rule,
-      location,
-      isValid: validationResult.isValid,
-      validationMessage: validationResult.message,
-      extractedAt: Date.now(),
-    };
-
-    const currentField = Object.hasOwn(acceptedFields, field_name)
-      ? acceptedFields[field_name]
-      : Object.hasOwn(memory.extractedFields, field_name) ? memory.extractedFields[field_name] : undefined;
-    if (!currentField || shouldReplaceField(currentField, preparedField)) {
-      acceptedFields[field_name] = currentField ? mergeField(currentField, preparedField) : preparedField;
-    }
-
-    extractedSummaries.push({
+    candidates.push({
       field_name,
-      original_field_name: rawFieldName,
-      field_value,
-      confidence,
-      validation_rule,
-      ...(location ? { location } : {}),
-      isValid: validationResult.isValid,
-      validationMessage: validationResult.message,
+      rawFieldName,
+      field: { value: field_value, confidence, validation_rule, location, extractedAt },
     });
   }
 
+  // Each candidate is reviewed against what this batch will store, not only
+  // against the fields accepted earlier in it, so the order of the batch
+  // cannot decide which values survive: a corrected due date sent before its
+  // corrected invoice date is checked against the new invoice date. Rounds
+  // repeat until the reviews stop changing; the last round was then checked
+  // against exactly the fields it accepts.
+  let round = reviewBatchRound(candidates, memory, {});
+  for (let rounds = 1; rounds < MAX_BATCH_REVIEW_ROUNDS; rounds += 1) {
+    const next = reviewBatchRound(candidates, memory, round.acceptedFields);
+    const settled = sameReviews(round, next);
+    round = next;
+    if (settled) break;
+  }
+
+  const extractedSummaries: Array<Record<string, unknown>> = candidates.map(({ field_name, rawFieldName, field }, index) => ({
+    field_name,
+    original_field_name: rawFieldName,
+    field_value: field.value,
+    confidence: field.confidence,
+    validation_rule: field.validation_rule,
+    ...(field.location ? { location: field.location } : {}),
+    isValid: round.reviews[index].isValid,
+    validationMessage: round.reviews[index].message,
+  }));
+
   return {
-    acceptedFields,
+    acceptedFields: round.acceptedFields,
     extractedSummaries,
   };
 }
@@ -235,7 +296,22 @@ export const AGENT_FUNCTIONS: FunctionDeclaration[] = [
       type: 'object',
       properties: {
         document_type: { type: 'string', description: 'The identified type of the document (e.g., "invoice", "resume", "report").' },
-        layout_analysis: { type: 'object', description: 'A description of the document layout (e.g., columns, sections, tables).' },
+        layout_analysis: {
+          type: 'object',
+          description: 'A description of the document layout (e.g., columns, sections, tables).',
+          properties: {
+            features: {
+              type: 'array',
+              description: 'Notable layout features, one per entry (e.g., "two columns", "line-item table", "header logo").',
+              items: { type: 'string' },
+            },
+            specialFeatures: {
+              type: 'array',
+              description: 'Content that needs special care (e.g., "handwriting", "signature", "stamp", "rotated text").',
+              items: { type: 'string' },
+            },
+          },
+        },
         extraction_strategy: { type: 'string', description: 'The recommended strategy for extraction (e.g., "form-based", "table-based", "full-text").' },
         confidence: { type: 'number', description: 'The confidence in the analysis (0.0 to 1.0).' },
       },
@@ -275,7 +351,7 @@ export async function executeReOcrRegion(
     if (!clientConfig.regionCropper) {
       throw new Error('Region refinement is not configured for this runtime');
     }
-    const croppedRegion = await clientConfig.regionCropper(fileData, mimeType, region);
+    const croppedRegion = await clientConfig.regionCropper(fileData, mimeType, region, clientConfig.abortSignal);
     const base64Data = croppedRegion.dataUrl.split(',')[1];
     if (!base64Data) {
       throw new Error('Failed to generate cropped region image for refinement');
@@ -386,12 +462,15 @@ export async function executeReOcrRegion(
       const entryConfidence = typeof entry.confidence === 'number' ? entry.confidence : 0;
       return entryConfidence >= confidence_threshold;
     });
-    const { acceptedFields, extractedSummaries } = normalizeStructuredFields(filteredFields, memory);
-
     // The model only ever saw the CROPPED image, so any location it returns is
-    // crop-relative — meaningless in the original document frame. Overwrite each
-    // recovered field's location with the known original-frame region so a later
-    // re_ocr_region re-crops the correct area instead of a wrong one.
+    // crop-relative and meaningless in the original document frame. It is dropped
+    // before validation (a crop-relative box must not fail the paid batch), and
+    // each recovered field's location is set to the known original-frame region
+    // so a later re_ocr_region re-crops the correct area instead of a wrong one.
+    const { acceptedFields, extractedSummaries } = normalizeStructuredFields(
+      filteredFields.map(({ location: _cropRelativeLocation, ...entry }) => entry),
+      memory,
+    );
     for (const field of Object.values(acceptedFields)) {
       field.location = region;
     }
@@ -409,7 +488,7 @@ export async function executeReOcrRegion(
         region,
         focus,
         targetFields,
-        fieldCandidates: extractedSummaries,
+        fieldCandidates: extractedSummaries.map((summary) => ({ ...summary, location: region })),
         fieldCount: Object.keys(acceptedFields).length,
         confidenceThreshold: confidence_threshold,
         crop: {
@@ -578,8 +657,10 @@ export function executeAnalyzeDocumentStructure(
  * "inconsistent total" flags (audit A-14).
  */
 function parseNumeric(value: string): number | null {
-  const cleaned = String(value).replace(/[^\d.,-]/g, '');
+  let cleaned = String(value).replace(/[^\d.,-]/g, '');
   if (!cleaned || !/\d/.test(cleaned)) return null;
+  // A trailing minus marks a credit ("150.00-").
+  if (cleaned.endsWith('-') && !cleaned.startsWith('-')) cleaned = `-${cleaned.slice(0, -1)}`;
   const hasDot = cleaned.includes('.');
   const hasComma = cleaned.includes(',');
   let normalized: string;
@@ -592,27 +673,89 @@ function parseNumeric(value: string): number | null {
     // A lone comma is a decimal separator unless it groups exactly 3 digits.
     normalized = /,\d{3}\b/.test(cleaned) ? cleaned.replace(/,/g, '') : cleaned.replace(',', '.');
   } else {
-    normalized = cleaned;
+    // Repeated dots followed by groups of three digits are grouping ("1.234.567").
+    normalized = /^-?\d{1,3}(?:\.\d{3}){2,}$/.test(cleaned) ? cleaned.replace(/\./g, '') : cleaned;
   }
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** Parse supported numeric dates without depending on host locale or Date.parse. */
+/** English month names and abbreviations, read from this table (never Date.parse). */
+const MONTH_NUMBERS: Readonly<Record<string, number>> = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5,
+  jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+};
+
+function monthNumber(name: string): number | undefined {
+  const key = name.toLowerCase();
+  return Object.hasOwn(MONTH_NUMBERS, key) ? MONTH_NUMBERS[key] : undefined;
+}
+
+/** "2026-01-15", "2026/01/15", "2026.1.5", ISO 8601 with time, fraction and zone. */
+const YEAR_FIRST_DATE = /^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}(?::?\d{2})?)?)?$/i;
+/** "15.01.2026" (day first), "31/12/2026" or "12-31-2026" (either order). */
+const NUMERIC_DATE = /^(\d{1,2})([/.-])(\d{1,2})\2(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
+/** "Mar 3, 2026", "March 3rd 2026". */
+const MONTH_FIRST_NAMED_DATE = /^([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/i;
+/** "3 March 2026", "3rd of March, 2026", "03-Mar-2026". */
+const DAY_FIRST_NAMED_DATE = /^(\d{1,2})(?:st|nd|rd|th)?(?:\s+(?:of\s+)?|-)([a-z]{3,9})\.?(?:,?\s+|-)(\d{4})$/i;
+const UTC_OFFSET = /^(?:Z|[+-](?:0\d|1[0-4])(?::?[0-5]\d)?)$/i;
+
+interface DateReadings {
+  readings: Array<{ year: number; month: number; day: number }>;
+  time: Array<string | undefined>;
+  zone?: string;
+}
+
+function dateReadings(text: string): DateReadings | null {
+  let match = YEAR_FIRST_DATE.exec(text);
+  if (match) {
+    return {
+      readings: [{ year: Number(match[1]), month: Number(match[3]), day: Number(match[4]) }],
+      time: match.slice(5, 8),
+      zone: match[8],
+    };
+  }
+  match = NUMERIC_DATE.exec(text);
+  if (match) {
+    const year = Number(match[4]);
+    const first = Number(match[1]);
+    const second = Number(match[3]);
+    const dayFirst = { year, month: second, day: first };
+    // A dotted date is day-first; "/" and "-" dates keep both readings.
+    return {
+      readings: match[2] === '.' ? [dayFirst] : [{ year, month: first, day: second }, dayFirst],
+      time: match.slice(5, 8),
+    };
+  }
+  match = MONTH_FIRST_NAMED_DATE.exec(text);
+  const monthFirst = match ? monthNumber(match[1]) : undefined;
+  if (match && monthFirst) {
+    return { readings: [{ year: Number(match[3]), month: monthFirst, day: Number(match[2]) }], time: [] };
+  }
+  match = DAY_FIRST_NAMED_DATE.exec(text);
+  const dayFirstMonth = match ? monthNumber(match[2]) : undefined;
+  if (match && dayFirstMonth) {
+    return { readings: [{ year: Number(match[3]), month: dayFirstMonth, day: Number(match[1]) }], time: [] };
+  }
+  return null;
+}
+
+/**
+ * Parse supported dates without depending on host locale or Date.parse. Every
+ * reading that is a real calendar date is returned, so an ambiguous
+ * "04/03/2026" yields two candidates instead of a guess. A UTC offset is
+ * checked but not applied: documents are compared by their printed date.
+ */
 function dateCandidates(value: string): number[] {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
-  const numeric = /^(\d{2})([/-])(\d{2})\2(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(value.trim());
-  if (!iso && !numeric) return [];
-  const year = Number(iso?.[1] ?? numeric?.[4]);
-  const first = Number(iso?.[2] ?? numeric?.[1]);
-  const second = Number(iso?.[3] ?? numeric?.[3]);
-  const hour = Number(iso?.[4] ?? numeric?.[5] ?? 0);
-  const minute = Number(iso?.[5] ?? numeric?.[6] ?? 0);
-  const seconds = Number(iso?.[6] ?? numeric?.[7] ?? 0);
+  const parsed = dateReadings(value.trim());
+  if (!parsed) return [];
+  const [hour = 0, minute = 0, seconds = 0] = parsed.time.map((part) => Number(part ?? 0));
   if (hour > 23 || minute > 59 || seconds > 59) return [];
-  const pairs = iso ? [[first, second]] : [[first, second], [second, first]];
+  if (parsed.zone !== undefined && !UTC_OFFSET.test(parsed.zone)) return [];
   const candidates: number[] = [];
-  for (const [month, day] of pairs) {
+  for (const { year, month, day } of parsed.readings) {
     if (month < 1 || month > 12 || day < 1 || day > 31) continue;
     const date = new Date(0);
     date.setUTCFullYear(year, month - 1, day);
@@ -671,21 +814,38 @@ function validateFieldValue(value: string, rule: string): { isValid: boolean; me
   }
 }
 
+/**
+ * Field-name words. Whole words are matched, never substrings, which would
+ * read "candidate" or "mandate" as a date and "taxpayer" as an amount.
+ */
+function fieldTokens(fieldName: string): string[] {
+  return fieldName.toLowerCase().split('_').filter(Boolean);
+}
+
+function isDateField(fieldName: string): boolean {
+  const tokens = fieldTokens(fieldName);
+  return tokens.includes('date') || tokens.includes('dob');
+}
+
+const AMOUNT_TOKENS = new Set(['amount', 'total', 'subtotal', 'tax']);
+const NON_AMOUNT_TOKENS = new Set(['id', 'number', 'name', 'exempt', 'payer', 'rate']);
+
+function isCurrencyField(fieldName: string): boolean {
+  const tokens = fieldTokens(fieldName);
+  return tokens.some((token) => AMOUNT_TOKENS.has(token)) && !tokens.some((token) => NON_AMOUNT_TOKENS.has(token));
+}
+
+function isPhoneField(fieldName: string): boolean {
+  const tokens = fieldTokens(fieldName);
+  return tokens.some((token) => token === 'phone' || token === 'mobile' || token === 'telephone')
+    && !tokens.includes('type');
+}
+
 function inferValidationRule(fieldName: string): string | undefined {
-  const lowerFieldName = fieldName.toLowerCase();
-
-  if (lowerFieldName.includes('email')) return 'email';
-  if (lowerFieldName.includes('phone')) return 'phone';
-  if (lowerFieldName.includes('date')) return 'date';
-  if (
-    lowerFieldName.includes('amount')
-    || lowerFieldName === 'total'
-    || lowerFieldName === 'subtotal'
-    || lowerFieldName.includes('tax')
-  ) {
-    return 'currency';
-  }
-
+  if (fieldTokens(fieldName).includes('email')) return 'email';
+  if (isPhoneField(fieldName)) return 'phone';
+  if (isDateField(fieldName)) return 'date';
+  if (isCurrencyField(fieldName)) return 'currency';
   return undefined;
 }
 
@@ -699,35 +859,46 @@ function fieldReviews(
   }]));
 }
 
-function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFields'][string]>): void {
+/** Rules validateFieldValue checks; any other rule (e.g. "text") checks nothing. */
+const RECOGNIZED_VALIDATION_RULES = new Set(['email', 'phone', 'date', 'currency', 'number']);
+
+/**
+ * The full runtime review of one field value against the other fields: the
+ * format check, then the consistency and cross-reference checks. A recognized
+ * rule (explicit or inferred from the name) decides the format check, so a
+ * passing explicit rule is not overridden by the field name.
+ */
+function reviewField(
+  fieldName: string,
+  field: ExtractedField,
+  fields: Record<string, ExtractedField>,
+): { isValid: boolean; message: string } {
   const reviewMemory = {
     extractedFields: fields,
   } as Readonly<AgentMemory>;
+  const formatResult = field.validation_rule && RECOGNIZED_VALIDATION_RULES.has(field.validation_rule)
+    ? validateFieldValue(field.value, field.validation_rule)
+    : validateFieldFormat(field.value, fieldName);
+  const consistencyResult = validateFieldConsistency(field.value, fieldName, reviewMemory);
+  const crossReferenceResult = validateFieldCrossReference(field.value, fieldName, reviewMemory);
 
+  const failedReview = !formatResult.isValid
+    ? formatResult
+    : !consistencyResult.isValid
+      ? consistencyResult
+    : !crossReferenceResult.isValid
+      ? crossReferenceResult
+      : null;
+  return failedReview ?? formatResult;
+}
+
+function applyCodeDrivenReviews(fields: Record<string, ExtractedField>): void {
   for (const [fieldName, field] of Object.entries(fields)) {
-    const explicitRule = field.validation_rule
-      ? validateFieldValue(field.value, field.validation_rule)
-      : undefined;
-    const formatResult = explicitRule?.isValid === false
-      ? explicitRule
-      : validateFieldFormat(field.value, fieldName);
-    const consistencyResult = validateFieldConsistency(field.value, fieldName, reviewMemory);
-    const crossReferenceResult = validateFieldCrossReference(field.value, fieldName, reviewMemory);
-
-    const failedReview = !formatResult.isValid
-      ? formatResult
-      : !consistencyResult.isValid
-        ? consistencyResult
-      : !crossReferenceResult.isValid
-        ? crossReferenceResult
-        : null;
-
+    const review = reviewField(fieldName, field, fields);
     fields[fieldName] = {
       ...field,
-      isValid: failedReview === null,
-      validationMessage: failedReview
-        ? failedReview.message
-        : formatResult.message,
+      isValid: review.isValid,
+      validationMessage: review.message,
     };
   }
 }
@@ -736,18 +907,9 @@ function applyCodeDrivenReviews(fields: Record<string, AgentMemory['extractedFie
  * Validate field format
  */
 function validateFieldFormat(value: string, fieldName: string): { isValid: boolean; message: string } {
-  // Basic format validation based on field name patterns
-  if (fieldName.toLowerCase().includes('email')) {
-    return validateFieldValue(value, 'email');
-  } else if (fieldName.toLowerCase().includes('phone')) {
-    return validateFieldValue(value, 'phone');
-  } else if (fieldName.toLowerCase().includes('date')) {
-    return validateFieldValue(value, 'date');
-  } else if (fieldName.toLowerCase().includes('amount') || fieldName.toLowerCase().includes('total')) {
-    return validateFieldValue(value, 'currency');
-  }
-  
-  return { isValid: true, message: 'Format validation passed' };
+  // Basic format validation based on the words in the field name
+  const rule = inferValidationRule(fieldName);
+  return rule ? validateFieldValue(value, rule) : { isValid: true, message: 'Format validation passed' };
 }
 
 /**
@@ -791,18 +953,17 @@ function validateFieldConsistency(value: string, fieldName: string, memory: Read
  */
 function validateFieldCrossReference(value: string, fieldName: string, memory: Readonly<AgentMemory>): { isValid: boolean; message: string } {
   const existingFields = memory.extractedFields;
-  const lowerFieldName = fieldName.toLowerCase();
 
   // Date Cross-References
-  if (lowerFieldName.includes('date')) {
+  if (isDateField(fieldName)) {
     const currentDates = dateCandidates(value);
     if (currentDates.length === 0) {
       return { isValid: false, message: 'Invalid date or time' };
     }
 
     // Check Due Date vs Invoice Date
-    if (lowerFieldName.includes('due')) {
-      const invoiceDateField = Object.entries(existingFields).find(([key]) => key.toLowerCase().includes('invoice') && key.toLowerCase().includes('date'));
+    if (fieldTokens(fieldName).includes('due')) {
+      const invoiceDateField = Object.entries(existingFields).find(([key]) => fieldTokens(key).includes('invoice') && isDateField(key));
       if (invoiceDateField) {
         const invoiceDates = dateCandidates(invoiceDateField[1].value);
         // Ambiguous numeric dates are not guessed: reject only when no

@@ -80,7 +80,7 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
   invoice: {
     documentType: 'invoice',
     requiredFields: ['vendor_name', 'invoice_number', 'invoice_date', 'customer_name', 'total_amount'],
-    optionalFields: ['due_date', 'currency', 'subtotal_amount', 'tax_amount', 'line_items'],
+    optionalFields: ['due_date', 'currency', 'subtotal_amount', 'tax_amount', 'amount_due', 'line_items'],
     aliases: {
       supplier_name: 'vendor_name',
       company_name: 'vendor_name',
@@ -96,14 +96,13 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
       vat: 'tax_amount',
       total: 'total_amount',
       grand_total: 'total_amount',
-      amount_due: 'total_amount',
       items: 'line_items',
     },
   },
   receipt: {
     documentType: 'receipt',
     requiredFields: ['merchant_name', 'transaction_date', 'total_amount'],
-    optionalFields: ['receipt_number', 'subtotal_amount', 'tax_amount', 'payment_method', 'items'],
+    optionalFields: ['transaction_time', 'receipt_number', 'subtotal_amount', 'tax_amount', 'payment_method', 'items'],
     aliases: {
       vendor_name: 'merchant_name',
       store_name: 'merchant_name',
@@ -111,7 +110,6 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
       merchant: 'merchant_name',
       date: 'transaction_date',
       receipt_date: 'transaction_date',
-      transaction_time: 'transaction_date',
       total: 'total_amount',
       grand_total: 'total_amount',
       subtotal: 'subtotal_amount',
@@ -123,7 +121,7 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
   resume: {
     documentType: 'resume',
     requiredFields: ['full_name', 'email'],
-    optionalFields: ['phone_number', 'location', 'job_title', 'skills', 'experience', 'education'],
+    optionalFields: ['phone_number', 'location', 'job_title', 'skills', 'experience', 'education', 'certifications'],
     aliases: {
       candidate_name: 'full_name',
       name: 'full_name',
@@ -136,7 +134,6 @@ const DOCUMENT_SCHEMAS: Record<Exclude<KnownAgentDocumentType, 'unknown'>, Agent
       work_experience: 'experience',
       work_history: 'experience',
       experience_highlights: 'experience',
-      certifications: 'education',
     },
   },
   'business card': {
@@ -184,9 +181,34 @@ export function normalizeAgentDocumentType(documentType?: string): string {
   }
 
   const sanitized = sanitizeKey(documentType);
-  return Object.hasOwn(DOCUMENT_TYPE_ALIASES, sanitized)
-    ? DOCUMENT_TYPE_ALIASES[sanitized]
-    : sanitized.replace(/_/g, ' ');
+  if (Object.hasOwn(DOCUMENT_TYPE_ALIASES, sanitized)) {
+    return DOCUMENT_TYPE_ALIASES[sanitized];
+  }
+  return qualifiedDocumentType(sanitized) ?? sanitized.replace(/_/g, ' ');
+}
+
+/**
+ * Aliases matched only as the whole label. "bill" also names documents that
+ * are not invoices ("bill of lading", "bill of materials").
+ */
+const EXACT_ONLY_DOCUMENT_ALIASES = new Set(['bill', 'unknown']);
+
+/**
+ * Resolve a qualified label such as "Tax Invoice" or "Resume/CV" through its
+ * words and two-word phrases ("business_card"). A label whose words name more
+ * than one known type stays schema-less rather than being guessed.
+ */
+function qualifiedDocumentType(sanitized: string): KnownAgentDocumentType | undefined {
+  const tokens = sanitized.split('_').filter(Boolean);
+  if (tokens.length < 2) return undefined;
+  const phrases = [...tokens, ...tokens.slice(1).map((token, index) => `${tokens[index]}_${token}`)];
+  const matches = new Set<KnownAgentDocumentType>();
+  for (const phrase of phrases) {
+    if (!EXACT_ONLY_DOCUMENT_ALIASES.has(phrase) && Object.hasOwn(DOCUMENT_TYPE_ALIASES, phrase)) {
+      matches.add(DOCUMENT_TYPE_ALIASES[phrase]);
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : undefined;
 }
 
 export function getAgentDocumentSchema(documentType?: string): AgentDocumentSchema | null {

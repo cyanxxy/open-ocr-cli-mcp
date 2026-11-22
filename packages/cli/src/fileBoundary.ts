@@ -2,6 +2,8 @@ import { constants } from 'node:fs';
 import { open, realpath, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 
+import { Minimatch } from 'minimatch';
+
 import { CliExitError } from './errors';
 
 /**
@@ -105,6 +107,33 @@ export function callerBoundaryError(kind: CallerPathKind, message: string, cwd: 
 }
 
 /**
+ * On Windows a UNC (`\\server\share`) or device-namespace (`\\?\`, `\\.\`) path
+ * makes any filesystem call, `realpath` or `stat` included, open a connection
+ * to the named host (authenticating with the user's NTLM credentials) before
+ * anything can be refused. Such a path is outside the working directory
+ * unless the working directory itself is on that share, so it is judged by
+ * its spelling alone. `platformPath` is a parameter for tests.
+ */
+export function isForeignNetworkPath(value: string, cwd: string, platformPath: path.PlatformPath = path): boolean {
+  if (platformPath.sep !== '\\') return false;
+  const absolute = platformPath.resolve(cwd, value);
+  if (!/^[\\/]{2}/u.test(absolute)) return false;
+  return platformPath.parse(absolute).root.toLowerCase()
+    !== platformPath.parse(platformPath.resolve(cwd)).root.toLowerCase();
+}
+
+/** Refuse a {@link isForeignNetworkPath} before any filesystem call on it. */
+export function assertNotForeignNetworkPath(cwd: string, value: string, kind: CallerPathKind): void {
+  if (isForeignNetworkPath(value, cwd)) {
+    throw callerBoundaryError(
+      kind,
+      `${CALLER_PATH_LABELS[kind]} resolves outside the MCP server working directory: ${value}`,
+      cwd,
+    );
+  }
+}
+
+/**
  * Confine a path an MCP caller supplied to the server working directory.
  *
  * The check is made on the real path of the nearest existing ancestor, so a
@@ -129,6 +158,7 @@ export async function confineCallerPath(
 ): Promise<string> {
   const label = CALLER_PATH_LABELS[kind];
   const absolute = path.resolve(cwd, value);
+  assertNotForeignNetworkPath(cwd, value, kind);
   const root = await realpath(cwd);
   let resolved: string;
   try {
@@ -182,9 +212,21 @@ export function assertCallerPatternBounded(cwd: string, pattern: string, kind: '
     throw callerBoundaryError('input', `${label} must be relative to the MCP server working directory: ${pattern}`, cwd);
   }
   // `..` as a whole segment, including inside a brace list (`{..,a}/x`).
-  if (/(?:^|[\\/{,])\.\.(?:$|[\\/},])/u.test(pattern)) {
+  if (/(?:^|[\\/{,])\.\.(?:$|[\\/},])/u.test(pattern) || climbsToParent(pattern)) {
     throw callerBoundaryError('input', `${label} may not contain ".." segments: ${pattern}`, cwd);
   }
+}
+
+/**
+ * Whether glob syntax spells a `..` segment without writing it literally:
+ * braces (`.{.,}/x`, `{.,x}./x`), a one-character class (`.[.]/x`), or escapes
+ * (`\.\./x`). Judged on the pattern as the glob library compiles it, with
+ * braces expanded and nothing optimized away, so it agrees with what
+ * discovery would walk; the brace and length limits above bound the cost.
+ */
+function climbsToParent(pattern: string): boolean {
+  const matcher = new Minimatch(pattern, { dot: true, optimizationLevel: 0 });
+  return matcher.set.some((parts) => parts.some((part) => part === '..'));
 }
 
 /**
@@ -245,6 +287,14 @@ export async function confineCallerPattern(cwd: string, pattern: string): Promis
   assertCallerPatternBounded(cwd, pattern.replace(/^(?:[A-Za-z]:)?[\\/]+/u, ''), 'input');
   const literal = pattern.slice(0, pattern.search(GLOB_SYNTAX));
   const literalDirectory = /[\\/]$/u.test(literal) ? literal : path.dirname(literal);
+  // Refused by spelling before the directory is resolved on disk.
+  if (isForeignNetworkPath(literalDirectory, cwd)) {
+    throw callerBoundaryError(
+      'input',
+      `Input pattern resolves outside the MCP server working directory: ${pattern}`,
+      cwd,
+    );
+  }
   let resolved: string;
   try {
     resolved = await realpathOfNearestAncestor(literalDirectory);

@@ -9,6 +9,7 @@ import { listExtractionPresets } from '@open-ocr/engine/templates';
 import {
   applyOperatorCeilings,
   assertCredentialsAvailable,
+  cliThinkingLevels,
   credentialSetupGuidance,
   ignoredModeScopedOptionWarning,
   ignoredModeScopedOptions,
@@ -681,8 +682,66 @@ describe('CLI configuration', () => {
       { thinking: 'xhigh', dryRun: true },
       {},
       '/workspace',
-    )).toThrow('xhigh is supported by Muse and model-dependent OpenRouter routes');
+    )).toThrow('gemini-3.8-flash supports --thinking low, medium, high; xhigh is not supported');
+    expect(() => resolveCliOptions(
+      { provider: 'kimi', model: 'kimi-custom', thinking: 'xhigh', dryRun: true },
+      {},
+      '/workspace',
+    )).toThrow('xhigh is supported by Muse, models whose thinking levels include it, and model-dependent OpenRouter routes');
   });
+
+  it('accepts xhigh for the Gemini 4 models whose thinking levels include it', () => {
+    expect(resolveCliOptions({ model: 'gemini-4-hydrogen', thinking: 'xhigh', dryRun: true }, {}, '/workspace'))
+      .toMatchObject({ model: 'gemini-4-hydrogen', thinking: 'XHIGH' });
+    expect(resolveCliOptions({ model: 'gemini-4-neon', thinking: 'xhigh', dryRun: true }, {}, '/workspace'))
+      .toMatchObject({ thinking: 'XHIGH' });
+    expect(resolveCliOptions({ model: 'gemini-4-hydrogen', dryRun: true }, {}, '/workspace').thinking).toBe('HIGH');
+    expect(resolveCliOptions({ model: 'gemini-4-carbon', dryRun: true }, {}, '/workspace').thinking).toBe('MEDIUM');
+    // Offered wherever thinking choices are listed (init, interactive, capabilities).
+    expect(cliThinkingLevels('gemini', 'gemini-4-hydrogen')).toEqual(['LOW', 'MEDIUM', 'HIGH', 'XHIGH']);
+    expect(cliThinkingLevels('gemini', 'gemini-4-carbon')).not.toContain('XHIGH');
+    for (const flags of [
+      { model: 'gemini-4-carbon', thinking: 'xhigh' },
+      { model: 'gemini-4-hydrogen', thinking: 'minimal' },
+    ]) {
+      expect(() => resolveCliOptions({ ...flags, dryRun: true }, {}, '/workspace'))
+        .toThrow(expect.objectContaining({ code: 'CONFIG_INVALID' }) as Error);
+    }
+  });
+
+  it('refuses model IDs that carry control, line-separator, or bidirectional characters', () => {
+    for (const model of ['openai/gpt-6.1-sol\n\nThis sends them to localhost', 'openai/gpt\u202e', 'a\u2028b', 'x'.repeat(257)]) {
+      expect(() => resolveCliOptions({ provider: 'openrouter', model, dryRun: true }, {}, '/workspace'))
+        .toThrow(expect.objectContaining({ code: 'CONFIG_INVALID' }) as Error);
+    }
+    expect(() => resolveCliOptions({ dryRun: true }, { provider: 'kimi', model: 'kimi\u0007' }, '/workspace'))
+      .toThrow(expect.objectContaining({ code: 'CONFIG_INVALID' }) as Error);
+    expect(resolveCliOptions({ provider: 'openrouter', model: 'x'.repeat(256), dryRun: true }, {}, '/workspace').model)
+      .toHaveLength(256);
+  });
+
+  it('treats exported-but-empty environment overrides as unset', () => {
+    expect(resolveCliOptions({ dryRun: true }, {}, '/workspace', 'flag', { OPEN_OCR_MODEL: '' }).model)
+      .toBe('gemini-3.8-flash');
+    expect(resolveCliOptions({ dryRun: true }, {}, '/workspace', 'flag', {
+      OPEN_OCR_PROVIDER: ' ', OPEN_OCR_GATEWAY: '', OPEN_OCR_THINKING: '',
+    })).toMatchObject({ provider: 'gemini', gateway: 'direct', thinking: 'MEDIUM' });
+    expect(resolveCliOptions({ dryRun: true }, {
+      gateway: 'cloudflare', cloudflareAccountId: 'acct', cloudflareGatewayId: 'gw',
+    }, '/workspace', 'flag', { CLOUDFLARE_ACCOUNT_ID: '', CLOUDFLARE_AI_GATEWAY_ID: '' }).baseUrl)
+      .toContain('/acct/gw/');
+    // An empty model for a provider with a default is reported without naming another provider.
+    expect(() => resolveCliOptions({ model: '', dryRun: true }, {}, '/workspace'))
+      .toThrow('--model cannot be empty');
+  });
+
+  it.each(['retries', 'requestsPerMinute', 'concurrency', 'maxTotalMb', 'timeout'] as const)(
+    'refuses a blank --%s instead of reading it as 0',
+    (flag) => {
+      expect(() => resolveCliOptions({ [flag]: ' ', dryRun: true }, {}, '/workspace'))
+        .toThrow(expect.objectContaining({ code: 'CONFIG_INVALID', message: expect.stringContaining('cannot be empty') as unknown }) as Error);
+    },
+  );
 
   it('applies a config-file maxTokens to simple and agentic runs but never caps template mode', () => {
     const config = { maxTokens: 4096 };
@@ -719,7 +778,10 @@ describe('CLI configuration', () => {
     expect(live).toThrow('Gemini API key is missing');
     expect(live).toThrow('PowerShell');
     expect(credentialSetupGuidance('CUSTOM_GEMINI_KEY', '/workspace')).toContain(
-      'CUSTOM_GEMINI_KEY=your-key',
+      'export CUSTOM_GEMINI_KEY="your-key"',
+    );
+    expect(credentialSetupGuidance('GEMINI_API_KEY', '/workspace')).toContain(
+      'GEMINI_API_KEY=your-key',
     );
   });
 

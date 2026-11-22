@@ -86,8 +86,8 @@ export async function* agentLoop(
   onProgress?: ProgressCallback
 ): AsyncGenerator<AgentStep, AgentMemory, unknown> {
   const agentConfig = { ...DEFAULT_AGENT_CONFIG, ...config };
-  const sessionId = Date.now().toString(36) + Math.random().toString(36).substring(2);
-  const memory = createInitialMemory(sessionId, file.name);
+  const sessionId = crypto.randomUUID();
+  const memory = createInitialMemory(sessionId, file.name, agentConfig.pageCount);
 
   let iteration = 0;
   let stopReason: AgentStopReason | null = null;

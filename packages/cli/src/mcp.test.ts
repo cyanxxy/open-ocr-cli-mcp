@@ -16,15 +16,19 @@ import {
   registerSecretForRedaction,
 } from '@open-ocr/engine/gemini/errorPayload';
 
+import { discoverInputSet } from './inputs';
 import {
   buildAgenticMcpRequest,
   buildExtractMcpRequest,
   buildWebMcpRequest,
+  confirmationMessage,
   createOcrMcpServer,
   mcpResult,
   ModernMcpDiagnosticTransport,
 } from './mcp';
+import { OcrJobService } from './ocrJobService';
 import type { OcrMachineResult } from './protocol';
+import type { ResolvedCliOptions } from './types';
 import * as machine from './machine';
 
 const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
@@ -845,6 +849,167 @@ describe('Open OCR MCP server', () => {
       expect(ran.result?.structuredContent).toMatchObject({ error: { code: 'AUTH_MISSING' } });
     });
 
+    it('counts only the documents a resume would send, and does not ask when it would send none', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      clearCredentials();
+      // The live runs below must get past the credential check; none of them calls a provider.
+      vi.stubEnv('GEMINI_API_KEY', 'test-key');
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-resume-'));
+      cleanupPaths.push(directory);
+      const scans = path.join(directory, 'scans');
+      await mkdir(scans);
+      const [a, b, c] = ['a.jpg', 'b.jpg', 'c.jpg'].map((name) => path.join(scans, name));
+      for (const file of [a, b, c]) await writeFile(file, JPEG_BYTES);
+      const out = path.join(directory, 'out');
+      const toolArgs = (paths: string[], extra: Record<string, unknown> = {}) => ({
+        inputs: paths.map((inputPath) => ({ type: 'path' as const, path: inputPath })),
+        outputDirectory: out,
+        noConfig: true,
+        ...extra,
+      });
+
+      // A previous run finished a and b, at a recorded $1 each.
+      let resolved: ResolvedCliOptions | undefined;
+      await machine.executeOcrJobRequest(buildExtractMcpRequest({ ...toolArgs([scans]), dryRun: true }), {
+        cwd: directory,
+        runId: 'plan-for-seed',
+        abortController: new AbortController(),
+        boundary: 'mcp',
+        noConfig: true,
+        onResolvedOptions: (options) => { resolved = options; },
+      });
+      const seedOptions = { ...resolved!, dryRun: false };
+      const seedInputs = (await discoverInputSet([a, b], seedOptions)).inputs;
+      await new OcrJobService({
+        extractDocument: (input, _options, _signal, _step, runtime) => {
+          runtime.recordUsage({ usage: { input_tokens: 1, total_tokens: 1, cost: 1 } });
+          return Promise.resolve({
+            artifacts: { markdown: `# ${input.name}`, json: { title: input.name, sections: [] } },
+            attempts: 1,
+          });
+        },
+      }).run(seedInputs, seedOptions, { runId: 'seed', abortController: new AbortController() });
+
+      const { request } = await driveServer(directory);
+      const message = (reply: JsonRpcReply): string => (
+        (reply.result?.inputRequests as Record<string, { params: { message: string } }>).proceed.params.message
+      );
+
+      const asked = await request(1, 'tools/call', { name: 'ocr_extract', arguments: toolArgs([scans]), _meta: modernMeta() });
+      expect(asked.result?.resultType).toBe('input_required');
+      expect(message(asked)).toMatch(/^Run OCR on 1 document with /u);
+      expect(message(asked)).toContain('2 other document(s) are already complete in the output directory');
+
+      // Only finished documents: the live run sends nothing, so nobody is asked.
+      const resumed = await request(2, 'tools/call', { name: 'ocr_extract', arguments: toolArgs([a, b]), _meta: modernMeta() });
+      expect(resumed.result?.resultType).toBe('complete');
+      expect(resumed.result?.inputRequests).toBeUndefined();
+      const documents = (resumed.result?.structuredContent as { documents: Array<{ skipReason?: string }> }).documents;
+      expect(documents.map((document) => document.skipReason)).toEqual(['resumed', 'resumed']);
+
+      // The spend recorded for the directory ($2) already meets the ceiling:
+      // c would not be sent either.
+      const capped = await request(3, 'tools/call', {
+        name: 'ocr_extract', arguments: toolArgs([scans], { maxCostUsd: 0.5 }), _meta: modernMeta(),
+      });
+      expect(capped.result?.resultType).toBe('complete');
+      expect(capped.result?.inputRequests).toBeUndefined();
+      expect(capped.result?.structuredContent).toMatchObject({ status: 'cost_limited' });
+    });
+
+    it('does not send a document that appears after a run was planned to send nothing', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      clearCredentials();
+      vi.stubEnv('GEMINI_API_KEY', 'test-key');
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-late-'));
+      cleanupPaths.push(directory);
+      const scans = path.join(directory, 'scans');
+      await mkdir(scans);
+      const [a, late] = ['a.jpg', 'late.jpg'].map((name) => path.join(scans, name));
+      await writeFile(a, JPEG_BYTES);
+      const out = path.join(directory, 'out');
+      const toolArgs = { inputs: [{ type: 'path' as const, path: scans }], outputDirectory: out, noConfig: true };
+
+      // A previous run finished a, so the plan below would send nothing.
+      let resolved: ResolvedCliOptions | undefined;
+      await machine.executeOcrJobRequest(buildExtractMcpRequest({ ...toolArgs, dryRun: true }), {
+        cwd: directory, runId: 'plan-for-seed', abortController: new AbortController(),
+        boundary: 'mcp', noConfig: true, onResolvedOptions: (options) => { resolved = options; },
+      });
+      const seedOptions = { ...resolved!, dryRun: false };
+      await new OcrJobService({
+        extractDocument: (input) => Promise.resolve({
+          artifacts: { markdown: `# ${input.name}`, json: { title: input.name, sections: [] } },
+          attempts: 1,
+        }),
+      }).run((await discoverInputSet([a], seedOptions)).inputs, seedOptions, {
+        runId: 'seed', abortController: new AbortController(),
+      });
+
+      // A file lands in the folder after the plan and before the live run
+      // discovers its inputs again.
+      const real = machine.executeOcrJobRequest;
+      const extract = vi.fn();
+      vi.spyOn(machine, 'executeOcrJobRequest').mockImplementation(async (request, options) => {
+        if (!request.dryRun) {
+          await writeFile(late, JPEG_BYTES);
+          expect(options.sendOnly).toEqual(new Set());
+          extract();
+        }
+        return real(request, options);
+      });
+
+      const { request } = await driveServer(directory);
+      const reply = await request(1, 'tools/call', { name: 'ocr_extract', arguments: toolArgs, _meta: modernMeta() });
+      expect(reply.result?.resultType).toBe('complete');
+      expect(reply.result?.inputRequests).toBeUndefined();
+      expect(extract).toHaveBeenCalledTimes(1);
+      const documents = (reply.result?.structuredContent as {
+        documents: Array<{ source: string; skipReason?: string; error?: { code: string; message: string } }>;
+      }).documents;
+      const lateDocument = documents.find((document) => document.source.endsWith('late.jpg'));
+      expect(lateDocument?.error).toMatchObject({ code: 'CANCELLED' });
+      expect(lateDocument?.error?.message).toContain('was not part of the confirmed plan');
+      expect(documents.find((document) => document.source.endsWith('a.jpg'))?.skipReason).toBe('resumed');
+    });
+
+    it('bounds a caller-supplied model ID in the confirmation prompt', async () => {
+      vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
+      clearCredentials();
+      const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-model-'));
+      cleanupPaths.push(directory);
+      await writeFile(path.join(directory, 'a.jpg'), JPEG_BYTES);
+      const { request } = await driveServer(directory);
+      const call = async (id: number, model: string): Promise<JsonRpcReply> => request(id, 'tools/call', {
+        name: 'ocr_extract',
+        arguments: {
+          inputs: [{ type: 'path', path: path.join(directory, 'a.jpg') }],
+          provider: 'openrouter',
+          model,
+          noConfig: true,
+        },
+        _meta: modernMeta(),
+      });
+
+      // Advertised in the tool schema, so a client is refused before planning.
+      const tools = await request(3, 'tools/list', { _meta: modernMeta() });
+      const listed = tools.result?.tools as Array<{ name: string; inputSchema: { properties: Record<string, { maxLength?: number }> } }>;
+      for (const tool of listed.filter((entry) => entry.inputSchema.properties.model)) {
+        expect(tool.inputSchema.properties.model.maxLength).toBe(256);
+      }
+      const tooLong = await call(1, `openai/${'x'.repeat(300)}`);
+      expect(tooLong.result).toMatchObject({ isError: true });
+
+      const long = `openai/${'x'.repeat(200)}`;
+      const asked = await call(2, long);
+      expect(asked.result?.resultType).toBe('input_required');
+      const text = (asked.result?.inputRequests as Record<string, { params: { message: string } }>).proceed.params.message;
+      expect(text).not.toContain(long);
+      expect(text).toContain(`${long.slice(0, 119)}…`);
+      // The facts a person checks still follow the model, on the same line.
+      expect(text).toMatch(/\(no cost ceiling\)\? This sends them to openrouter\.ai/u);
+    });
+
     it('does not ask a person to approve a run that would send nothing', async () => {
       vi.stubEnv('OPEN_OCR_MCP_CONFIRM', '1');
       const directory = await mkdtemp(path.join(tmpdir(), 'open-ocr-mcp-plan-'));
@@ -1382,6 +1547,25 @@ describe('Open OCR MCP server', () => {
       });
       expect(refused.error).toMatchObject({ code: -32602 });
       expect(refused.result).toBeUndefined();
+    });
+  });
+
+  describe('confirmation message', () => {
+    it('escapes line breaks and bidirectional overrides in the provider and model', () => {
+      const text = confirmationMessage({
+        sources: ['a.jpg'],
+        rejected: 0,
+        notSent: 0,
+        provider: 'openrouter',
+        gateway: 'direct',
+        model: 'openai/gpt-6.1-sol (estimated cost capped at $0.05)? This sends them to localhost and is free.\n\n\u202e',
+        destination: 'openrouter.ai',
+        credentialEnvs: ['OPENROUTER_API_KEY'],
+        optionsDigest: 'digest',
+      });
+      expect(text).not.toMatch(/[\n\u202e]/u);
+      expect(text).toContain('\\n\\n\\u202e');
+      expect(text).toContain('(no cost ceiling)? This sends them to openrouter.ai with the credential in OPENROUTER_API_KEY');
     });
   });
 

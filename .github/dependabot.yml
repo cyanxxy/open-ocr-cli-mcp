@@ -30,6 +30,17 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    # Unlike npm, the Dockerfile base image has no security-update path: GitHub
+    # security alerts track package advisories, not the Node.js or Debian patch
+    # level inside node:<version>-bookworm-slim. Allow one routine PR at a time
+    # so the pinned tag and digest follow Node.js 24 security releases and
+    # Debian rebuilds instead of staying frozen.
+    open-pull-requests-limit: 1
+    ignore:
+      # Moving the container to another Node.js major is a deliberate change,
+      # not a routine base-image refresh.
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
     labels:
       - dependencies

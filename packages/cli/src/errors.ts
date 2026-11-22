@@ -7,6 +7,7 @@ import {
   type ProviderErrorPayload,
   type ProviderErrorSubject,
 } from '@open-ocr/engine/gemini/errorPayload';
+import { GEMINI_PER_REQUEST_LIMIT_PHRASE } from '@open-ocr/engine/gemini/client';
 import { isTransientBudgetProviderError } from '@open-ocr/engine/providers/openaiCompatible';
 import { isQuotaExhaustedError } from '@open-ocr/engine/providers/retry';
 
@@ -154,6 +155,12 @@ function classifyErrorMessage(message: string, exitCode: CliExitCode): OcrErrorD
   ) {
     return { code: 'SCHEMA_INVALID', category: 'schema', retryable: false, hint: 'Validate the JSON Schema against the supported structured-output subset.' };
   }
+  // A stop at the model's per-request output cap (Gemini CONTINUATION, or an
+  // interaction that requires continuation). Checked before the generic
+  // truncation rule: no --max-tokens can lift this cap.
+  if (normalized.includes(GEMINI_PER_REQUEST_LIMIT_PHRASE)) {
+    return OUTPUT_TRUNCATED_PER_REQUEST_DETAILS;
+  }
   // Output-token truncation, as the Gemini client words it. The request was
   // valid and the provider did not fail: it ran out of the token budget, so the
   // fix is a larger budget, never an identical retry.
@@ -202,6 +209,19 @@ const OUTPUT_TRUNCATED_DETAILS: OcrErrorDetails = {
   retryable: false,
   hint: 'The response hit the output-token limit and is incomplete; rerun with a higher --max-tokens '
     + '(maxTokens in a run request), a lower --thinking level, or a smaller document.',
+};
+
+/**
+ * The response stopped at the model's per-request output cap, which sits below
+ * any --max-tokens the CLI accepts. A larger budget cannot help, so the hint
+ * never suggests one.
+ */
+const OUTPUT_TRUNCATED_PER_REQUEST_DETAILS: OcrErrorDetails = {
+  code: 'PROVIDER_FAILURE',
+  category: 'provider',
+  retryable: false,
+  hint: 'The response stopped at the model\'s per-request output limit and is incomplete; lower the --thinking level '
+    + '(extraction.thinking in a run request) or split the document, for example by page ranges, then retry.',
 };
 
 /**
@@ -470,9 +490,10 @@ function classifyKnownError(error: unknown, exitCode: CliExitCode): OcrErrorDeta
       const payload = providerPayloadOf(current);
       const subject = payload ? providerErrorSubject(payload) : undefined;
       if (subject) return classifyProviderSubject(subject);
-      if (providerError && recordValue(current, 'message') !== undefined
-        && String(recordValue(current, 'message')).includes('reached the output token limit')) {
-        return OUTPUT_TRUNCATED_DETAILS;
+      if (providerError && recordValue(current, 'message') !== undefined) {
+        const providerMessage = String(recordValue(current, 'message')).toLowerCase();
+        if (providerMessage.includes(GEMINI_PER_REQUEST_LIMIT_PHRASE)) return OUTPUT_TRUNCATED_PER_REQUEST_DETAILS;
+        if (providerMessage.includes('reached the output token limit')) return OUTPUT_TRUNCATED_DETAILS;
       }
       if (providerError) {
         return {
@@ -555,9 +576,32 @@ export function batchMetadataError(message: string): CliExitError {
   });
 }
 
+/**
+ * error-v2 requires a non-empty `message`, so an error thrown with none (a
+ * provider body `{"error":{"message":""}}`, a bare `new Error()`) would make
+ * the document's own failure event invalid and fail the whole run. Name what
+ * is known instead: the HTTP status, else the thrower and the code.
+ */
+function nonEmptyMessage(message: string, error: unknown, code: OcrErrorCode): string {
+  if (message.trim()) return message;
+  const seen = new Set<unknown>();
+  let status: number | undefined;
+  let thrower: string | undefined;
+  for (let current = error, depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    status ??= numericStatus(current);
+    const name = recordValue(current, 'name');
+    if (typeof name === 'string' && name) thrower = name;
+    current = recordValue(current, 'cause');
+  }
+  if (status !== undefined) return `Provider request failed with HTTP ${status}`;
+  return `${thrower ?? 'Error'} with no message (${code})`;
+}
+
 export function asCliExitError(error: unknown, exitCode: CliExitCode): CliExitError {
   if (error instanceof CliExitError) {
-    const redacted = redactSensitiveErrorText(error.message);
+    const redacted = nonEmptyMessage(redactSensitiveErrorText(error.message), error, error.code);
     if (redacted === error.message) return error;
     return new CliExitError(redacted, error.exitCode, {
       cause: error,
@@ -580,7 +624,7 @@ export function asCliExitError(error: unknown, exitCode: CliExitCode): CliExitEr
     ?? classifyErrorMessage(message, exitCode)
     ?? defaultErrorDetails(exitCode);
   return new CliExitError(
-    message,
+    nonEmptyMessage(message, error, classified.code),
     exitCode,
     { cause: error, ...classified },
   );

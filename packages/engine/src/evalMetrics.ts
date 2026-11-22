@@ -93,15 +93,19 @@ function multisetOverlap(reference: readonly string[], prediction: readonly stri
 }
 
 export function scoreOcrText(referenceText: string, predictionMarkdown: string): EvalMetricScores {
-  const strictReference = referenceText.normalize('NFC').replace(/\r\n?/g, '\n').trim();
-  const strictPrediction = markdownToPlainText(predictionMarkdown).normalize('NFC').trim();
-  const normalizedReference = normalizeOcrText(referenceText);
-  const normalizedPrediction = normalizeOcrText(predictionMarkdown);
+  // Both sides drop Markdown markers the same way, so a prediction that
+  // reproduces the reference exactly scores 0 even when the reference holds
+  // "____", "1. " or "a < b" literally. Lengths count code points, the unit the
+  // edit distance runs over, so non-BMP characters are not counted twice.
+  const strictReference = Array.from(markdownToPlainText(referenceText).normalize('NFC').trim());
+  const strictPrediction = Array.from(markdownToPlainText(predictionMarkdown).normalize('NFC').trim());
+  const normalizedReference = Array.from(normalizeOcrText(referenceText));
+  const normalizedPrediction = Array.from(normalizeOcrText(predictionMarkdown));
   const referenceTokens = tokenize(referenceText);
   const predictionTokens = tokenize(predictionMarkdown);
 
-  const strictDistance = levenshteinDistance([...strictReference], [...strictPrediction]);
-  const normalizedDistance = levenshteinDistance([...normalizedReference], [...normalizedPrediction]);
+  const strictDistance = levenshteinDistance(strictReference, strictPrediction);
+  const normalizedDistance = levenshteinDistance(normalizedReference, normalizedPrediction);
   const wordDistance = levenshteinDistance(referenceTokens, predictionTokens);
   const overlap = multisetOverlap(referenceTokens, predictionTokens);
   const similarityDenominator = Math.max(normalizedReference.length, normalizedPrediction.length, 1);
@@ -198,17 +202,23 @@ export function scoreFields(
   };
 }
 
+/** A "column:value" token per non-empty cell; a value may itself end with ":". */
+function cellToken(column: string, value: unknown): string[] {
+  const canonical = canonicalValue(value);
+  return canonical === '' ? [] : [`${column}:${canonical}`];
+}
+
 function tableCellTokens(rows: unknown): string[] {
   if (!Array.isArray(rows)) return [];
   return rows.flatMap((row) => {
     if (Array.isArray(row)) {
-      return row.map((value, index) => `${index}:${canonicalValue(value)}`);
+      return row.flatMap((value, index) => cellToken(String(index), value));
     }
     if (isRecord(row)) {
-      return Object.entries(row).map(([key, value]) => `${normalizeOcrText(key)}:${canonicalValue(value)}`);
+      return Object.entries(row).flatMap(([key, value]) => cellToken(normalizeOcrText(key), value));
     }
     return [];
-  }).filter((token) => !token.endsWith(':'));
+  });
 }
 
 export function scoreTableCells(referenceRows: unknown, predictionRows: unknown): EvalMetricScores {

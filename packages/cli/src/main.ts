@@ -65,6 +65,7 @@ import {
   resolveWebUrls,
   runWebJob,
   WEB_ANALYSIS_MODES,
+  webFileConfig,
   type WebAnalysisMode,
   type WebOutputFormat,
 } from './web';
@@ -83,9 +84,7 @@ export function cliVersion(): string {
 
 function isSupportedNode(version: string): boolean {
   const [major = 0, minor = 0] = version.split('.').map(Number);
-  return (major === 20 && minor >= 19)
-    || (major === 22 && minor >= 13)
-    || major >= 24;
+  return (major === 22 && minor >= 13) || major >= 24;
 }
 
 function collect(value: string, previous: string[]): string[] {
@@ -605,17 +604,11 @@ then CLI flags. Later sources win.
       );
       const options = resolveCliOptions(
         { ...flags, outputPathKind: 'file' },
-        {
-          ...fileConfig,
-          mode: 'simple',
-          preset: undefined,
-          schema: undefined,
-          // `web` supports only markdown and JSON, so a `format` meant for
-          // `extract` (`csv`, `all`) must not leak in from the config file and
-          // fail the run. Commander already restricts the flag itself, so an
-          // explicit --format still wins.
-          format: fileConfig.format === 'json' ? 'json' : 'markdown',
-        },
+        // `web` supports only simple mode with markdown and JSON, so extract
+        // keys (`preset`, `schema`, a `format` of `csv` or `all`) must not leak
+        // in from the config file and fail the run. Commander already
+        // restricts the flag itself, so an explicit --format still wins.
+        webFileConfig(fileConfig),
         cwd,
         'flag',
         env,
@@ -821,7 +814,7 @@ then CLI flags. Later sources win.
       };
       if (flags.json) process.stdout.write(`${JSON.stringify(checks, null, 2)}\n`);
       else {
-        process.stdout.write(`Node.js ${checks.node.version}: ${checks.node.ok ? 'ok' : 'use Node 20.19+, 22.13+, or 24+'}\n`);
+        process.stdout.write(`Node.js ${checks.node.version}: ${checks.node.ok ? 'ok' : 'use Node 22.13+ or 24+'}\n`);
         process.stdout.write(`Configuration: ${checks.configuration.ok ? 'ok' : checks.configuration.error}\n`);
         if (checks.configuration.hint) process.stdout.write(`  hint: ${checks.configuration.hint}\n`);
         process.stdout.write(`${apiKeyEnv}: ${checks.apiKey.ok ? 'configured' : 'missing'}\n`);

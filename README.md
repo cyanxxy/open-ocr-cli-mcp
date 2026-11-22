@@ -45,6 +45,10 @@ claude mcp add --transport stdio --scope user open-ocr -- open-ocr-cli mcp
 ```
 
 Start Claude with the provider key in its environment, then check with `/mcp`.
+If `/mcp` shows open-ocr failing to connect, for example after an earlier
+launch failed, start Claude Code with `MCP_PROTOCOL_NEGOTIATION=auto`
+(2.1.221+): with the variable unset, Claude Code can skip probing a stdio
+server for 7 days and use the earlier handshake, which this server rejects.
 Claude Code aborts a stdio tool call that sends no response or progress for 30
 minutes (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`); a single document may run up to
 `timeoutSeconds` (at most 3600), so keep that under 1800 or raise the window.
@@ -147,10 +151,10 @@ or cost-limited, `2` invalid command or config. Request examples are in the
 
 | `--provider` | Key variable | Suggested models (default first) |
 | --- | --- | --- |
-| `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.5-flash-lite` |
+| `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.8-flash`, `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-3.5-flash-lite` |
 | `kimi` | `MOONSHOT_API_KEY` | `kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed`, `kimi-k3` |
 | `muse` | `META_API_KEY` | `muse-spark-1.3`, `muse-wonder-1.0` |
-| `openrouter` | `OPENROUTER_API_KEY` | Gemini, GPT-6.x, Claude 5.x, Muse, Grok 4.7, Mistral Medium 3.5 |
+| `openrouter` | `OPENROUTER_API_KEY` | Gemini, GPT-6.x, Claude Opus/Sonnet/Haiku 5.5, Claude Fable 5.2 and 5.1, Muse, Grok 4.7, Mistral Medium 3.5 |
 | `openai-compatible` | `OPEN_OCR_API_KEY` | Any vision model, for example a local Ollama server |
 
 ```bash
@@ -164,9 +168,19 @@ PDFs natively; Kimi extracts PDF text first; the generic compatible profile
 takes images only. Cloudflare AI Gateway routing is supported with
 `--gateway cloudflare`.
 
+Gemini 4 Hydrogen and Neon accept `--thinking xhigh` and default to `high`;
+Gemini 4 Argon and Carbon default to `medium`. The built-in cost estimates for
+Gemini 4 Carbon, Hydrogen, and Neon were checked on 2026-11-21 against
+secondary sources, because Google's pricing page could not be reached; pass
+`--input-price` and `--output-price` if your bill differs. An OpenRouter model
+with no known reasoning contract (one outside the suggested list) is sent a
+reasoning effort only when you choose one with `--thinking`.
+
 ## Installation
 
-Requires Node.js 20.19+, 22.13+, or 24+.
+Requires Node.js 22.13+ or 24+. CI tests Node.js 22, 24, and 26. Upgrading from
+4.x: Node.js 20 is no longer supported, and a few setups now behave differently;
+see [5.0.0 in the changelog](CHANGELOG.md#500---2026-11-22).
 
 **npm**
 
@@ -185,7 +199,7 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
 **GitHub Actions**
 
 ```yaml
-- uses: cyanxxy/open-ocr-cli-mcp@v4
+- uses: cyanxxy/open-ocr-cli-mcp@v5
   env:
     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
   with:
@@ -195,7 +209,9 @@ docker run --rm -e GEMINI_API_KEY -v "$PWD:/work" \
     output: ocr-results
 ```
 
-All inputs are listed in [action.yml](action.yml).
+All inputs are listed in [action.yml](action.yml). The action uses the job's
+Node.js when it already satisfies the CLI's supported range, and installs
+Node.js 22 only otherwise, so later steps keep the version the job set up.
 
 **Agent skill.** A portable skill for Claude Code and Codex ships in the npm
 package and in [integrations/open-ocr](integrations/open-ocr/skills/open-ocr).

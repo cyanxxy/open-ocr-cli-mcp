@@ -288,6 +288,14 @@ export interface OcrJobResult {
   outputArtifacts?: ArtifactTarget[];
   plannedOutputArtifacts?: ArtifactTarget[];
   skipReason?: 'validated' | 'resumed' | 'cancelled' | 'cost-limit' | 'fail-fast';
+  /**
+   * Dry runs only, internal: the document validated, but the live run would
+   * not send it, because a resume skips it as unchanged (`resumed`) or the
+   * spend recorded for the job already meets `--max-cost` (`cost-limit`). Its
+   * status stays `skipped`/`validated`; the MCP confirmation reads this so it
+   * counts only documents that would be sent.
+   */
+  plannedSkip?: 'resumed' | 'cost-limit';
   partialReason?: OcrPartialReason;
   nextAction?: OcrNextAction;
   error?: string;

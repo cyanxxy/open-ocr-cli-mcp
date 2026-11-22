@@ -1,5 +1,11 @@
-import type { AutomaticContinuationOption, Content, FunctionDeclaration, Interactions } from '@google/genai';
-import { getGenAIClient, normalizeThinkingLevel } from './client';
+import type {
+  AutomaticContinuationOption,
+  Content,
+  FunctionDeclaration,
+  GoogleGenAIRequestOptions,
+  Interactions,
+} from '@google/genai';
+import { GEMINI_PER_REQUEST_LIMIT_PHRASE, getGenAIClient, normalizeThinkingLevel } from './client';
 import type { GeminiModel, ThinkingConfig } from './types';
 import {
   recordGeminiInteractionStepUsages,
@@ -404,10 +410,25 @@ export function summarizeUrlContextResults(steps?: InteractionStep[]): UrlContex
 function assertInteractionNotTruncated(status: string | undefined): void {
   if (status === 'requires_continuation') {
     throw new Error(
-      'Gemini interaction reached the output token limit for a single request (status requires_continuation) '
-      + 'and returned incomplete output. Lower the thinking level or split the document and retry.',
+      `Gemini interaction stopped at the model's ${GEMINI_PER_REQUEST_LIMIT_PHRASE} (status requires_continuation) `
+      + 'and returned incomplete output. A larger output budget cannot help; '
+      + 'lower the thinking level or split the document (for example by page ranges) and retry.',
     );
   }
+}
+
+/**
+ * Per-request options for `interactions.create`. The SDK's Interactions bridge
+ * otherwise retries 408/409/429/5xx and connection errors up to 4 times inside
+ * one call: behind the request-rate gate, past terminal quota verdicts and
+ * `--retries 0`, and with each attempt possibly billed but counted once. Retry
+ * policy belongs to the engine and CLI, so the SDK sends exactly one request.
+ */
+function interactionRequestOptions(abortSignal?: AbortSignal): GoogleGenAIRequestOptions {
+  return {
+    retries: { strategy: 'none' },
+    ...(abortSignal ? { fetchOptions: { signal: abortSignal } } : {}),
+  };
 }
 
 function buildResponseFormat(
@@ -475,7 +496,7 @@ export async function runModelInteraction({
     };
     const interaction = await withReadableProviderErrors(() => genAI.interactions.create(
       params,
-      abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+      interactionRequestOptions(abortSignal),
     )) as Interactions.Interaction;
     recordGeminiInteractionUsage(
       interaction,
@@ -504,7 +525,7 @@ export async function runModelInteraction({
   };
   const stream = await withReadableProviderErrors(() => genAI.interactions.create(
     params,
-    abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+    interactionRequestOptions(abortSignal),
   )) as AsyncIterable<Interactions.InteractionSSEEvent>;
   const steps = new Map<number, InteractionStep>();
   const argumentDeltas = new Map<number, string>();

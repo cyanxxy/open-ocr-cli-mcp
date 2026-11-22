@@ -147,6 +147,11 @@ async function providerArguments(
   const defaultProvider = configuredChoice(env.OPEN_OCR_PROVIDER, PROVIDER_IDS, configuredProvider);
   const provider = await chooseProvider(prompter, writeOutput, defaultProvider);
   const providerContextMatches = provider === configuredProvider;
+  // OPEN_OCR_MODEL and OPEN_OCR_THINKING belong to the ambient provider
+  // (OPEN_OCR_PROVIDER, else the configured one), exactly as resolveCliOptions
+  // treats them: picking another provider here drops them instead of turning a
+  // foreign model ID into an explicit --model.
+  const envContextMatches = provider === defaultProvider;
   const configuredGateway = configuredChoice(config.gateway, ['direct', 'cloudflare'] as const, 'direct');
   const defaultGateway = configuredChoice(env.OPEN_OCR_GATEWAY, ['direct', 'cloudflare'] as const, configuredGateway);
   const gateway = await promptSelect<GatewayId>(
@@ -159,13 +164,18 @@ async function providerArguments(
     ],
     defaultGateway,
   );
-  const preferredModel = env.OPEN_OCR_MODEL
-    ?? (providerContextMatches ? config.model : undefined)
+  const envModel = envContextMatches ? env.OPEN_OCR_MODEL : undefined;
+  const configuredModel = providerContextMatches ? config.model : undefined;
+  const preferredModel = envModel
+    ?? configuredModel
     ?? PROVIDER_PROFILES[provider].defaultModel;
   const model = await chooseModel(prompter, writeOutput, provider, preferredModel);
   const modelContextMatches = providerContextMatches && (!config.model || config.model === model);
+  const envThinking = envContextMatches && model === (envModel ?? configuredModel ?? PROVIDER_PROFILES[provider].defaultModel)
+    ? env.OPEN_OCR_THINKING
+    : undefined;
   const configuredThinking = (
-    env.OPEN_OCR_THINKING
+    envThinking
     ?? (modelContextMatches ? config.thinking : undefined)
   )?.toLowerCase();
   const thinkingValues: readonly InteractiveThinkingLevel[] = cliThinkingLevels(provider, model)
@@ -192,11 +202,17 @@ async function providerArguments(
     'API key environment variable',
     providerContextMatches ? config.apiKeyEnv ?? profileApiKeyEnvironment(provider) : profileApiKeyEnvironment(provider),
   );
+  // Accepting the offered default when nothing configured a level is not
+  // choosing one: omitting the flag resolves the same level, and on an
+  // OpenRouter route without a known reasoning contract it leaves the
+  // reasoning field out, as the CLI does. With a configured level the flag is
+  // always passed, so the person's pick wins over the environment.
+  const thinkingChosen = configuredThinking !== undefined || thinking !== defaultThinking;
   const args = [
     '--provider', provider,
     '--gateway', gateway,
     '--model', model,
-    '--thinking', thinking,
+    ...(thinkingChosen ? ['--thinking', thinking] : []),
     '--api-key-env', apiKeyEnv,
   ];
   if (provider === 'openai-compatible') {
@@ -410,10 +426,12 @@ export async function promptInteractiveArguments(runtime: InteractiveRuntime = {
     writeOutput('\nOpen OCR CLI interactive mode\n\n');
     const command = await promptSelect(prompter, writeOutput, 'Command', COMMAND_CHOICES, 'extract');
     switch (command) {
+      // Awaited inside the try: a returned, pending promise would reject past
+      // the catch below, so Ctrl-C at a sub-prompt exited 2 instead of 130.
       case 'extract':
-        return extractArguments(prompter, writeOutput, env, config);
+        return await extractArguments(prompter, writeOutput, env, config);
       case 'web':
-        return webArguments(prompter, writeOutput, env, config);
+        return await webArguments(prompter, writeOutput, env, config);
       case 'init':
         return ['init'];
       case 'providers':

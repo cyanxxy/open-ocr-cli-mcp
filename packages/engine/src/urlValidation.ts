@@ -31,6 +31,10 @@ export function isPublicIpAddress(address: string): boolean {
   // Never follow IPv4-mapped IPv6 answers. Hexadecimal forms such as
   // ::ffff:7f00:1 have historically bypassed dotted-quad-only filters.
   if (parsed instanceof ipaddr.IPv6 && parsed.isIPv4MappedAddress()) return false;
+  // Nor the deprecated IPv4-compatible block ::/96 (RFC 4291 2.5.5.1), which
+  // ipaddr.js labels unicast: the URL parser turns [::127.0.0.1] into
+  // [::7f00:1], and ::a9fe:a9fe embeds the cloud metadata address.
+  if (parsed instanceof ipaddr.IPv6 && parsed.parts.slice(0, 6).every((part) => part === 0)) return false;
   return parsed.range() === 'unicast';
 }
 

@@ -20,8 +20,10 @@ vi.mock('@google/genai', async () => {
 
 import type { AgentMemory, NormalizedRegion } from './agentTypes';
 import { applyMemoryUpdate } from './agentMemory';
+import { evaluateAgentCompletion } from './agentSchema';
 import { GeminiCostLimitError } from './gemini/requestPolicy';
 import {
+  AGENT_FUNCTIONS,
   executeAnalyzeDocumentStructure,
   executeExtractFieldsBatch,
   executeReOcrRegion,
@@ -226,6 +228,11 @@ describe('agentTools', () => {
     ['31/12/2026', true], ['12/31/2026', true], ['31-12-2026 23:59:59', true],
     ['2028-02-29', true], ['2026-02-29', false], ['31/04/2026', false],
     ['2026-01-12 24:00', false], ['2026-01-12 12:60', false],
+    ['15.01.2026', true], ['1.5.2026', true], ['31.04.2026', false], ['01.15.2026', false],
+    ['1/5/2026', true], ['2026/01/15', true], ['2026-01-15T10:00:00Z', true],
+    ['2026-01-15T10:00:00.250+05:30', true], ['2026-01-15T10:00:00+15:00', false],
+    ['March 3, 2026', true], ['Mar 3 2026', true], ['3 March 2026', true], ['3rd of March, 2026', true],
+    ['03-Mar-2026', true], ['30 February 2026', false], ['Smarch 3, 2026', false], ['15/01/26', false],
   ])('validates real calendar dates consistently: %s', async (value, expected) => {
     const memory = createMemory();
     delete memory.extractedFields.invoice_date;
@@ -250,6 +257,220 @@ describe('agentTools', () => {
     }, '', '', memory);
     applyMemoryUpdate(memory, result.memoryUpdate);
     expect(memory.extractedFields.due_date.isValid).toBe(expected);
+  });
+
+  it('keeps a known-valid value when a higher-confidence candidate fails the cross-reference review', async () => {
+    const memory = createMemory();
+    memory.extractedFields.invoice_date.isValid = true;
+    memory.extractedFields.due_date = { value: '2026-03-20', confidence: 0.9, isValid: true, extractedAt: 100 };
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'due_date', field_value: '2026-01-20', confidence: 0.95 }],
+    }, '', '', memory);
+    expect(result.data).toMatchObject({
+      fields: [{ field_name: 'due_date', isValid: false, validationMessage: 'Due date cannot be before invoice date' }],
+    });
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.due_date).toMatchObject({ value: '2026-03-20', isValid: true });
+  });
+
+  it.each(['due-first', 'invoice-first'])('accepts a self-consistent correction batch whatever its order (%s)', async (order) => {
+    const memory = createMemory();
+    const seeded = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'invoice_date', field_value: '2026-01-10', confidence: 0.8 },
+        { field_name: 'due_date', field_value: '2026-02-10', confidence: 0.8 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, seeded.memoryUpdate);
+    const correction = [
+      { field_name: 'due_date', field_value: '2025-12-31', confidence: 0.99 },
+      { field_name: 'invoice_date', field_value: '2025-12-01', confidence: 0.99 },
+    ];
+    const result = await executeExtractFieldsBatch({
+      fields: order === 'due-first' ? correction : [...correction].reverse(),
+    }, '', '', memory);
+    expect((result.data as { fields: Array<Record<string, unknown>> }).fields).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field_name: 'due_date', isValid: true }),
+      expect.objectContaining({ field_name: 'invoice_date', isValid: true }),
+    ]));
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.invoice_date).toMatchObject({ value: '2025-12-01', isValid: true });
+    expect(memory.extractedFields.due_date).toMatchObject({ value: '2025-12-31', isValid: true });
+  });
+
+  it('keeps a stored due date when the batch invoice date that would justify a new one is rejected', async () => {
+    const memory = createMemory();
+    memory.extractedFields.invoice_date = { value: '2026-01-10', confidence: 0.9, isValid: true, extractedAt: 100 };
+    memory.extractedFields.due_date = { value: '2026-02-10', confidence: 0.9, isValid: true, extractedAt: 100 };
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'due_date', field_value: '2025-12-31', confidence: 0.99 },
+        { field_name: 'invoice_date', field_value: 'see stamp', confidence: 0.99 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.invoice_date).toMatchObject({ value: '2026-01-10', isValid: true });
+    expect(memory.extractedFields.due_date).toMatchObject({ value: '2026-02-10', isValid: true });
+  });
+
+  it('keeps a known-valid value when the candidate passes its explicit rule but fails the name-based check', async () => {
+    const memory = createMemory('unknown');
+    const first = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'contact_email', field_value: 'a@b.co', confidence: 0.8 }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, first.memoryUpdate);
+    const second = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'contact_email', field_value: 'nope', confidence: 0.99, validation_rule: 'text' }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, second.memoryUpdate);
+    expect(memory.extractedFields.contact_email).toMatchObject({ value: 'a@b.co', isValid: true });
+
+    const invoice = createMemory();
+    invoice.extractedFields.invoice_date.isValid = true;
+    const dated = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'invoice_date', field_value: 'see stamp', confidence: 0.99, validation_rule: 'Date' }],
+    }, '', '', invoice);
+    applyMemoryUpdate(invoice, dated.memoryUpdate);
+    expect(invoice.extractedFields.invoice_date).toMatchObject({ value: '2026-02-18', isValid: true });
+  });
+
+  it.each([
+    ['invoice', 'total_amount', 'amount_due', '1,000.00', '400.00'],
+    ['receipt', 'transaction_date', 'transaction_time', '2026-01-12', '14:22'],
+    ['resume', 'education', 'certifications', 'BSc Industrial Design', 'AWS Solutions Architect'],
+  ])('keeps %s fields %s and %s as separate facts', async (documentType, firstName, secondName, firstValue, secondValue) => {
+    const memory = createMemory(documentType);
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: firstName, field_value: firstValue, confidence: 0.95 },
+        { field_name: secondName, field_value: secondValue, confidence: 0.95 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields[firstName]).toMatchObject({ value: firstValue, isValid: true });
+    expect(memory.extractedFields[secondName]).toMatchObject({ value: secondValue, isValid: true });
+  });
+
+  it.each([
+    ['€ 1.234.567', true], ['150.00-', true], ['1.234,56', true], ['(150.00)', true], ['n/a', false],
+  ])('validates printed currency amount %s', async (value, expected) => {
+    const memory = createMemory();
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: 'total_amount', field_value: value, confidence: 0.95 }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields.total_amount.isValid).toBe(expected);
+  });
+
+  it('completes an invoice whose date is printed day-first with dots', async () => {
+    const memory = createMemory();
+    delete memory.extractedFields.invoice_date;
+    const result = await executeExtractFieldsBatch({
+      fields: [
+        { field_name: 'invoice_date', field_value: '15.01.2026', confidence: 0.98 },
+        { field_name: 'customer_name', field_value: 'Acme Logistics', confidence: 0.98 },
+        { field_name: 'total_amount', field_value: '1.471,50', confidence: 0.98 },
+      ],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(evaluateAgentCompletion(memory, 0.98, 0.8)).toEqual({
+      complete: true, reason: 'confidence-and-coverage-met',
+    });
+  });
+
+  it.each([
+    ['form', 'candidate_name', 'Jordan Lee', undefined],
+    ['form', 'candidate_name', 'Jordan Lee', 'text'],
+    ['form', 'validated_by', 'Operations', undefined],
+    ['form', 'update_reason', 'Address change', undefined],
+    ['form', 'mandate_reference', 'MR-2026-01', undefined],
+    ['form', 'taxpayer_name', 'Jordan Lee', undefined],
+    ['form', 'tax_id', 'pending', undefined],
+    ['form', 'phone_type', 'mobile', undefined],
+    ['contract', 'liquidated_damages', '$5,000 per day', undefined],
+    ['invoice', 'consolidated_total', '1,234.00', undefined],
+    ['resume', 'candidate_location', 'Amsterdam', undefined],
+  ])('does not read a word inside the %s field name %s as a type', async (documentType, name, value, rule) => {
+    const memory = createMemory(documentType);
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: name, field_value: value, confidence: 0.95, ...(rule ? { validation_rule: rule } : {}) }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields[name]).toMatchObject({ value, isValid: true });
+  });
+
+  it.each([
+    ['invoice_date', 'next week'], ['due_date', 'on receipt'], ['date_of_birth', 'unknown'],
+    ['phone_number', 'call me'], ['contact_email', 'nope'], ['tax_amount', 'n/a'],
+  ])('still checks the type of %s by its name', async (name, value) => {
+    const memory = createMemory('form');
+    memory.extractedFields = {};
+    const result = await executeExtractFieldsBatch({
+      fields: [{ field_name: name, field_value: value, confidence: 0.95, validation_rule: 'text' }],
+    }, '', '', memory);
+    applyMemoryUpdate(memory, result.memoryUpdate);
+    expect(memory.extractedFields[name]).toMatchObject({ value, isValid: false });
+  });
+
+  it('stores only the region keys of a model-supplied location', async () => {
+    const result = await executeExtractFieldsBatch({
+      fields: [{
+        field_name: 'invoice_number', field_value: 'INV-1', confidence: 0.99,
+        location: { ...totalRegion, label: 'top right' },
+      }],
+    }, '', '', createMemory());
+    expect(result.success).toBe(true);
+    expect(result.memoryUpdate?.extractedFields?.invoice_number?.location).toStrictEqual(totalRegion);
+    expect(result.data).toMatchObject({ fields: [{ location: totalRegion }] });
+    expect((result.data as { fields: Array<{ location: object }> }).fields[0].location).toStrictEqual(totalRegion);
+  });
+
+  it('keeps re-OCR fields whose crop-relative location is not a valid page region', async () => {
+    const controller = new AbortController();
+    const result = await executeReOcrRegion(
+      { region: { ...totalRegion, rotation: 0 }, focus: 'invoice total' },
+      'data:application/pdf;base64,ZmFrZQ==',
+      'application/pdf',
+      createMemory(),
+      {
+        apiKey: 'test-key',
+        model: 'gemini-3.5-flash-lite',
+        abortSignal: controller.signal,
+        regionCropper: mockRegionCropper,
+        regionStructuredExtractor: () => Promise.resolve({
+          fields: [{
+            field_name: 'total_amount', field_value: '1471.50', confidence: 0.95,
+            location: { page: 1, x: 0.1, y: 0, width: 0.95, height: 1, units: 'normalized' },
+          }],
+        }),
+      },
+    );
+    expect(result.success).toBe(true);
+    expect(mockRegionCropper).toHaveBeenCalledWith(
+      'data:application/pdf;base64,ZmFrZQ==', 'application/pdf', totalRegion, controller.signal,
+    );
+    expect(result.memoryUpdate?.extractedFields?.total_amount).toMatchObject({ value: '1471.50', isValid: true });
+    expect(result.memoryUpdate?.extractedFields?.total_amount?.location).toStrictEqual(totalRegion);
+    expect((result.data as { region: object }).region).toStrictEqual(totalRegion);
+  });
+
+  it('declares and carries layout features and special features', async () => {
+    const analyze = AGENT_FUNCTIONS.find((declaration) => declaration.name === 'analyze_document_structure');
+    const schema = analyze?.parametersJsonSchema as { properties: { layout_analysis: { properties: Record<string, unknown> } } };
+    expect(Object.keys(schema.properties.layout_analysis.properties)).toEqual(['features', 'specialFeatures']);
+
+    const result = await executeAnalyzeDocumentStructure({
+      document_type: 'invoice',
+      layout_analysis: {
+        features: ['header', 'two columns', 'line-item table', 'totals box', 'footer', 'logo'],
+        specialFeatures: ['handwriting', 7],
+      },
+      extraction_strategy: 'form-based',
+      confidence: 0.9,
+    }, '', '', createMemory('unknown'));
+    expect(result.memoryUpdate?.documentAnalysis).toMatchObject({
+      complexity: 'medium', specialFeatures: ['handwriting'],
+    });
   });
 
   it('does not assume an unextracted subtotal or tax is zero', async () => {
@@ -396,6 +617,7 @@ describe('agentTools', () => {
       'data:application/pdf;base64,ZmFrZQ==',
       'application/pdf',
       totalRegion,
+      undefined,
     );
     expect(mockGenerateContent).toHaveBeenCalledWith(expect.objectContaining({
       config: expect.objectContaining({

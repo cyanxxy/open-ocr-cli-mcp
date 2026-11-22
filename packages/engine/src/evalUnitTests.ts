@@ -280,12 +280,25 @@ function stripTags(html: string): string {
   return text;
 }
 
+/**
+ * A numeric character reference as text. Like HTML parsers (and olmOCR's
+ * BeautifulSoup), an out-of-range or surrogate code point becomes U+FFFD
+ * instead of throwing, so model output cannot crash scoring.
+ */
+function decodeCodePoint(digits: string, radix: number): string {
+  const codePoint = Number.parseInt(digits, radix);
+  return Number.isInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+    && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ? String.fromCodePoint(codePoint)
+    : '\ufffd';
+}
+
 function htmlText(html: string): string {
   // Entities decode after tags are gone, so an escaped `&lt;` stays literal text.
   return stripTags(html)
     .replace(/&(#\d+|#x[\da-f]+|\w+);/gi, (entity, code: string) => {
-      if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(Number.parseInt(code.slice(2), 16));
-      if (code.startsWith('#')) return String.fromCodePoint(Number.parseInt(code.slice(1), 10));
+      if (code.startsWith('#x') || code.startsWith('#X')) return decodeCodePoint(code.slice(2), 16);
+      if (code.startsWith('#')) return decodeCodePoint(code.slice(1), 10);
       return ENTITIES[code.toLowerCase()] ?? entity;
     })
     .trim();

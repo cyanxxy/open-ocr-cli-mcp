@@ -46,6 +46,13 @@ describe('normalizedRegion', () => {
     expect(isNormalizedRegion(region({ y: 0.9, height: 0.2 }))).toBe(false);
   });
 
+  it('returns a copy without keys outside the region contract', () => {
+    const input = region({ label: 'top right', rotation: 0 });
+    const result = assertNormalizedRegion(input);
+    expect(result).toStrictEqual(region());
+    expect(result).not.toBe(input);
+  });
+
   it('names the offending field in the thrown message', () => {
     expect(() => assertNormalizedRegion(null, 'location')).toThrow('"location" must be a normalized region object');
   });

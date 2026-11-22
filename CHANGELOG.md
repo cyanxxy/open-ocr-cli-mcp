@@ -1,5 +1,247 @@
 # Changelog
 
+## 5.0.0 - 2026-11-22
+
+A major release: Node.js 20 is no longer supported (it reached end of life on
+2026-04-30), and the CLI requires Node.js 22.13+ or 24+. It also carries the
+fixes from the [2026-11-21 codebase audit](docs/codebase-audit.md#codebase-audit-2026-11-21).
+Some of them change results or refuse setups that ran before: configuration
+files that switch provider, OpenRouter reasoning on unlisted models, agentic
+field names, and template signs. Review the first section before upgrading.
+The GitHub Action's moving major tag is now `v5`; `v4` stays on 4.4.0.
+
+### Changed (review before upgrading)
+
+- Node.js 20 is no longer supported: it reached end of life on 2026-04-30.
+  The CLI now requires Node.js 22.13+ or 24+, and npm refuses to install it
+  on Node.js 20 (`engines`). CI tests Node.js 22.13.0, 24 and 26. This is a
+  breaking change, so the next release is 5.0.0.
+- Configuration files are no longer merged key by key across a provider
+  switch. A higher layer (project `.open-ocr-cli.json`, `--config`, or an MCP
+  `configPath`) that sets another `provider` drops the lower layers' `model`,
+  `thinking`, `baseUrl`, `apiKeyEnv`, `cloudflareProvider`, BYOK settings,
+  `maxTokens`, and prices. Another `gateway` drops `baseUrl` and the BYOK
+  settings; another `model` drops `thinking`, `maxTokens`, and prices. A
+  project that sets `provider: kimi` over a Gemini user config now uses Kimi's
+  endpoint and `MOONSHOT_API_KEY` instead of sending Kimi requests to Google
+  with `GEMINI_API_KEY`. `init` says which endpoint and key variable a new
+  project config will use.
+- OpenRouter: a route with no known reasoning contract (a model outside
+  `models --provider openrouter`, Kimi K3 routes aside) is sent `reasoning`
+  only when a level was chosen with `--thinking`, `extraction.thinking`,
+  `OPEN_OCR_THINKING`, or a config `thinking` for that model. Preset, schema,
+  and agentic requests, which require every parameter, can now route to
+  vision models that do not reason, such as `openai/gpt-4o`. `init --yes` no
+  longer writes a default `thinking` for such a route.
+- Gemini adds `gemini-4-carbon`, `gemini-4-hydrogen`, and `gemini-4-neon`
+  (also as `google/` routes on OpenRouter, whose catalog could not be
+  re-checked). Hydrogen and Neon accept `--thinking xhigh` and default to
+  `high`; Carbon takes `low`, `medium` (default), or `high`. Every Gemini
+  model's levels come from one table, and a model missing from it fails
+  closed. Cost estimates per million tokens, checked 2026-11-21 against
+  secondary sources because ai.google.dev could not be reached: Hydrogen
+  $1.50 / $0.075 cached / $7.50, Neon $3 / $0.15 / $15, and Carbon
+  $2 / $0.10 / $10 through 2026-11-30, then $4 / $0.20 / $20 from 2026-12-01
+  (UTC).
+- OpenRouter suggests `anthropic/claude-fable-5.2`, with Anthropic's list
+  price ($8 / $0.20 cached / $40) as the fallback estimate; OpenRouter's
+  reported cost still takes precedence. Fable 5.1 stays available.
+- `--max-cost` across resumed runs: once a run in the output directory sent a
+  paid request that reported no usage, a capped rerun starts no new paid work
+  and says why. Raising the cap does not reopen it; rerun with `--overwrite`
+  to start a new total, or without `--max-cost`. Under `--max-cost`, spend is
+  also written to the manifest as each paid response arrives, so a killed run
+  loses at most about a second of it.
+- Agentic: invoice `amount_due`, receipt `transaction_time`, and resume
+  `certifications` are separate optional fields. They used to be aliases that
+  overwrote `total_amount`, `transaction_date`, and `education`.
+- Template money values: a `-` or `(` that is not next to the amount no longer
+  makes it negative (`Sub-total: 1,250.00`, `50.00 - Visa`, and
+  `(approx. $27.00)` were read as negative); a warning says how the value was
+  read. `-$5`, `USD-5.00`, `5.00-`, and `(27.00)` stay negative.
+- MCP: the `OPEN_OCR_MCP_CONFIRM` prompt counts only the documents the run
+  would send and says how many are already complete in the output directory.
+  A request that would send nothing (every valid document resumed, or the
+  recorded spend already at the ceiling) runs without a prompt.
+- MCP: an `OPEN_OCR_MCP_CONFIRM` approval now binds the run to the documents
+  it listed. A document that appears in the folder after the plan (between
+  approval and the run, or before a run planned to send nothing) fails as
+  `CANCELLED` instead of being sent unasked; re-run to confirm it.
+- `interactive` passes `--thinking` only for a level the person picked or one
+  the configuration or environment set. Accepting the offered default on an
+  unlisted OpenRouter route now sends no `reasoning` field, as the CLI does.
+- `run --no-config` refuses a request that names `configPath`
+  (`CONFIG_INVALID`), as documented; it used to load that file. Ambient
+  `OPEN_OCR_NO_CONFIG=1` still allows one explicit file.
+- An exported but empty `OPEN_OCR_PROVIDER`, `OPEN_OCR_GATEWAY`,
+  `OPEN_OCR_MODEL`, `OPEN_OCR_THINKING`, `CLOUDFLARE_ACCOUNT_ID`, or
+  `CLOUDFLARE_AI_GATEWAY_ID` counts as unset, and a blank numeric option such
+  as `--retries ""` fails with `CONFIG_INVALID` instead of meaning 0.
+- A result, event, or capabilities document that fails the CLI's own schema is
+  reported as `INTERNAL` (exit 1) instead of `SCHEMA_INVALID` (exit 2).
+
+### Security
+
+- MCP: an operator's `apiKeyEnv` could be sent to whatever provider a caller's
+  `configPath` switched to, for example as a bearer token over plain HTTP to
+  `http://localhost:11434/v1`. The configuration change above closes it.
+- MCP: the glob `..` guard checks the compiled pattern, so braces
+  (`.{.,}/`), classes (`.[.]`), and escapes (`\.\./`) can no longer walk
+  outside the working directory. Every match is also checked against the
+  working directory before discovery stats or opens it, so a spelling the
+  guard does not know still cannot read an outside file. A match outside is
+  refused without naming the file, so the error no longer reveals which
+  outside files exist. `minimatch` is now a direct dependency.
+- MCP on Windows: a UNC or device path to another host is refused from its
+  spelling, before a filesystem call could open an SMB connection and leak an
+  NTLM hash.
+- MCP: the confirmation prompt escapes and shortens the model ID, and a model
+  ID over 256 characters or holding control, line-separator, or
+  bidirectional-formatting characters is refused from any source, so it
+  cannot forge the ceiling or destination a person approves.
+- URL fetches treat IPv4-compatible IPv6 literals (`[::127.0.0.1]`,
+  `[::a9fe:a9fe]`) as non-public and refuse them.
+- Gemini requests ignore the ambient `GOOGLE_GEMINI_BASE_URL`,
+  `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_GENAI_USE_ENTERPRISE`, and
+  `GOOGLE_GENAI_API_VERSION`, which could send the key and documents to a host
+  other than the one reported and confirmed. A configured `baseUrl`,
+  Cloudflare included, still applies.
+- A hostile page can no longer stall the MCP server: HTML is converted to text
+  on a worker thread with its own stack and heap limits and a 15-second
+  budget, and cancelling the call stops it. Deeply nested markup converts on
+  the worker's larger stack, and a page that still cannot be converted fails
+  as `INPUT_INVALID` instead of overflowing the server's stack.
+- A FIFO, device, or directory named `.env` is skipped with a warning instead
+  of blocking the server, and a `.env` over 1 MB is refused.
+- Redirect and error response bodies are no longer read after the fetch
+  settles; an endless body used to keep its socket busy indefinitely.
+- Template Markdown escapes the model's summary, and template and agentic
+  Markdown escape square brackets in values, so model text cannot forge a
+  section, inject HTML, or embed a link or remote image.
+- Region crops render at most 32 megapixels and stop when the run is
+  cancelled; a 433-byte PDF declaring a huge page cost about 1 GiB and 12 s
+  per crop.
+- The container image pins Node.js 24.22.3, the 2026-11-10 security release,
+  by tag and digest (the earlier digest was Node.js 24.18.0). Dependabot now
+  proposes base-image updates on the Node.js 24 line, and CI warns when a
+  newer security release exists.
+
+### Fixed
+
+- URL extraction with Kimi, Muse, OpenRouter, and OpenAI-compatible endpoints
+  works for host names: the pinned DNS lookup answered Node's all-addresses
+  request with a single address, so every host-name URL failed as
+  `CONFIG_INVALID` "Invalid IP address".
+- Web: an SVG URL keeps its title, description, and text instead of failing
+  with no readable text. A body cut off mid-transfer fails at once as a
+  retryable error instead of waiting for the 120-second deadline. DNS,
+  connection, TLS, and redirect failures are typed `INPUT_INVALID` (retryable
+  only for transient network failures) instead of `CONFIG_INVALID` or
+  `PROVIDER_FAILURE`.
+- URL requests on `run` and MCP `ocr_web` no longer fail over a config file's
+  `mode`, `preset`, `schema`, or `csv`/`all` format; they read it the way the
+  `web` command does.
+- Provider requests are no longer cut at 300 seconds by Node.js fetch's own
+  header and body timeouts, which made slow non-streaming completions fail
+  and be re-sent and re-billed. Only `--timeout` bounds a request, and a
+  local transport timeout is never retried. Adds the `undici` dependency.
+- Cost accounting: OpenRouter BYOK responses add the reported upstream
+  inference cost to OpenRouter's fee (the fee alone let a $5 cap allow about
+  $100), and a BYOK response without it is counted at least at the local
+  estimate. Gemini URL-context page tokens are priced as input. A stream that
+  started generating and then failed or was cut off counts as unreported
+  usage under `--max-cost`.
+- Gemini Interactions (agentic and web runs) sends one request per attempt.
+  The SDK's four hidden retries re-sent terminal quota errors and bypassed
+  `--requests-per-minute` and `usage.requests`. Interactions 429s keep the
+  server's `RetryInfo` delay.
+- Engine errors are classified by type, not by digits in their message, so a
+  JSON parse error at position 403 no longer ends a Gemini run as an invalid
+  key, and `--retries` retries `OUTPUT_INVALID` on every provider.
+- A stream that hits `max_tokens` or a content filter after reasoning only is
+  reported as truncated or filtered, not as an empty response.
+- Gemini `CONTINUATION` and Interactions `requires_continuation` stops are
+  reported as the model's per-request output limit, with a hint to lower the
+  thinking level or split the document. The hint no longer suggests a larger
+  `--max-tokens`, which cannot help.
+- Error messages are never empty. A provider error with a blank message used
+  to fail the whole run as `SCHEMA_INVALID`, even for documents that
+  succeeded.
+- Request validation reports each array item's errors under its own index,
+  and describes thousands of identical mistakes quickly (5,000 bad inputs took
+  7.4 s).
+- Custom schemas accept `$anchor` references, open `prefixItems` tuples,
+  `anyOf` branches that add `required`, and `minimum` or `properties` without
+  `type`, as the documented subset says. A `$ref` that leads back to a schema
+  already applying to the same value is refused as `SCHEMA_INVALID`.
+- Batches and resume:
+  - Manifest, summary, lock, and artifact writes are flushed to disk before
+    they replace the old file. An unreadable manifest's error names the file,
+    and `--overwrite` moves it aside to
+    `.open-ocr-manifest.json.corrupt-<timestamp>` instead of refusing every
+    run.
+  - `status` reports a summary recorded with a Gemini model this release no
+    longer offers, with a note, instead of refusing it.
+  - An artifact from 4.3.0 or earlier named like an agent instruction file
+    (`CLAUDE.md`) is re-extracted to the `.ocr` name on resume.
+  - Cancelling during the up-front hashing pass stops it at once and writes
+    no claims.
+  - `.heif` files whose brands name HEVC (`heic`, `heix`, `hevc`, `hevx`) are
+    accepted as HEIF.
+- Agentic:
+  - A higher-confidence value that fails the format or cross-reference checks
+    no longer replaces a valid one.
+  - Dates are read without locale guessing: year-first with an optional time
+    and offset, day-first dotted dates (`15.01.2026`), and English month names
+    (`3 March 2026`, `Mar 3, 2026`). Amounts accept `1.234.567` grouping and a
+    trailing minus.
+  - Field names are matched by whole words, so `candidate_name`,
+    `validated_by`, and `tax_id` are not checked as dates, amounts, or phone
+    numbers, and a recognized validation rule decides the format check.
+  - Qualified labels such as `Tax Invoice`, `Sales Receipt`, and
+    `Rental Agreement` apply their type's schema and required fields;
+    ambiguous ones (`Invoice Receipt`, `Bill of Lading`) stay schema-less.
+  - Field locations keep only the region keys, so a key the model added no
+    longer breaks result validation after a paid run, and a crop-relative
+    location from region re-OCR no longer discards the paid result.
+  - The agent records the document's real page count (it was always 1), and
+    layout features reach the document analysis.
+  - Region re-OCR of a PDF page that contains an image no longer crashes the
+    process (two copies of the canvas addon were loaded), and JPEG 2000
+    images decode instead of coming out blank.
+- Templates: a malformed value for a field the preset does not define is
+  ignored with a warning instead of failing the document.
+- Markdown normalization handles a long run of blank lines in linear time
+  (40,000 blank lines took about 5 s).
+- Interactive: Ctrl-C at the extract or web prompts exits 130 instead of 2,
+  and choosing another provider no longer offers the `OPEN_OCR_MODEL` and
+  `OPEN_OCR_THINKING` meant for the ambient one.
+- The missing-key message suggests a project `.env` only for the variable
+  names a project `.env` can supply.
+- Evals: strict CER strips Markdown markers from the reference as well as the
+  prediction, so an exact transcription scores 0, and counts characters as
+  code points. Table-cell F1 scores label cells such as `Total:`. An invalid
+  numeric character reference scores as U+FFFD instead of crashing, and a
+  case that cannot be scored is reported as failed instead of aborting the
+  run. Scores can differ from earlier reports.
+- Distribution:
+  - The Homebrew formula installs the packed tarball with Homebrew's
+    `std_npm_args`. The old formula linked into Homebrew's temporary build
+    directory without installing dependencies, so `open-ocr-cli` failed after
+    `brew install`. CI and the release run smoke-test that install.
+  - The GitHub Action keeps a supported Node.js the job already set up instead
+    of switching later steps to Node.js 22.
+  - CI also runs on Node.js 26 (Active LTS since 2026-10-28), including the
+    packed install and MCP smoke tests.
+  - `.dockerignore` excludes nested `node_modules`, so host-platform native
+    addons no longer enter the Docker build context.
+- Docs: with `MCP_PROTOCOL_NEGOTIATION` unset, Claude Code can skip the
+  2026-07-28 probe of a stdio server for up to 7 days. The README, agent
+  guide, and skill now give `MCP_PROTOCOL_NEGOTIATION=auto` as the first fix
+  when `/mcp` cannot connect.
+
+[Full comparison](https://github.com/cyanxxy/open-ocr-cli-mcp/compare/v4.4.0...v5.0.0)
+
 ## 4.4.0 - 2026-11-01
 
 A security and correctness release. The MCP server now treats its caller as

@@ -82,6 +82,41 @@ describe('Retry-After', () => {
     // Without a hint, the jittered backoff applies.
     expect(providerRetryDelayMs(0, new ProviderApiError('slow', 429))).toBeGreaterThanOrEqual(750);
   });
+
+  it('reads the retry delay an Interactions SDK error keeps off its message', () => {
+    // RateLimitError-like: status 429, message "429 <sentence>", the body as
+    // text on `body`, parsed on `error`, and the response headers.
+    const payload = {
+      error: {
+        code: 429,
+        message: 'Resource has been exhausted. Please retry in 30.5s.',
+        status: 'RESOURCE_EXHAUSTED',
+        details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '30s' }],
+      },
+    };
+    const sdkError = (fields: Record<string, unknown>) => Object.assign(
+      new Error('429 Resource has been exhausted. Please retry in 30.5s.'),
+      { status: 429, ...fields },
+    );
+    // As readableProviderError restates it: a sentence, with the SDK error as cause.
+    const restated = (cause: Error) => Object.assign(
+      new Error('Resource has been exhausted. Please retry in 30.5s. [RESOURCE_EXHAUSTED]', { cause }),
+      { status: 429 },
+    );
+
+    expect(providerRetryAfterMs(restated(sdkError({ body: JSON.stringify(payload) })))).toBe(30_000);
+    expect(providerRetryAfterMs(restated(sdkError({ error: payload })))).toBe(30_000);
+    expect(providerRetryAfterMs(restated(sdkError({ error: [payload] })))).toBe(30_000);
+    expect(providerRetryAfterMs(restated(sdkError({ headers: new Headers({ 'retry-after': '12' }) })))).toBe(12_000);
+    expect(providerRetryAfterMs(restated(sdkError({ headers: new Headers({ 'retry-after-ms': '1500' }) })))).toBe(1_500);
+    expect(providerRetryDelayMs(0, restated(sdkError({ error: payload })))).toBe(30_000);
+    // A non-throttling status keeps the jittered backoff.
+    expect(providerRetryAfterMs(Object.assign(new Error('400 bad'), {
+      status: 400,
+      headers: new Headers({ 'retry-after': '12' }),
+      error: payload,
+    }))).toBeUndefined();
+  });
 });
 
 describe('quota exhaustion', () => {

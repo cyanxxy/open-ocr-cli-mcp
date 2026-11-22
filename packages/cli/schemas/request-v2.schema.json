@@ -54,7 +54,7 @@
       "properties": {
         "id": { "enum": ["gemini", "kimi", "muse", "openrouter", "openai-compatible"] },
         "gateway": { "enum": ["direct", "cloudflare"] },
-        "model": { "type": "string", "minLength": 1 }
+        "model": { "type": "string", "minLength": 1, "maxLength": 256 }
       }
     },
     "extraction": {

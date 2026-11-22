@@ -10,6 +10,7 @@ import {
   artifactPathVariants,
   batchLockOwnerState,
   transactionFileTarget,
+  unreadableManifestError,
   type BatchLockState,
 } from './output';
 import {
@@ -142,12 +143,17 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function readJsonIfPresent(filePath: string): Promise<unknown> {
+async function readJsonIfPresent(
+  filePath: string,
+  invalidJson: (error: SyntaxError) => CliExitError = (error) => (
+    batchMetadataError(`Invalid JSON in ${filePath}: ${error.message}`)
+  ),
+): Promise<unknown> {
   try {
     return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    if (error instanceof SyntaxError) throw batchMetadataError(`Invalid JSON in ${filePath}: ${error.message}`);
+    if (error instanceof SyntaxError) throw invalidJson(error);
     throw error;
   }
 }
@@ -246,6 +252,10 @@ function parseSummary(value: unknown, summaryPath: string): ParsedSummary | unde
   // carries them, and the old "absent means gemini/direct" fallback silently
   // relabelled a summary from an unknown writer as a Gemini run.
   //
+  // The model is reported as recorded, not checked against this release's
+  // curated list: a summary is a historical record, and a model retired since
+  // the run must not make the whole directory unreadable to `status`.
+  //
   // The checks are inlined into the guard below rather than hoisted into a
   // `hasValidProviderMetadata` boolean so that `isOneOf` narrows these three
   // locals for the return statement. A boolean alias would validate the same
@@ -265,7 +275,6 @@ function parseSummary(value: unknown, summaryPath: string): ParsedSummary | unde
     || model.trim().length === 0
     || !isOneOf(PROVIDER_IDS, provider)
     || !isOneOf(GATEWAY_IDS, gateway)
-    || (provider === 'gemini' && !isOneOf(GEMINI_MODELS, model))
     || !isNonNegativeNumber(record.durationMs)
     || countKeys.some((key) => !isNonNegativeInteger(record[key]))
     || usageIntegerKeys.some((key) => !isNonNegativeInteger(usage[key]))
@@ -403,7 +412,7 @@ export async function inspectBatchStatus(
   const summaryPath = path.join(outputDirectory, 'batch-summary.json');
   const lockPath = path.join(outputDirectory, '.open-ocr.lock');
   const [manifestValue, summaryValue, activeLock] = await Promise.all([
-    readJsonIfPresent(manifestPath),
+    readJsonIfPresent(manifestPath, (error) => unreadableManifestError(manifestPath, error)),
     readJsonIfPresent(summaryPath),
     readBatchLockIfPresent(lockPath),
   ]);
@@ -577,6 +586,9 @@ export function renderBatchStatus(report: BatchStatusReport): string {
       `Last run: ${report.lastRun.completedAt} with ${report.lastRun.provider}/${report.lastRun.model} via ${report.lastRun.gateway} in ${report.lastRun.mode} mode`,
       usageLine('Usage (last run)', report.lastRun.usage),
     );
+    if (report.lastRun.provider === 'gemini' && !isOneOf(GEMINI_MODELS, report.lastRun.model)) {
+      lines.push(`Note: ${report.lastRun.model} is no longer offered by this release; a rerun needs a current --model, which re-extracts every document.`);
+    }
     if (report.lastRun.costLimitReached) lines.push('Last run stopped at its estimated cost limit.');
     else if (report.lastRun.incomplete) lines.push('Last run did not schedule or complete every document.');
   }

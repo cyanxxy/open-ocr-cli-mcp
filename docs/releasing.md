@@ -38,7 +38,7 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
    npm run typecheck
    npm run lint
    npm run test:coverage
-   node --test scripts/release-automation.test.mjs
+   node --test scripts/*.test.mjs
    npm run evals:validate
    npm run evals:matrix:check
    npm run cli:smoke
@@ -55,6 +55,14 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
    The release section needs at least one `###` heading and a
    `[Full comparison](...)` link; the release workflow refuses it otherwise.
 
+   The Dockerfile pins an exact `node:<version>-bookworm-slim` tag by digest.
+   Dependabot proposes base-image tag and digest updates on the same Node.js
+   major; merge the open one (updating the Node.js version named in the
+   Dockerfile comments) before releasing. CI's container job and the release
+   run warn when the pinned release misses a newer Node.js security release.
+   The release workflow also installs the packed tarball the way the attached
+   Homebrew formula does (`std_npm_args`) before attaching the formula.
+
 3. When provider credentials are available, run the canary evaluation matrix
    with a private copy of `evals/providers.example.json`. Review quality,
    latency, and billed-cost deltas before promoting the release.
@@ -68,7 +76,7 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
 5. Confirm both the automatic dispatch and tagged release runs succeeded and
    published all five surfaces: npm, GitHub Release,
    `ghcr.io/cyanxxy/open-ocr-cli`, the attached Homebrew formula, and the moving
-   matching major GitHub Action tag (currently `v4`). The workflow only moves
+   matching major GitHub Action tag (currently `v5`). The workflow only moves
    that major tag forward from an ancestor
    and uses a force-with-lease so a concurrent tag change cannot be overwritten.
    Install from npm and run `open-ocr-cli doctor` once outside the repository.

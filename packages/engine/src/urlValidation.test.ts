@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { getUnsupportedUrls, isSupportedHttpUrl, parseSupportedHttpUrl } from './urlValidation';
+import { getUnsupportedUrls, isPublicIpAddress, isSupportedHttpUrl, parseSupportedHttpUrl } from './urlValidation';
 
 describe('urlValidation', () => {
   describe('parseSupportedHttpUrl', () => {
@@ -51,6 +51,18 @@ describe('urlValidation', () => {
       expect(parseSupportedHttpUrl('http://[2001:db8::1]/')).toBeNull();
       expect(parseSupportedHttpUrl('http://[::ffff:7f00:1]/')).toBeNull();
       expect(parseSupportedHttpUrl('http://[::ffff:127.0.0.1]/')).toBeNull();
+    });
+
+    it('rejects IPv4-compatible IPv6 literals (::/96) however they are written', () => {
+      // The URL parser normalizes [::127.0.0.1] to [::7f00:1], which ipaddr.js
+      // labels plain unicast.
+      expect(parseSupportedHttpUrl('http://[::127.0.0.1]/')).toBeNull();
+      expect(parseSupportedHttpUrl('http://[::7f00:1]/')).toBeNull();
+      expect(parseSupportedHttpUrl('http://[::a9fe:a9fe]/latest/meta-data')).toBeNull();
+      expect(isPublicIpAddress('::7f00:1')).toBe(false);
+      expect(isPublicIpAddress('::a9fe:a9fe')).toBe(false);
+      expect(isPublicIpAddress('[::a9fe:a9fe]')).toBe(false);
+      expect(isPublicIpAddress('2606:4700:4700::1111')).toBe(true);
     });
 
     it('rejects tunnelling hosts (ngrok/pinggy/localtunnel)', () => {

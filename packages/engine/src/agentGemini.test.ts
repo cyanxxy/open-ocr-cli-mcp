@@ -34,9 +34,10 @@ vi.mock('./agentTools', async () => {
   };
 });
 
-import { executeAgentTurn } from './agentGemini';
+import { executeAgentTurn, executeFunctionCall } from './agentGemini';
 import type { AgentMemory, AgentStep } from './agentTypes';
 import type { InteractionStep } from './gemini/interactions';
+import { OcrError, OcrErrorType } from './gemini/types';
 
 function createMemory(): AgentMemory {
   return {
@@ -493,5 +494,26 @@ describe('executeAgentTurn', () => {
       { maxIterations: 4, confidenceThreshold: 0.8, maxTokens: 1024 },
       vi.fn(),
     )).rejects.toThrow(/requires action but returned no function call/i);
+  });
+});
+
+describe('executeFunctionCall error routing', () => {
+  it.each([
+    'Re-OCR returned invalid JSON: Expected \',\' or \'}\' after property value in JSON at position 403 (line 1 column 404)',
+    'Re-OCR returned invalid JSON: Unexpected token in JSON at position 503 (line 1 column 504)',
+  ])('returns invalid model output to the model as a tool error: %s', async (message) => {
+    mockExecuteReOcrRegion.mockRejectedValueOnce(new OcrError(
+      OcrErrorType.OUTPUT_INVALID,
+      message,
+      undefined,
+      { cause: new SyntaxError('bad json') },
+    ));
+    await expect(executeFunctionCall(
+      { id: 'call-1', name: 're_ocr_region', arguments: { focus: 'total' } },
+      'data:image/png;base64,ZmFrZQ==',
+      'image/png',
+      createMemory(),
+      { apiKey: 'test-key', model: 'gemini-3.8-flash' },
+    )).resolves.toEqual({ success: false, error: `re_ocr_region failed: ${message}` });
   });
 });

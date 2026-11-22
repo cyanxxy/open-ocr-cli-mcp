@@ -1,4 +1,4 @@
-import { isGeminiQuotaExhaustedError, isRetryableGeminiError } from '../gemini/client';
+import { isGeminiQuotaExhaustedError, isRetryableGeminiError, parseDurationSeconds } from '../gemini/client';
 import {
   isQuotaExhaustedProviderError,
   isRetryableProviderError,
@@ -61,9 +61,58 @@ function geminiRetryInfoDelayMs(message: string): number | undefined {
   return Number.isFinite(seconds) ? Math.round(seconds * 1000) : undefined;
 }
 
+const GOOGLE_RPC_RETRY_INFO = 'type.googleapis.com/google.rpc.RetryInfo';
+
+/**
+ * `RetryInfo.retryDelay` from an already-parsed Google error body, as the
+ * Interactions SDK keeps it on `error`: `{error:{details:[...]}}`, the bare
+ * status object, or the single-element array form.
+ */
+function retryInfoDelayFromBody(body: unknown, depth = 0): number | undefined {
+  if (depth > 3 || typeof body !== 'object' || body === null) return undefined;
+  if (Array.isArray(body)) {
+    for (const entry of body) {
+      const delay = retryInfoDelayFromBody(entry, depth + 1);
+      if (delay !== undefined) return delay;
+    }
+    return undefined;
+  }
+  const nested = recordValue(body, 'error');
+  const status = typeof nested === 'object' && nested !== null ? nested : body;
+  const details = recordValue(status, 'details');
+  if (!Array.isArray(details)) return undefined;
+  for (const detail of details) {
+    if (recordValue(detail, '@type') !== GOOGLE_RPC_RETRY_INFO) continue;
+    const retryDelay = recordValue(detail, 'retryDelay');
+    const seconds = typeof retryDelay === 'string' ? parseDurationSeconds(retryDelay) : undefined;
+    if (seconds !== undefined) return Math.round(seconds * 1000);
+  }
+  return undefined;
+}
+
+/** `retry-after-ms` / `Retry-After` from a response-headers object kept on an SDK error. */
+function headerRetryAfterMs(headers: unknown): number | undefined {
+  const get = recordValue(headers, 'get');
+  if (typeof get !== 'function') return undefined;
+  const read = (name: string): string | null => {
+    const value: unknown = Reflect.apply(get, headers, [name]);
+    return typeof value === 'string' ? value : null;
+  };
+  const milliseconds = read('retry-after-ms');
+  if (milliseconds !== null && /^\d+(?:\.\d+)?$/u.test(milliseconds.trim())) {
+    return Math.max(0, Math.round(Number(milliseconds.trim())));
+  }
+  return parseRetryAfterHeader(read('retry-after'));
+}
+
 /**
  * The delay a provider asked for before retrying, walking the cause chain so a
  * retry-layer wrapper does not hide it. Undefined when the provider gave none.
+ *
+ * generateContent errors carry Gemini's body as `message`. The Interactions
+ * SDK's errors keep it on `body` (text) and `error` (parsed), with the
+ * response headers on `headers`; its own retry handling is disabled, so the
+ * engine reads all three.
  */
 export function providerRetryAfterMs(error: unknown): number | undefined {
   const seen = new Set<unknown>();
@@ -73,13 +122,18 @@ export function providerRetryAfterMs(error: unknown): number | undefined {
     seen.add(current);
     const direct = recordValue(current, 'retryAfterMs');
     if (typeof direct === 'number' && Number.isFinite(direct) && direct >= 0) return direct;
-    const message = recordValue(current, 'message');
-    if (typeof message === 'string') {
-      const status = recordValue(current, 'status') ?? recordValue(current, 'code');
-      if (status === 429 || status === 503 || /RESOURCE_EXHAUSTED|UNAVAILABLE/u.test(message)) {
-        const delay = geminiRetryInfoDelayMs(message);
-        if (delay !== undefined) return delay;
-      }
+    const status = recordValue(current, 'status') ?? recordValue(current, 'code');
+    const throttled = status === 429 || status === 503;
+    for (const key of ['message', 'body'] as const) {
+      const text = recordValue(current, key);
+      if (typeof text !== 'string' || !(throttled || /RESOURCE_EXHAUSTED|UNAVAILABLE/u.test(text))) continue;
+      const delay = geminiRetryInfoDelayMs(text);
+      if (delay !== undefined) return delay;
+    }
+    if (throttled) {
+      const delay = retryInfoDelayFromBody(recordValue(current, 'error'))
+        ?? headerRetryAfterMs(recordValue(current, 'headers'));
+      if (delay !== undefined) return delay;
     }
     current = recordValue(current, 'cause');
   }

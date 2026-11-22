@@ -65,6 +65,18 @@ describe('agentLoop', () => {
     expect(memory.stopReason).toBe('succeeded');
     expect(steps.some((s) => s.type === 'result' && s.content.includes('Extraction complete'))).toBe(true);
     expect(memory.currentIteration).toBe(1);
+    expect(memory.documentAnalysis.pageCount).toBe(1);
+  });
+
+  it('records the page count the host passes in', async () => {
+    mockExecuteAgentTurn.mockResolvedValue({ finished: true, steps: [] });
+    const { memory } = await drainLoop(agentLoop(
+      FIXTURE_FILE(),
+      FIXTURE_DATA,
+      { apiKey: 'test-key', model: 'gemini-3.5-flash-lite' },
+      { maxIterations: 1, ...BASE_CONFIG, pageCount: 12 },
+    ));
+    expect(memory.documentAnalysis.pageCount).toBe(12);
   });
 
   it('does NOT report success when the model stops early with zero fields', async () => {

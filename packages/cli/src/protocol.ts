@@ -685,6 +685,33 @@ function unionClauses(unionError: ErrorObject, branchErrors: ErrorObject[]): str
   return [withInstanceLabel(instancePath, unionError.message ?? 'is invalid')];
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/**
+ * The errors whose instance path equals `path` (or, with `prefix`, starts
+ * with it), found by binary search in a list sorted by instance path: the
+ * matches are one contiguous run.
+ */
+function errorsWithInstancePath(sorted: readonly ErrorObject[], path: string, prefix: boolean): ErrorObject[] {
+  let low = 0;
+  let high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (compareCodeUnits(sorted[middle].instancePath, path) < 0) low = middle + 1;
+    else high = middle;
+  }
+  const matches: ErrorObject[] = [];
+  for (let index = low; index < sorted.length; index += 1) {
+    const instancePath = sorted[index].instancePath;
+    if (prefix ? !instancePath.startsWith(path) : instancePath !== path) break;
+    matches.push(sorted[index]);
+  }
+  return matches;
+}
+
 /**
  * Build the clause list for a set of Ajv errors, collapsing unions and merging
  * everything else by instance path so each clause names one actionable problem.
@@ -699,13 +726,25 @@ function validationClauses(allErrors: ErrorObject[]): string[] {
     .sort((left, right) => left.schemaPath.length - right.schemaPath.length);
   const consumed = new Set<ErrorObject>();
   const branchesByUnion = new Map<ErrorObject, ErrorObject[]>();
+  // A union owns only the branch errors of its own instance. Schema paths carry
+  // no array index (every `inputs[i]` union is `#/properties/inputs/items/oneOf`),
+  // so matching on the schema path alone let the first failing item claim
+  // every later item's errors, and scanning every error for every union made a
+  // request with thousands of bad inputs take tens of seconds to describe.
+  const byInstance = [...errors].sort((left, right) => compareCodeUnits(left.instancePath, right.instancePath));
+  const reportedOrder = new Map(errors.map((error, index) => [error, index]));
   for (const unionError of unionErrors) {
     if (consumed.has(unionError)) continue;
-    const owned = errors.filter((error) => (
+    const owned = [
+      ...errorsWithInstancePath(byInstance, unionError.instancePath, false),
+      ...errorsWithInstancePath(byInstance, `${unionError.instancePath}/`, true),
+    ].filter((error) => (
       error !== unionError
       && !consumed.has(error)
       && error.schemaPath.startsWith(`${unionError.schemaPath}/`)
     ));
+    // Keep Ajv's reporting order, which the clauses are rendered in.
+    owned.sort((left, right) => (reportedOrder.get(left) ?? 0) - (reportedOrder.get(right) ?? 0));
     for (const error of owned) consumed.add(error);
     branchesByUnion.set(unionError, owned);
   }
@@ -769,10 +808,19 @@ function assertValid<T>(
   schemaName: 'request' | 'result' | 'event' | 'capabilities',
 ): asserts value is T {
   if (validator(value)) return;
-  const requestPayload = schemaName === 'request';
+  if (schemaName !== 'request') {
+    // Results, events, and capabilities are the CLI's own output. When one
+    // breaks its contract the defect is here, not in the caller's request or
+    // schema: SCHEMA_INVALID told agents to "fix the request locally".
+    throw new CliExitError(`${label}: ${validationMessage(validator.errors)}`, 1, {
+      code: 'INTERNAL',
+      category: 'internal',
+      retryable: false,
+    });
+  }
   throw new CliExitError(`${label}: ${validationMessage(validator.errors)}`, 2, {
-    code: requestPayload ? 'CONFIG_INVALID' : 'SCHEMA_INVALID',
-    category: requestPayload ? 'configuration' : 'schema',
+    code: 'CONFIG_INVALID',
+    category: 'configuration',
     retryable: false,
     hint: `Compare the payload with the bundled schema: open-ocr-cli schema ${schemaName}.`,
   });

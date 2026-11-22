@@ -4,6 +4,7 @@ import type { AgentStep } from '@open-ocr/engine/agentTypes';
 import {
   createProviderExecutionContext,
   type ProviderExecutionContext,
+  type ProviderUsageSnapshot,
 } from '@open-ocr/engine/providers';
 import {
   asCliExitError,
@@ -131,6 +132,13 @@ export interface OcrJobServiceRuntime {
    * the stderr diagnostics channel.
    */
   priorWarnings?: readonly string[];
+  /**
+   * Display paths of the documents a person approved (MCP confirmation). When
+   * set, the run sends no other document: one that appeared after the plan was
+   * approved fails as CANCELLED instead of being sent unapproved. Resumed and
+   * skipped documents are not sends and are unaffected.
+   */
+  sendOnly?: ReadonlySet<string>;
 }
 
 export interface OcrJobServiceResult {
@@ -148,6 +156,17 @@ interface OutputPlan {
   shouldWriteFiles: boolean;
   needsManifest: boolean;
   deliveryMode: OcrDeliveryMode;
+}
+
+/**
+ * This run's usage as the result reports it. `unmeteredPaidRequests` is resume
+ * bookkeeping for the cumulative `--max-cost` gate: it is persisted with the
+ * manifest's cumulative usage, and the published result keeps
+ * `unreportedUsageRequests` as the one usage-gap figure.
+ */
+function runUsage(usage: ProviderUsageSnapshot): ProviderUsageSnapshot {
+  const { unmeteredPaidRequests: _unmetered, ...reported } = usage;
+  return reported;
 }
 
 /** Remove document bodies and extraction payloads from the auditable summary. */
@@ -232,15 +251,19 @@ export function modeFingerprint(options: ResolvedCliOptions): string {
   });
 }
 
-/** Run `task` over `items` with at most `limit` in flight (bounded file handles). */
+/**
+ * Run `task` over `items` with at most `limit` in flight (bounded file
+ * handles). Once `signal` is aborted no further item is started.
+ */
 async function forEachLimited<T>(
   items: readonly T[],
   limit: number,
   task: (item: T, index: number) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<void> {
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
+    while (next < items.length && !signal?.aborted) {
       const index = next;
       next += 1;
       await task(items[index], index);
@@ -543,7 +566,19 @@ export class OcrJobService {
     }
     const manifest = needsManifest ? new ManifestStore(defaultOutputDirectory(options)) : undefined;
     try {
-      await manifest?.load();
+      // `--overwrite` starts a fresh job and a fresh total, so a manifest a
+      // crash left unreadable (empty, cut short) is no reason to refuse it.
+      const loaded = await manifest?.load(options.overwrite
+        ? { unreadable: options.dryRun ? 'ignore' : 'set-aside' }
+        : {});
+      if (manifest && loaded?.setAsidePath) {
+        warn(
+          `${manifest.path} was not valid JSON; moved it to ${loaded.setAsidePath}. --overwrite starts this `
+          + 'directory\'s resume state and cumulative --max-cost total afresh.',
+        );
+      } else if (manifest && loaded?.unreadable) {
+        warn(`${manifest.path} is not valid JSON; a live --overwrite run would move it aside and start afresh.`);
+      }
     } catch (error) {
       throw asCliExitError(error, 2);
     }
@@ -552,19 +587,31 @@ export class OcrJobService {
     const staleArtifacts = new Map<number, ReadonlySet<string>>();
     const resumeActive = Boolean(options.resume) && manifest !== undefined;
     const outputDirectory = defaultOutputDirectory(options);
+    const abortSignal = runtime.abortController.signal;
     // Resume compares content, so every input is hashed once up front. Only a
     // run that keeps a manifest needs it; bounded so a large batch does not
-    // open every file at once.
+    // open every file at once. A cancel stops the pass: nothing after it
+    // (recovery, resume checks, claims) runs, and every document is reported
+    // as cancelled below.
     const fingerprints = new Array<ManifestFingerprints>(inputs.length);
     const possibleTargets = new Array<string[]>(inputs.length);
     if (manifest) {
       await forEachLimited(inputs, 8, async (input, index) => {
-        const contentSha256 = await inputContentSha256(input);
+        let contentSha256: string;
+        try {
+          contentSha256 = await inputContentSha256(input, abortSignal);
+        } catch (error) {
+          if (abortSignal.aborted) return;
+          throw error;
+        }
         fingerprints[index] = {
           current: inputFingerprint(input, fingerprintMode, contentSha256),
           legacy: inputFingerprint(input, fingerprintMode),
         };
-      });
+      }, abortSignal);
+    }
+    const cancelledBeforeWork = abortSignal.aborted;
+    if (manifest && !cancelledBeforeWork) {
       // A process killed mid-commit leaves `<artifact>.<pid>-<uuid>.tmp|.bak`
       // beside its targets (and the manifest/summary). This run holds the
       // batch lock, so no live writer can own any file last touched before the
@@ -610,13 +657,29 @@ export class OcrJobService {
     // `--overwrite` and `--no-resume` start a fresh job, and a fresh total.
     const priorUsage = resumeActive && !options.overwrite ? manifest?.recordedUsage() : undefined;
     if (priorUsage) providerRuntime.setPriorCostUsd(priorUsage.estimatedCostUsd);
+    // Earlier runs sent paid requests that reported no usage, so the job's
+    // recorded total is a floor, not its spend: a capped resume stays closed
+    // exactly as the run that met the gap did. Manifests from releases that
+    // did not record the count read as 0.
+    const priorUnmeteredPaidRequests = options.maxCostUsd !== undefined
+      ? priorUsage?.unmeteredPaidRequests ?? 0
+      : 0;
+    // A dry run sends nothing; it only reports the document as a planned skip.
+    if (priorUnmeteredPaidRequests > 0 && !options.dryRun) providerRuntime.setPriorUsageUnknown();
     const cumulativeUsage = (): ReturnType<typeof providerRuntime.getUsage> => (
       addUsageSnapshots(priorUsage, providerRuntime.getUsage())
     );
     manifest?.setUsageSource(cumulativeUsage);
     const priorCostReachedLimit = priorUsage !== undefined && options.maxCostUsd !== undefined
-      && priorUsage.estimatedCostUsd >= options.maxCostUsd;
-    if (priorCostReachedLimit) {
+      && (priorUnmeteredPaidRequests > 0 || priorUsage.estimatedCostUsd >= options.maxCostUsd);
+    if (priorUnmeteredPaidRequests > 0) {
+      warn(
+        `Earlier runs of ${outputDirectory} sent ${priorUnmeteredPaidRequests} paid request(s) whose provider reported `
+        + `no token usage, so this job's spend is unknown and cannot be checked against --max-cost `
+        + `$${options.maxCostUsd!.toFixed(6)}; no new documents will be extracted (fail closed). `
+        + 'Rerun with --overwrite to start a new total, or without --max-cost to accept unmetered spend.',
+      );
+    } else if (priorCostReachedLimit) {
       warn(
         `Estimated spend already recorded for ${outputDirectory} ($${priorUsage.estimatedCostUsd.toFixed(6)} across earlier runs) `
         + `reaches --max-cost $${options.maxCostUsd!.toFixed(6)}; no new documents will be extracted. `
@@ -629,10 +692,10 @@ export class OcrJobService {
     // first keeps that honest in both directions: a document the live run would
     // skip as unchanged is not reported as a conflict.
     try {
-      await Promise.all(inputs.map(async (input, index) => {
+      await Promise.all((cancelledBeforeWork ? [] : inputs).map(async (input, index) => {
         const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
         const completedEntry = resumeActive && !options.overwrite
-          ? await manifest?.completedEntry(key, fingerprints[index])
+          ? await manifest?.completedEntry(key, fingerprints[index], input.relativePath)
           : undefined;
         if (completedEntry) {
           resumableEntries.set(index, completedEntry);
@@ -669,7 +732,7 @@ export class OcrJobService {
     // a crash loses at most MANIFEST_FLUSH_INTERVAL_MS of them, and those
     // documents keep their durable pending claim.
     const unstartedClaims = new Map<number, ManifestEntry | undefined>();
-    if (manifest && shouldWriteFiles && !options.dryRun && !priorCostReachedLimit) {
+    if (manifest && shouldWriteFiles && !options.dryRun && !priorCostReachedLimit && !abortSignal.aborted) {
       const claims: Array<[string, ManifestEntry]> = [];
       for (const [index, input] of inputs.entries()) {
         if (resumableEntries.has(index)) continue;
@@ -703,9 +766,17 @@ export class OcrJobService {
     // total --max-cost is enforced on, so a capped run writes it durably
     // (concurrent updates still share one write).
     const deferPaidUpdates = options.maxCostUsd === undefined;
+    // A long document (an agentic run, retries) can pay for many responses
+    // before its final update. Under a cap, each recorded response schedules
+    // a usage write, so a hard kill loses at most the flush interval of spend.
+    if (manifest && options.maxCostUsd !== undefined && !options.dryRun) {
+      providerRuntime.setUsageListener(() => manifest.scheduleUsageWrite());
+    }
     /** Withdraw claims of documents this run never started, and persist everything deferred. */
     const settleManifest = async (): Promise<void> => {
       if (!manifest) return;
+      // Nothing may schedule a write that lands after the batch lock is released.
+      providerRuntime.setUsageListener(undefined);
       for (const [index, previous] of unstartedClaims) {
         manifest.restore(inputs[index].absolutePath ?? STDIN_MANIFEST_KEY, previous);
       }
@@ -811,6 +882,11 @@ export class OcrJobService {
               const plannedOutputArtifacts = shouldWriteFiles
                 ? await plannedArtifactTargets(input, options, inputs.length)
                 : [];
+              // Dry runs validate even resumed inputs, and say which ones the
+              // live run would not send.
+              const plannedSkip = completedEntry
+                ? 'resumed' as const
+                : priorCostReachedLimit ? 'cost-limit' as const : undefined;
               result = {
                 status: 'skipped', input, provider: options.provider, gateway: options.gateway,
                 mode: options.mode, model: options.model, startedAt: jobStartedAt,
@@ -818,6 +894,7 @@ export class OcrJobService {
                 attempts: 0, plannedOutputArtifacts,
                 plannedOutputFiles: plannedOutputArtifacts.map((target) => target.path),
                 skipReason: 'validated',
+                ...(plannedSkip ? { plannedSkip } : {}),
               };
             } catch (error) {
               result = {
@@ -836,6 +913,23 @@ export class OcrJobService {
               const { legacyFingerprint: _legacy, ...entry } = completedEntry;
               await manifest?.update(key, { ...entry, fingerprint, fingerprintVersion: 2 }, { defer: true });
             }
+          } else if (runtime.sendOnly && !runtime.sendOnly.has(input.displayPath)) {
+            result = {
+              status: 'failed', input, provider: options.provider, gateway: options.gateway,
+              mode: options.mode, model: options.model, startedAt: jobStartedAt,
+              completedAt: new Date().toISOString(), durationMs: performance.now() - jobStart,
+              attempts: 0,
+              ...documentFailure(new CliExitError(
+                `${input.displayPath} was not part of the confirmed plan and was not sent`,
+                1,
+                {
+                  code: 'CANCELLED',
+                  category: 'cancelled',
+                  retryable: true,
+                  hint: 'Re-run the tool to confirm the documents now in the folder.',
+                },
+              )),
+            };
           } else {
             const timeoutController = new AbortController();
             const relayAbort = (): void => timeoutController.abort(runtime.abortController.signal.reason);
@@ -1002,12 +1096,18 @@ export class OcrJobService {
       if (rejected?.status === 'rejected') {
         throw rejected.reason instanceof Error ? rejected.reason : new Error(errorMessage(rejected.reason));
       }
-      const costLimitReason = providerRuntime.wasUsageUnknownUnderCostLimit()
+      const costLimitReason = priorUnmeteredPaidRequests > 0
+        ? 'Not started because earlier runs of this output directory sent paid requests that reported no token usage, '
+          + `so spend cannot be checked against --max-cost $${options.maxCostUsd?.toFixed(4)}`
+        : providerRuntime.wasUsageUnknownUnderCostLimit()
         ? `Not started because the provider reported no token usage, so spend could not be checked against --max-cost $${options.maxCostUsd?.toFixed(4)}`
         : (priorUsage?.estimatedCostUsd ?? 0) > 0
           ? `Not started because the estimated cost recorded for this output directory across resumed runs reached --max-cost $${options.maxCostUsd?.toFixed(4)}`
           : `Not started because the estimated cost reached --max-cost $${options.maxCostUsd?.toFixed(4)}`;
-      const costLimitHint = providerRuntime.wasUsageUnknownUnderCostLimit()
+      const costLimitHint = priorUnmeteredPaidRequests > 0
+        ? 'Earlier runs of this output directory sent paid requests whose spend is unknown, so raising --max-cost '
+          + 'cannot help. Rerun with --overwrite to start a new total, or without --max-cost to accept unmetered spend.'
+        : providerRuntime.wasUsageUnknownUnderCostLimit()
         ? 'This route returns no token usage, so --max-cost cannot bound its spend. Use a provider or model that '
           + 'reports usage, or rerun without --max-cost to accept unmetered spend.'
         : (priorUsage?.estimatedCostUsd ?? 0) > 0
@@ -1084,11 +1184,14 @@ export class OcrJobService {
         provider: options.provider,
         gateway: options.gateway,
         model: options.model,
-        usage: providerRuntime.getUsage(),
+        usage: runUsage(providerRuntime.getUsage()),
         costLimitUsd: options.maxCostUsd,
+        // An unknown spend inherited from earlier runs stops only work that
+        // remained (`costLimitReached` above); a rerun whose every document
+        // resumed did not hit the limit.
         costLimitReached: costLimitReached
           || providerRuntime.wasCostLimitDenied()
-          || providerRuntime.wasUsageUnknownUnderCostLimit(),
+          || (priorUnmeteredPaidRequests === 0 && providerRuntime.wasUsageUnknownUnderCostLimit()),
         ...(manifest ? { cumulativeUsage: cumulativeUsage() } : {}),
         results: finishedResults,
       };

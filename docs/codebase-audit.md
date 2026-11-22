@@ -137,3 +137,152 @@ after the repository rename requires npm's trusted publisher to use the new
 repository name; see [release setup](releasing.md). The local Docker daemon was
 unavailable, so no container build was run locally. Passing checks establishes tested behavior, not
 absence of every possible defect.
+
+## Codebase audit, 2026-11-21
+
+Scope: release 4.4.0 as published on 2026-11-01. The audit covered the engine
+(provider clients and cost accounting, the Gemini client, agent tools,
+templates, eval metrics), the CLI (MCP surface and trust boundary, batch and
+resume state, configuration and entry points, machine protocol contracts), the
+documentation against upstream sources (Gemini models and pricing, MCP client
+behavior in Claude Code and Codex, provider catalogs), and the runtime
+dependencies, CI, container, GitHub Action, and Homebrew packaging.
+
+Method: ten scoped auditors, one per area (C1 engine providers, C2 engine
+Gemini, C3 engine agent and templates, C4 CLI and MCP surface, C5 CLI batch
+state, C6 CLI configuration and entry points, C7 CLI protocol contracts, D1
+Gemini documentation, D2 MCP and provider documentation, D3 runtime,
+dependencies, and CI). Each finding came with evidence and a concrete failure
+scenario. An adversarial verifier per area then tried to refute every finding
+with its own reproduction (scripts against the real SDKs and local HTTP
+servers, upstream documentation fetched on 2026-11-21) and gave a verdict, a
+severity, and the fix to implement, including its regression test. The fixes
+were then made in parallel lanes (engine providers and Gemini, engine agent
+and templates, CLI batch and MCP, CLI configuration, web, and boundary,
+tooling and release, documentation). Each fix comes with a regression test
+written to fail without it, except documentation-only items.
+
+Results: **73 findings**. **69 confirmed**, **1 uncertain** (C1-3, fixed
+together with D2-1), and **3 refuted** (C4-11, C6-2, D1-3). Of the 70 kept,
+**3 are high** (C4-1, C6-1, D3-1), **28 medium**, and **39 low**.
+
+### Fixed
+
+The user-visible changes are listed under "Unreleased" in the
+[changelog](../CHANGELOG.md). In short:
+
+- Security: configuration layers no longer carry an operator's endpoint and
+  key variable across a provider switch (C6-1); the MCP glob `..` guard works
+  on the compiled pattern and outside matches are not named (C4-2); Windows
+  UNC paths are refused before any filesystem call (C4-8); the confirmation
+  prompt cannot be forged through the model ID (C4-9); IPv4-compatible IPv6
+  literals are not public (C1-5); ambient Google SDK variables cannot reroute
+  Gemini traffic (C2-4, D1-2); hostile pages, a FIFO `.env`, endless redirect
+  bodies, and huge PDF pages can no longer stall or exhaust the server (C4-3,
+  C6-3, C4-6, C4-7); model text is escaped in template Markdown (C3-5); the
+  container follows Node.js 24 security releases (D3-3).
+- Cost and retries: OpenRouter BYOK, Gemini URL-context tokens, and failed
+  streams are counted (C1-1, C2-1, C1-4); unmetered paid usage keeps a capped
+  resume closed and spend is persisted per response (C5-1, C5-5); Node.js
+  fetch's 300-second timeouts no longer cut and re-bill requests (C1-2); the
+  Interactions SDK's hidden retries are off and `RetryInfo` is kept (C2-2,
+  C2-3); engine errors are classified by type (C2-5).
+- Providers and models: OpenRouter reasoning is sent to unlisted routes only
+  when chosen (C1-3, D2-1); Gemini 4 Carbon, Hydrogen, and Neon with `xhigh`
+  (D1-1); Claude Fable 5.2 on OpenRouter (D2-5); streamed truncation and
+  `CONTINUATION` stops are reported accurately (D2-2, D1-4).
+- Web: host-name URLs work for non-Gemini providers (C4-1); SVG text, cut-off
+  bodies, and typed transport errors (C4-4, C4-5, C4-10); URL requests ignore
+  extract-only configuration (C7-3).
+- Batches: durable writes and recovery from an unreadable manifest (C5-2),
+  retired Gemini models in `status` (C5-3), old agent-instruction artifact
+  names (C5-4), cancellation while hashing (C5-6), HEVC-branded `.heif`
+  (C5-7).
+- Agentic and templates: field merging, aliases, dates, amounts, signs,
+  document labels, field-name checks, region keys, re-OCR locations, page
+  count, and preset validation (C3-1 to C3-11); region crops no longer crash
+  on PDF images or blank JPEG 2000 images (D3-1, D3-5); linear-time Markdown
+  normalization (C2-6).
+- Configuration and CLI: `.env` guidance, empty environment values, blank
+  numeric flags, `run --no-config`, and interactive cancellation and defaults
+  (C6-4 to C6-8); non-empty error messages and `INTERNAL` self-validation
+  failures (C7-1); per-item validation messages (C7-2); the documented schema
+  subset (C7-4).
+- Evals: CER and table-cell F1 scoring, invalid character references, and
+  unscorable cases (C3-12 to C3-15).
+- Distribution: the Homebrew formula (D3-2), Node.js 26 in CI (D3-4, the
+  non-breaking part), the Docker build context (D3-6), and the GitHub Action's
+  Node.js (D3-7).
+- Documentation: Claude Code's 7-day stdio probe skip and the
+  `MCP_PROTOCOL_NEGOTIATION=auto` remedy, consistent across the README, the
+  agent guide, and the skill (C7-5, D2-3).
+
+C4-2 is closed twice: the compiled-pattern check refuses every known spelling
+of `..`, and discovery hands every match to the MCP boundary check before it
+stats or opens any of them, so an unknown spelling still cannot read an
+outside file. One fix is partial on purpose. C4-8 refuses foreign UNC and
+device paths on Windows only; a general lexical pre-check before `realpath`
+would break the documented acceptance of absolute globs through a
+symbolic-link alias of the working directory.
+
+An independent review of the change set found four defects it had introduced,
+all fixed with regression tests: the batch field review depended on the order
+of the batch (now reviewed to a fixed point against the whole batch); evals
+did not mark an `OPEN_OCR_THINKING` level as explicit; `doctor` and `init`
+credential probes had no deadline once undici's 300 s defaults were removed
+(now 60 s); and current `<name>.steps.*` artifacts were mistaken for the
+4.3.0 instruction-file layout and never resumed.
+
+### Deferred
+
+- Dropping Node.js 20, which reached end of life on 2026-04-30, is a
+  semver-major change left for 5.0.0. It blocks the dependency majors that
+  need Node.js 22 or later: `@google/genai` 3.x, `pdfjs-dist` 6.x,
+  `commander` 15, `vitest` 5, `tsup` 9, and TypeScript 7. Node.js 26 is now
+  tested in CI; `engines` is unchanged.
+- Meta Muse Ember (`muse-ember-1.0`) is not added: it had no first-party price
+  source, because Meta's model and pricing pages could not be reached.
+- Refuted, no change: C4-11 (MCP 2026-07-28 requires only `-32602` for a
+  missing resource; `data.uri` comes from a non-normative example), C6-2 (a
+  project that can set `output` can commit those files directly, and `.git`
+  stays refused), and D1-3 (`^2.32.0` cannot resolve to `@google/genai` 3.x,
+  and the D1-2 fix already pins `apiVersion`).
+- Gaps found after the first pass and closed in the same change set:
+  `interactive` passed the default `--thinking` as if chosen, so it counted as
+  explicit on an unlisted OpenRouter route; `evals/run.ts` passed no page
+  count, so agentic eval artifacts reported 1; and under
+  `OPEN_OCR_MCP_CONFIRM=1` the live run discovered its inputs again after the
+  plan, so a file added to the folder in between was sent without approval
+  (on both the prompted and the no-prompt path). The approval now binds the
+  run to the documents it listed; a regression test reproduces the race and
+  showed the late file reaching the provider before the fix. Still open: the
+  Dockerfile comments naming the Node.js version are not updated by
+  Dependabot.
+
+### Limits
+
+No live provider request was made: provider behavior was checked with
+fixtures, mocked transports, and the real SDKs against local HTTP servers. No
+live Claude Code or Codex session was run. Docker builds and GitHub Actions
+workflows were not run locally; their changes are covered by static tests and
+local equivalents of the smoke steps. The Gemini 4 prices come from secondary
+sources because ai.google.dev could not be reached, and the OpenRouter catalog
+could not be reached either, so the Claude Fable 5.2 effort contract follows
+Fable 5.1's, its fallback price is Anthropic's list price, and the new
+`google/gemini-4-*` OpenRouter suggestions are not confirmed against that
+catalog. Passing checks
+establish tested behavior, not the absence of every defect.
+
+Verification: all **1431 tests in 79 files** pass on Node **22.23.5** (the
+1429-test set also passed on **20.19.0**); 10 of the 79 test files are new.
+Coverage passes its gate at **89.08% statements**, **81.84% branches**,
+**93.10% functions**, and **92.05% lines** (thresholds 83 / 74 / 89 / 87). Full
+TypeScript checks and ESLint pass with no warnings. The **26 release and
+packaging script tests** in 5 files pass on Node 22.23.5 and 20.19.0 (and on
+26.13.1 in the tooling lane). Evaluation corpus validation passes (**24
+cases**, one suite assertion), as does the provider matrix dry run. The CLI
+build, `--help`, and `capabilities --json` pass. The engine-strict packed
+tarball installation, including the official MCP SDK stdio smoke, passes on
+Node 22.23.5 and 20.19.0. Release-version consistency and release-note
+extraction pass for v4.4.0. The npm audit reports zero known vulnerabilities,
+`npm ls` reports a consistent tree, and `git diff --check` is clean.

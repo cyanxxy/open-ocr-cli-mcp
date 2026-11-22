@@ -84,6 +84,37 @@ describe('CLI init', () => {
     })).rejects.toMatchObject({ code: 'CONFIG_INVALID', hint: expect.stringContaining('init --global') as unknown });
   });
 
+  it('leaves thinking unset for an OpenRouter route with no known reasoning contract under --yes', async () => {
+    const unlisted = await runInit({ yes: true, skipValidation: true, provider: 'openrouter', model: 'meta-llama/llama-4-maverick' }, {
+      cwd: directory, env: {}, prompter: answers([]), writeOutput: () => undefined,
+    });
+    expect(JSON.parse(await readFile(unlisted.configPath, 'utf8'))).not.toHaveProperty('thinking');
+    const curated = await runInit({ yes: true, force: true, skipValidation: true, provider: 'openrouter', model: 'anthropic/claude-fable-5.2' }, {
+      cwd: directory, env: {}, prompter: answers([]), writeOutput: () => undefined,
+    });
+    expect(JSON.parse(await readFile(curated.configPath, 'utf8'))).toMatchObject({ thinking: 'HIGH' });
+  });
+
+  it('describes the endpoint and key a project configuration will actually use', async () => {
+    const home = path.join(directory, 'home');
+    await runInit({ global: true, yes: true, skipValidation: true }, {
+      cwd: directory, homeDirectory: home, env: {}, prompter: answers([]), writeOutput: () => undefined,
+    });
+    const switched: string[] = [];
+    await runInit({ yes: true, skipValidation: true, provider: 'kimi' }, {
+      cwd: directory, homeDirectory: home, env: {}, prompter: answers([]), writeOutput: (text) => switched.push(text),
+    });
+    expect(switched.join('')).toContain('uses the kimi default endpoint and MOONSHOT_API_KEY');
+
+    const kept: string[] = [];
+    await runInit({ yes: true, force: true, skipValidation: true, provider: 'gemini' }, {
+      cwd: directory, homeDirectory: home, env: {}, prompter: answers([]), writeOutput: (text) => kept.push(text),
+    });
+    expect(kept.join('')).toContain(
+      `keeps provider gemini, so it uses the endpoint https://generativelanguage.googleapis.com and key variable GEMINI_API_KEY from ${path.join(home, '.config', 'open-ocr-cli', 'config.json')}`,
+    );
+  });
+
   it('shows fixed-choice options and re-prompts after an invalid provider', async () => {
     const output: string[] = [];
     const questions: string[] = [];

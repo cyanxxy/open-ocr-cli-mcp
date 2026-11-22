@@ -18,6 +18,7 @@ import {
 import { CliExitError } from './errors';
 import {
   assertCallerPatternBounded,
+  assertNotForeignNetworkPath,
   callerBoundaryError,
   confineCallerPath,
   confineCallerPattern,
@@ -38,7 +39,7 @@ import {
   type OcrJobRequest,
 } from './protocol';
 import type { CliConfigFile, ExtractCommandFlags, ResolvedCliOptions } from './types';
-import { resolveWebUrls, runWebJob } from './web';
+import { resolveWebUrls, runWebJob, webFileConfig } from './web';
 
 export interface ExecuteOcrJobOptions {
   cwd: string;
@@ -57,6 +58,8 @@ export interface ExecuteOcrJobOptions {
   boundary?: 'mcp';
   /** Observe the fully resolved options, e.g. to describe a run for confirmation. */
   onResolvedOptions?: (options: ResolvedCliOptions) => void;
+  /** Display paths a person approved; the run sends no other document (see OcrJobServiceRuntime). */
+  sendOnly?: ReadonlySet<string>;
 }
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -318,6 +321,9 @@ async function confineMcpInputs(
       confined.push(input);
       continue;
     }
+    // Before `existsAsLiteralPath` stats it: on Windows, a UNC path to another
+    // host is refused without being touched.
+    assertNotForeignNetworkPath(cwd, input.path, 'input');
     const value = GLOB_SYNTAX.test(input.path) && !(await existsAsLiteralPath(cwd, input.path))
       ? await confineCallerPattern(cwd, input.path)
       : input.path;
@@ -328,17 +334,23 @@ async function confineMcpInputs(
 }
 
 async function assertMcpMatchesInside(
-  inputs: readonly { absolutePath?: string; displayPath: string }[],
+  absolutePaths: readonly string[],
   cwd: string,
 ): Promise<void> {
   const root = await realpath(cwd);
-  for (const input of inputs) {
-    if (!input.absolutePath) continue;
-    const resolved = await realpath(input.absolutePath);
-    if (escapesRoot(path.relative(root, resolved))) {
+  for (const absolutePath of absolutePaths) {
+    // A match removed since the walk is judged by its spelling; discovery then
+    // reports it missing. The raw realpath error would name the path.
+    const resolved = await realpath(absolutePath).catch(() => undefined);
+    const outside = resolved === undefined
+      ? escapesRoot(path.relative(path.resolve(cwd), absolutePath)) && escapesRoot(path.relative(root, absolutePath))
+      : escapesRoot(path.relative(root, resolved));
+    if (outside) {
+      // Generic on purpose: naming the match would disclose the name of a
+      // file outside the working directory to the caller.
       throw callerBoundaryError(
         'input',
-        `A matched input resolves outside the MCP server working directory: ${input.displayPath}`,
+        'An input matched a file that resolves outside the MCP server working directory',
         cwd,
       );
     }
@@ -386,6 +398,12 @@ export async function executeOcrJobRequest(
   if (urlInputs.length > 0 && urlInputs.length !== request.inputs.length) {
     throw configurationError('OCR URL inputs cannot be mixed with path or stdin inputs.');
   }
+  // `run --no-config` promises a hermetic run, exactly like protocol
+  // `noConfig: true`, which the request schema already refuses next to
+  // `configPath`.
+  if (execution.noConfig === true && request.configPath !== undefined) {
+    throw configurationError('--no-config cannot be combined with the request configPath.');
+  }
   const hermetic = execution.noConfig === true || request.noConfig === true;
   const mcp = execution.boundary === 'mcp';
   // Ambient OPEN_OCR_NO_CONFIG still blocks .env; explicit configPath may load
@@ -405,6 +423,10 @@ export async function executeOcrJobRequest(
   } else {
     fileConfig = await loadCliConfig(execution.cwd, request.configPath, hermetic);
   }
+  // URL requests read the configuration the way the `web` command does, so a
+  // `format`, `preset`, or `schema` written for file extraction cannot fail
+  // them over fields the caller never sent.
+  if (urlInputs.length > 0) fileConfig = webFileConfig(fileConfig);
   const invalidConfiguration = machineConfigurationError(request, fileConfig);
   if (invalidConfiguration) throw configurationError(invalidConfiguration);
 
@@ -497,15 +519,18 @@ export async function executeOcrJobRequest(
       deliveryMode,
       progress: options.progress,
       enableSingleInputResume: deliveryMode === 'reference',
+      sendOnly: execution.sendOnly,
     });
   }
+  // Under MCP every match is confined before discovery stats or opens it.
   const discovery = await discoverInputSet(discoveryInputs.map((input) => (
     input.type === 'stdin' ? '-' : input.type === 'path' ? input.path : input.url
-  )), options, execution.abortController.signal);
+  )), options, execution.abortController.signal, mcp
+    ? (absolutePaths) => assertMcpMatchesInside(absolutePaths, execution.cwd)
+    : undefined);
   // A directory scan that drops files hands back fewer documents than were
   // requested, which the caller has to hear about. It reuses the CLI's wording
   // so both surfaces say one thing.
-  if (mcp) await assertMcpMatchesInside(discovery.inputs, execution.cwd);
   const skipSummary = describeDiscoverySkips(discovery.skipped);
   if (skipSummary) warn(`Discovery: ${skipSummary}`);
   assertCredentialsAvailable(options);
@@ -518,5 +543,6 @@ export async function executeOcrJobRequest(
     deliveryMode,
     progress: options.progress,
     enableSingleInputResume: deliveryMode === 'reference',
+    sendOnly: execution.sendOnly,
   });
 }

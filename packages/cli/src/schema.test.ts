@@ -100,8 +100,9 @@ describe('custom JSON schemas', () => {
     expect(thrown.message).toBe(`Invalid JSON in schema ${schemaPath}`);
     await writeFile(schemaPath, '{"private_key": 1,}');
     const positioned = await loadCustomSchema(schemaPath, directory).catch((error: unknown) => error as Error);
-    expect(positioned.message).toMatch(/^Invalid JSON in schema \S+ \(at position \d+/u);
+    expect(positioned.message).toMatch(/^Invalid JSON in schema \S+/u);
     expect(positioned.message).not.toContain('private_key');
+    // The position V8 reports is checked on Node in schema.node.test.ts.
   });
 
   it('validates and clones inline schemas for machine requests', () => {
@@ -160,5 +161,53 @@ describe('custom JSON schemas', () => {
       additionalProperties: false,
       properties: { total: { anyOf: [{ type: 'string' }, { type: 'null' }] } },
     })).toBeUndefined();
+  });
+});
+
+describe('the documented keyword subset', () => {
+  it('accepts $anchor references and validates through them', () => {
+    const schema = validateCustomSchema({
+      $defs: { x: { $anchor: 'foo', type: 'string' } },
+      type: 'object',
+      properties: { a: { $ref: '#foo' } },
+    });
+    expect(() => assertCustomSchemaOutput(schema, { a: 'z' })).not.toThrow();
+    expect(() => assertCustomSchemaOutput(schema, { a: 1 })).toThrow(expect.objectContaining({ code: 'OUTPUT_INVALID' }) as Error);
+  });
+
+  it.each([
+    ['an open prefixItems tuple', { type: 'array', prefixItems: [{ type: 'string' }] }],
+    ['anyOf with required', {
+      type: 'object',
+      properties: { a: { type: 'string' }, b: { type: 'string' } },
+      anyOf: [{ required: ['a'] }, { required: ['b'] }],
+    }],
+    ['minimum without type', { minimum: 0 }],
+    ['properties without type', { properties: { a: { type: 'string' } } }],
+  ])('accepts %s', (_label, schema) => {
+    expect(() => validateCustomSchema(schema)).not.toThrow();
+  });
+
+  it.each([
+    ['a root self-reference', { $ref: '#' }],
+    ['a self-reference through anyOf', { anyOf: [{ $ref: '#' }, { type: 'string' }] }],
+    ['a two-step cycle', { $defs: { a: { $ref: '#/$defs/b' }, b: { $ref: '#/$defs/a' } }, $ref: '#/$defs/a' }],
+  ])('refuses %s before any provider call', (_label, schema) => {
+    let thrown: unknown;
+    try {
+      validateCustomSchema(schema);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(ocrErrorPayload(thrown).code).toBe('SCHEMA_INVALID');
+  });
+
+  it('still accepts recursion that descends into the value', () => {
+    const tree = validateCustomSchema({
+      $defs: { node: { type: 'object', properties: { children: { type: 'array', items: { $ref: '#/$defs/node' } } } } },
+      $ref: '#/$defs/node',
+    });
+    expect(() => assertCustomSchemaOutput(tree, { children: [{ children: [] }] })).not.toThrow();
   });
 });

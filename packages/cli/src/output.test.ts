@@ -13,8 +13,10 @@ import {
   ManifestStore,
   plannedArtifactTargets,
   primaryArtifact,
+  STDIN_MANIFEST_KEY,
   writeArtifacts,
   writeBatchSummary,
+  writeTextFileAtomically,
 } from './output';
 import type { BatchSummary, OcrArtifacts, ResolvedCliOptions, ResolvedInput } from './types';
 
@@ -674,6 +676,129 @@ describe('artifact path hardening', () => {
       fingerprint: 'abc', status: 'succeeded', outputFiles: [current], completedAt: new Date().toISOString(),
     });
     await expect(manifest.completedEntry('/workspace/.mcp.png', 'abc')).resolves.toMatchObject({ outputFiles: [current] });
+  });
+
+  it('re-extracts a resumed entry whose recorded artifact has an agent instruction name from the old layout', async () => {
+    await fs.mkdir(path.join(directory, 'docs'));
+    const legacy = path.join(directory, 'docs', 'CLAUDE.md');
+    const legacySteps = path.join(directory, 'docs', 'AGENTS.steps.json');
+    const current = path.join(directory, 'docs', 'CLAUDE.ocr.md');
+    const lookalike = path.join(directory, 'docs', 'claude-notes.md');
+    for (const file of [legacy, legacySteps, current, lookalike]) await writeFile(file, '# x\n');
+    const manifest = new ManifestStore(directory);
+    await manifest.load();
+    const entry = (outputFiles: string[]) => ({
+      fingerprint: 'abc', status: 'succeeded' as const, outputFiles, completedAt: new Date().toISOString(),
+    });
+    await manifest.update('/workspace/docs/CLAUDE.jpg', entry([legacy]));
+    await expect(manifest.completedEntry('/workspace/docs/CLAUDE.jpg', 'abc')).resolves.toBeUndefined();
+    // The old path stays owned, so the new write is not blocked by it.
+    expect(manifest.recordedArtifactPaths('/workspace/docs/CLAUDE.jpg').has(legacy)).toBe(true);
+    await manifest.update('/workspace/docs/AGENTS.jpg', entry([legacySteps]));
+    await expect(manifest.completedEntry('/workspace/docs/AGENTS.jpg', 'abc')).resolves.toBeUndefined();
+
+    // Names the current layout writes still resume.
+    await manifest.update('/workspace/docs/CLAUDE.jpg', entry([current]));
+    await expect(manifest.completedEntry('/workspace/docs/CLAUDE.jpg', 'abc')).resolves.toMatchObject({ outputFiles: [current] });
+    await manifest.update('/workspace/docs/claude-notes.jpg', entry([lookalike]));
+    await expect(manifest.completedEntry('/workspace/docs/claude-notes.jpg', 'abc')).resolves.toBeDefined();
+  });
+
+  it('resumes current artifacts of an input named like an instruction file plus ".steps"', async () => {
+    const markdown = path.join(directory, 'skill.steps.md');
+    const json = path.join(directory, 'skill.steps.json');
+    const legacy = ['skill.md', 'skill.json', 'skill.steps.json'].map((name) => path.join(directory, 'old', name));
+    await fs.mkdir(path.join(directory, 'old'));
+    for (const file of [markdown, json, ...legacy]) await writeFile(file, '{}\n');
+    const manifest = new ManifestStore(directory);
+    await manifest.load();
+    const entry = (outputFiles: string[]) => ({
+      fingerprint: 'abc', status: 'succeeded' as const, outputFiles, completedAt: new Date().toISOString(),
+    });
+    // What this release writes for `skill.steps.png`; `skill.steps` is no instruction name.
+    await manifest.update('/workspace/skill.steps.png', entry([markdown, json]));
+    await expect(manifest.completedEntry('/workspace/skill.steps.png', 'abc'))
+      .resolves.toMatchObject({ outputFiles: [markdown, json] });
+    // The 4.3.0 layout for `skill.png` is still re-extracted, steps file included.
+    await manifest.update('/workspace/old/skill.png', entry(legacy));
+    await expect(manifest.completedEntry('/workspace/old/skill.png', 'abc')).resolves.toBeUndefined();
+    await manifest.update('/workspace/old/skill.png', entry([legacy[2]]));
+    await expect(manifest.completedEntry('/workspace/old/skill.png', 'abc')).resolves.toBeUndefined();
+  });
+
+  it('reads the instruction name off the stdin name, since stdin entries share one key', async () => {
+    const legacy = path.join(directory, 'CLAUDE.md');
+    await writeFile(legacy, '# x\n');
+    const manifest = new ManifestStore(directory);
+    await manifest.load();
+    await manifest.update(STDIN_MANIFEST_KEY, {
+      fingerprint: 'abc', status: 'succeeded', outputFiles: [legacy], completedAt: new Date().toISOString(),
+    });
+    await expect(manifest.completedEntry(STDIN_MANIFEST_KEY, 'abc', 'CLAUDE.png')).resolves.toBeUndefined();
+    await expect(manifest.completedEntry(STDIN_MANIFEST_KEY, 'abc', 'scan.png')).resolves.toBeDefined();
+  });
+});
+
+describe('durable job metadata', () => {
+  it('syncs a staged manifest before committing it, then syncs its directory', async () => {
+    const events: string[] = [];
+    const realOpen = fs.open.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      const sync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        events.push(`sync ${path.basename(String(args[0]))}`);
+        await sync();
+      };
+      return handle;
+    });
+    vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      events.push(`rename ${path.basename(String(to))}`);
+      await realRename(from, to);
+    });
+    try {
+      await writeTextFileAtomically(path.join(directory, '.open-ocr-manifest.json'), '{}\n', true);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(events).toEqual([
+      expect.stringMatching(/^sync \.open-ocr-manifest\.json\.\d+-[0-9a-f-]+\.tmp$/u),
+      'rename .open-ocr-manifest.json',
+      `sync ${path.basename(directory)}`,
+    ]);
+    await expect(readFile(path.join(directory, '.open-ocr-manifest.json'), 'utf8')).resolves.toBe('{}\n');
+  });
+
+  it('names an unreadable manifest in its hint, and sets it aside only when asked', async () => {
+    const manifestPath = path.join(directory, '.open-ocr-manifest.json');
+    await writeFile(manifestPath, '');
+    const failure = await new ManifestStore(directory).load().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: 'INPUT_INVALID' });
+    expect((failure as Error).message).toContain(`Invalid JSON in ${manifestPath}`);
+    expect((failure as { hint?: string }).hint).toContain(manifestPath);
+    expect((failure as { hint?: string }).hint).toContain('--overwrite');
+
+    // A dry run starts empty and writes nothing.
+    await expect(new ManifestStore(directory).load({ unreadable: 'ignore' })).resolves.toEqual({ unreadable: true });
+    await expect(readFile(manifestPath, 'utf8')).resolves.toBe('');
+
+    const store = new ManifestStore(directory);
+    const loaded = await store.load({ unreadable: 'set-aside' });
+    expect(loaded.setAsidePath).toMatch(/\.open-ocr-manifest\.json\.corrupt-[0-9TZ-]+$/u);
+    await expect(readFile(loaded.setAsidePath!, 'utf8')).resolves.toBe('');
+    expect(store.recordedUsage()).toBeUndefined();
+
+    // Only invalid JSON is set aside: a manifest another tool wrote is still refused.
+    // The exclusive create also proves the corrupt manifest was moved away.
+    const replacement = await fs.open(manifestPath, 'wx');
+    try {
+      await replacement.writeFile(JSON.stringify({ version: 9, entries: {} }));
+    } finally {
+      await replacement.close();
+    }
+    await expect(new ManifestStore(directory).load({ unreadable: 'set-aside' }))
+      .rejects.toThrow('Unsupported manifest version');
   });
 });
 

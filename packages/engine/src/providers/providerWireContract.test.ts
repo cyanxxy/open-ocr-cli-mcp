@@ -85,6 +85,34 @@ describe('tool-call wire fields per provider', () => {
   });
 });
 
+describe('OpenRouter reasoning field on routes without a known contract', () => {
+  // require_parameters keeps only endpoints that list every request parameter,
+  // and a non-reasoning model does not list `reasoning`.
+  const requests: Array<[string, { responseSchema?: Record<string, unknown>; tools?: OpenAITool[] }]> = [
+    ['schema', { responseSchema: strictObject }],
+    ['tools', { tools: [tool] }],
+  ];
+  it.each(requests)('omits reasoning for an unlisted route with %s unless thinking was explicit', async (_label, request) => {
+    const unlisted = config('openrouter', 'openai/gpt-4.1-mini');
+    const implicit = await wireBody({ ...unlisted, thinkingConfig: { level: 'MEDIUM' } }, request);
+    expect(implicit.provider).toEqual({ require_parameters: true });
+    expect(implicit).not.toHaveProperty('reasoning');
+    expect(await wireBody(unlisted, request)).not.toHaveProperty('reasoning');
+
+    const explicit = await wireBody({ ...unlisted, thinkingConfig: { level: 'HIGH', explicit: true } }, request);
+    expect(explicit.reasoning).toEqual({ effort: 'high', exclude: false });
+  });
+
+  it.each([
+    ['anthropic/claude-sonnet-5.5', 'high'],
+    ['google/gemini-3.8-flash', 'medium'],
+    ['moonshotai/kimi-k3.1-pro', 'max'],
+  ])('keeps reasoning on curated route %s without an explicit level', async (model, effort) => {
+    const body = await wireBody(config('openrouter', model), { responseSchema: strictObject });
+    expect(body.reasoning).toEqual({ effort, exclude: false });
+  });
+});
+
 describe('provider-aware strict schema subset', () => {
   const strictFlag = async (provider: ProviderId, model: string, schema: Record<string, unknown>) => {
     const body = await wireBody(config(provider, model), { responseSchema: schema });

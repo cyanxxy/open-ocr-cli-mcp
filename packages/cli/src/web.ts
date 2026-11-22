@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import { convert } from 'html-to-text';
+import { Worker } from 'node:worker_threads';
+import type { HtmlToTextOptions } from 'html-to-text';
 
 import {
   dedupeRequestedUrls,
@@ -32,7 +34,7 @@ import { assertProviderMediaTypeSupported } from './providerInputs';
 import { providerRuntimeConfig } from './providerRuntime';
 import { runWithProviderRetries } from './providerRetries';
 import { secureFetchPublicUrl } from './secureFetch';
-import type { OcrArtifacts, ResolvedCliOptions, ResolvedInput } from './types';
+import type { CliConfigFile, OcrArtifacts, ResolvedCliOptions, ResolvedInput } from './types';
 
 export const WEB_ANALYSIS_MODES = ['individual', 'combined', 'comparison'] as const;
 export type WebAnalysisMode = (typeof WEB_ANALYSIS_MODES)[number];
@@ -107,21 +109,168 @@ export async function runWebJob(
   });
 }
 
-export function readableWebText(bytes: Uint8Array, contentType: string): string {
-  const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-  if (!contentType.includes('html') && !contentType.includes('xml')) return decoded;
-  return convert(decoded, {
+/**
+ * The view of a configuration file that a URL request reads.
+ *
+ * URL extraction is simple mode with Markdown or JSON output only, so the
+ * extract-oriented keys of a configuration that is perfectly valid for files
+ * (`mode`, `preset`, `schema`, a `format` of `csv` or `all`) must not leak in
+ * and fail the run. Explicit request fields and flags are still validated.
+ */
+export function webFileConfig(fileConfig: CliConfigFile): CliConfigFile {
+  return {
+    ...fileConfig,
+    mode: 'simple',
+    preset: undefined,
+    schema: undefined,
+    format: fileConfig.format === 'json' ? 'json' : 'markdown',
+  };
+}
+
+/** Wall-clock budget for converting one fetched page to text. */
+export const WEB_TEXT_CONVERSION_TIMEOUT_MS = 15_000;
+
+/**
+ * Whether the document's root element is `<svg>` (skipping inline SVG there
+ * would skip the whole document). A linear scan past the XML declaration,
+ * comments and doctype: a regex with a repeated lazy comment group backtracks
+ * exponentially on input like `<!--` followed by many `--><!--`.
+ */
+function isSvgDocument(text: string): boolean {
+  let index = 0;
+  const skipSpace = (): void => {
+    while (index < text.length && /\s/u.test(text[index])) index += 1;
+  };
+  skipSpace();
+  if (text.startsWith('<?xml', index)) {
+    const end = text.indexOf('>', index);
+    if (end === -1) return false;
+    index = end + 1;
+  }
+  for (;;) {
+    skipSpace();
+    if (text.startsWith('<!--', index)) {
+      const end = text.indexOf('-->', index + 4);
+      if (end === -1) return false;
+      index = end + 3;
+    } else if (text.slice(index, index + 9).toUpperCase() === '<!DOCTYPE') {
+      const end = text.indexOf('>', index);
+      if (end === -1) return false;
+      index = end + 1;
+    } else {
+      break;
+    }
+  }
+  return text.slice(index, index + 4).toLowerCase() === '<svg' && /[\s/>]/u.test(text[index + 4] ?? '');
+}
+
+function htmlToTextOptions(svgDocument: boolean): HtmlToTextOptions {
+  return {
     wordwrap: false,
     preserveNewlines: true,
     selectors: [
       { selector: 'script', format: 'skip' },
       { selector: 'style', format: 'skip' },
       { selector: 'noscript', format: 'skip' },
-      { selector: 'svg', format: 'skip' },
+      // An SVG embedded in a page is decoration; in an SVG document its text
+      // elements are the content.
+      ...(svgDocument
+        ? [
+            { selector: 'title', format: 'block' },
+            { selector: 'desc', format: 'block' },
+            { selector: 'text', format: 'block' },
+          ]
+        : [{ selector: 'svg', format: 'skip' }]),
       { selector: 'img', format: 'skip' },
       { selector: 'a', options: { ignoreHref: true } },
     ],
-  })
+  };
+}
+
+/**
+ * Converted on a worker thread. Parsing deeply nested markup costs time
+ * quadratic in the depth and the formatter recurses per level, so a hostile
+ * page of a few megabytes could block the event loop for minutes (stalling a
+ * long-lived MCP server's cancellations, timeouts, and other calls) or
+ * overflow the stack. The worker has its own stack and heap limits, and is
+ * terminated when the budget runs out or the attempt is cancelled.
+ */
+const CONVERT_IN_WORKER = `
+const { parentPort, workerData } = require('node:worker_threads');
+const { convert } = require(workerData.modulePath);
+parentPort.postMessage(convert(workerData.html, workerData.options));
+`;
+
+let htmlToTextModulePath: string | undefined;
+
+function webTextError(message: string, cause?: unknown): CliExitError {
+  return new CliExitError(message, 2, {
+    ...(cause === undefined ? {} : { cause }),
+    code: 'INPUT_INVALID',
+    category: 'input',
+    retryable: false,
+    hint: 'Use a URL whose page is smaller or less deeply nested, or a supported image/PDF URL.',
+  });
+}
+
+function convertHtmlOffThread(
+  html: string,
+  options: HtmlToTextOptions,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<string> {
+  signal?.throwIfAborted();
+  htmlToTextModulePath ??= createRequire(import.meta.url).resolve('html-to-text');
+  const worker = new Worker(CONVERT_IN_WORKER, {
+    eval: true,
+    workerData: { modulePath: htmlToTextModulePath, html, options },
+    resourceLimits: { maxOldGenerationSizeMb: 1024, stackSizeMb: 16 },
+    // Never forwarded to this process's stdout, which carries the MCP protocol.
+    stdout: true,
+  });
+  worker.stdout.resume();
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const finish = (outcome: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      void worker.terminate();
+      outcome();
+    };
+    const onAbort = (): void => finish(() => reject(
+      signal?.reason instanceof Error ? signal.reason : new DOMException('Operation aborted', 'AbortError'),
+    ));
+    const timer = setTimeout(() => finish(() => reject(webTextError(
+      `URL response took longer than ${timeoutMs / 1000} seconds to convert to text`,
+    ))), timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    worker.once('message', (text: unknown) => finish(() => resolve(String(text))));
+    worker.once('error', (error) => finish(() => reject(
+      error instanceof RangeError
+        ? webTextError('URL response is nested too deeply to convert to text', error)
+        : (error as NodeJS.ErrnoException).code === 'ERR_WORKER_OUT_OF_MEMORY'
+          ? webTextError('URL response is too large to convert to text', error)
+          : error,
+    )));
+    worker.once('exit', (code) => finish(() => reject(webTextError(
+      `URL response text conversion stopped unexpectedly (exit code ${code})`,
+    ))));
+  });
+}
+
+export async function readableWebText(
+  bytes: Uint8Array,
+  contentType: string,
+  signal?: AbortSignal,
+  timeoutMs = WEB_TEXT_CONVERSION_TIMEOUT_MS,
+): Promise<string> {
+  const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  if (!contentType.includes('html') && !contentType.includes('xml')) return decoded;
+  const svgDocument = contentType === 'image/svg+xml' || isSvgDocument(decoded);
+  const text = await convertHtmlOffThread(decoded, htmlToTextOptions(svgDocument), signal, timeoutMs);
+  return text
     .replace(/\u00a0/g, ' ')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n\s*\n\s*\n+/g, '\n\n')
@@ -295,7 +444,7 @@ async function runCompatibleWebExtraction(
         signal,
       ));
     } else {
-      const text = readableWebText(fetched.bytes, contentType).slice(0, 1_500_000);
+      const text = (await readableWebText(fetched.bytes, contentType, signal)).slice(0, 1_500_000);
       if (!text) {
         throw new CliExitError(`URL returned no readable text: ${url}`, 2, {
           code: 'INPUT_INVALID',

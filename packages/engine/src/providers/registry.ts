@@ -5,7 +5,7 @@ import type {
   ProviderRuntimeConfig,
   ProviderTokenPrice,
 } from './types';
-import { GEMINI_MODELS, type ThinkingLevel } from '../gemini/types';
+import { GEMINI_MODELS, type GeminiModel, type ThinkingLevel } from '../gemini/types';
 
 export { GEMINI_MODELS };
 
@@ -87,6 +87,7 @@ export const PROVIDER_PROFILES: Record<ProviderId, ProviderProfile> = {
       'anthropic/claude-opus-5.5',
       'anthropic/claude-sonnet-5.5',
       'anthropic/claude-haiku-5.5',
+      'anthropic/claude-fable-5.2',
       'anthropic/claude-fable-5.1',
       'x-ai/grok-4.7',
       'mistralai/mistral-medium-3-5',
@@ -158,6 +159,9 @@ const OPENROUTER_REASONING: Record<string, { levels: readonly ThinkingLevel[]; d
   'anthropic/claude-opus-5.5': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
   'anthropic/claude-sonnet-5.5': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
   'anthropic/claude-haiku-5.5': { levels: FULL_EFFORTS, defaultLevel: 'MEDIUM' },
+  // Successor to Fable 5.1. Its catalog entry could not be fetched on
+  // 2026-11-21; the effort contract follows Fable 5.1's.
+  'anthropic/claude-fable-5.2': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
   'anthropic/claude-fable-5.1': { levels: FULL_EFFORTS, defaultLevel: 'HIGH' },
   'x-ai/grok-4.7': { levels: ['LOW', 'MEDIUM', 'HIGH', 'XHIGH'], defaultLevel: 'HIGH' },
   'mistralai/mistral-medium-3-5': { levels: ['HIGH'], defaultLevel: 'HIGH' },
@@ -165,18 +169,45 @@ const OPENROUTER_REASONING: Record<string, { levels: readonly ThinkingLevel[]; d
 
 const MUSE_EFFORTS: readonly ThinkingLevel[] = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'MAX'];
 
+const GEMINI_STANDARD_LEVELS: readonly ThinkingLevel[] = ['LOW', 'MEDIUM', 'HIGH'];
+const GEMINI_XHIGH_LEVELS: readonly ThinkingLevel[] = ['LOW', 'MEDIUM', 'HIGH', 'XHIGH'];
+
+/**
+ * Thinking contract per native Gemini model. Typed over every GEMINI_MODELS
+ * entry, so a new ID without a row fails to compile instead of inheriting a
+ * level set; an ID outside the table has no known levels and fails closed.
+ * Gemini 4 models reject MINIMAL; XHIGH is offered by 4 Hydrogen and 4 Neon.
+ */
+interface ThinkingContract {
+  levels: readonly ThinkingLevel[];
+  defaultLevel: ThinkingLevel;
+}
+
+const GEMINI_THINKING: Record<GeminiModel, ThinkingContract> = {
+  'gemini-3.8-flash': { levels: GEMINI_STANDARD_LEVELS, defaultLevel: 'MEDIUM' },
+  'gemini-4-argon': { levels: GEMINI_STANDARD_LEVELS, defaultLevel: 'MEDIUM' },
+  'gemini-4-carbon': { levels: GEMINI_STANDARD_LEVELS, defaultLevel: 'MEDIUM' },
+  'gemini-4-hydrogen': { levels: GEMINI_XHIGH_LEVELS, defaultLevel: 'HIGH' },
+  'gemini-4-neon': { levels: GEMINI_XHIGH_LEVELS, defaultLevel: 'HIGH' },
+  'gemini-3.5-flash-lite': { levels: ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'], defaultLevel: 'MINIMAL' },
+};
+
+/** The Gemini thinking contract for a direct or OpenRouter `google/` route, if the model is curated. */
+function geminiThinkingContract(provider: ProviderId, routedModel: string): ThinkingContract | undefined {
+  const geminiModel = provider === 'gemini'
+    ? routedModel
+    : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
+  return geminiModel !== undefined && (GEMINI_MODELS as readonly string[]).includes(geminiModel)
+    ? GEMINI_THINKING[geminiModel as GeminiModel]
+    : undefined;
+}
+
 /** Current, verified reasoning contracts; unlisted gateway models remain model-dependent. */
 export function knownModelThinkingLevels(provider: ProviderId, model: string): readonly ThinkingLevel[] | undefined {
   if (isKimiK3Route(provider, model)) return ['LOW', 'HIGH', 'MAX'];
   const routedModel = provider === 'openrouter' ? model.split(':')[0] : model;
-  const geminiModel = provider === 'gemini'
-    ? model
-    : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
-  if (geminiModel && (GEMINI_MODELS as readonly string[]).includes(geminiModel)) {
-    return geminiModel === 'gemini-3.8-flash' || geminiModel === 'gemini-4-argon'
-      ? ['LOW', 'MEDIUM', 'HIGH']
-      : ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'];
-  }
+  const gemini = geminiThinkingContract(provider, routedModel);
+  if (gemini) return gemini.levels;
   const museModel = provider === 'muse'
     ? model
     : provider === 'openrouter' && routedModel.startsWith('meta/') ? routedModel.slice(5) : undefined;
@@ -190,10 +221,8 @@ export function knownModelThinkingLevels(provider: ProviderId, model: string): r
 export function providerDefaultThinkingLevel(provider: ProviderId, model: string): ThinkingLevel {
   if (isKimiK3Route(provider, model)) return 'MAX';
   const routedModel = provider === 'openrouter' ? model.split(':')[0] : model;
-  const geminiModel = provider === 'gemini'
-    ? model
-    : provider === 'openrouter' && routedModel.startsWith('google/') ? routedModel.slice(7) : undefined;
-  if (geminiModel === 'gemini-3.5-flash-lite') return 'MINIMAL';
+  const gemini = geminiThinkingContract(provider, routedModel);
+  if (gemini) return gemini.defaultLevel;
   if (provider === 'openrouter') return OPENROUTER_REASONING[routedModel]?.defaultLevel ?? 'MEDIUM';
   return 'MEDIUM';
 }
@@ -324,6 +353,17 @@ export function providerTokenPrice(
         : { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
     case 'gemini-3.5-flash-lite':
       return { inputPerMillionUsd: 0.3, cachedInputPerMillionUsd: 0.03, outputPerMillionUsd: 2.5 };
+    // Gemini 4 Carbon, Hydrogen and Neon list prices, checked 2026-11-21 via
+    // secondary sources (ai.google.dev was not reachable). Carbon's rates
+    // double on 2026-12-01 (UTC), like Argon's.
+    case 'gemini-4-carbon':
+      return now < Date.UTC(2026, 11, 1)
+        ? { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10 }
+        : { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 20 };
+    case 'gemini-4-hydrogen':
+      return { inputPerMillionUsd: 1.5, cachedInputPerMillionUsd: 0.075, outputPerMillionUsd: 7.5 };
+    case 'gemini-4-neon':
+      return { inputPerMillionUsd: 3, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 15 };
     // https://dev.meta.ai/docs/pricing-rate-limits (verified 2026-10-28).
     case 'muse-spark-1.3':
       return { inputPerMillionUsd: 1.25, cachedInputPerMillionUsd: 0.15, outputPerMillionUsd: 4.25 };
@@ -360,6 +400,9 @@ export function providerTokenPrice(
         : { inputPerMillionUsd: 0.1, cachedInputPerMillionUsd: 0.01, outputPerMillionUsd: 0.5 };
     case 'anthropic/claude-fable-5.1':
       return { inputPerMillionUsd: 10, cachedInputPerMillionUsd: 0.25, outputPerMillionUsd: 50 };
+    // Anthropic's list price (2026-11-21); the OpenRouter catalog was not reachable.
+    case 'anthropic/claude-fable-5.2':
+      return { inputPerMillionUsd: 8, cachedInputPerMillionUsd: 0.2, outputPerMillionUsd: 40 };
     case 'x-ai/grok-4.7':
       return inputTokens >= 200_000
         ? { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 1, outputPerMillionUsd: 12 }

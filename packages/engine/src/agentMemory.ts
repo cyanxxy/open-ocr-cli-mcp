@@ -28,9 +28,10 @@ export function agentProgressFingerprint(memory: Readonly<AgentMemory>): string 
 }
 
 /**
- * Create initial agent memory.
+ * Create initial agent memory. `pageCount` is the document's real page count;
+ * anything other than a positive integer falls back to 1.
  */
-export function createInitialMemory(sessionId: string, fileName: string): AgentMemory {
+export function createInitialMemory(sessionId: string, fileName: string, pageCount = 1): AgentMemory {
   return {
     sessionId,
     documentName: fileName,
@@ -38,7 +39,7 @@ export function createInitialMemory(sessionId: string, fileName: string): AgentM
     extractedFields: {},
     processingHistory: [],
     documentAnalysis: {
-      pageCount: 1,
+      pageCount: Number.isSafeInteger(pageCount) && pageCount > 0 ? pageCount : 1,
       documentType: 'unknown',
       complexity: 'medium',
       specialFeatures: [],

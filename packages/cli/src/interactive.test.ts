@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { cliExitCode } from './errors';
+import { CliExitError, cliExitCode } from './errors';
 import { promptInteractiveArguments, type InteractivePrompter } from './interactive';
 import type { CliConfigFile } from './types';
 
@@ -87,7 +87,7 @@ describe('interactive command menu', () => {
       '--provider', 'muse',
       '--gateway', 'direct',
       '--model', 'muse-spark-1.3',
-      '--thinking', 'medium',
+      // medium is the model's default and nothing configured a level.
       '--api-key-env', 'META_API_KEY',
       '--analysis', 'comparison',
       '--format', 'markdown',
@@ -119,7 +119,9 @@ describe('interactive command menu', () => {
       writeOutput: () => undefined,
     });
 
-    expect(result).toContain('max');
+    // max is Kimi K3's default and nothing configured a level, so the CLI
+    // resolves it without the flag (a Kimi K3 route always sends reasoning).
+    expect(result).not.toContain('--thinking');
     expect(calls).toContainEqual({
       question: 'Thinking level',
       values: ['low', 'high', 'max'],
@@ -249,5 +251,112 @@ describe('interactive command menu', () => {
     }
 
     expect(cliExitCode(thrown)).toBe(130);
+  });
+
+  it.each(['extract', 'web'])('maps Ctrl-C at a %s sub-prompt to exit code 130', async (command) => {
+    const abort = Object.assign(new Error('Aborted with Ctrl+C'), { code: 'ABORT_ERR' });
+    let chooseCalls = 0;
+    const choose: NonNullable<InteractivePrompter['choose']> = <T extends string>(): Promise<T> => {
+      chooseCalls += 1;
+      return chooseCalls === 1 ? Promise.resolve(command as T) : Promise.reject(abort);
+    };
+    let thrown: unknown;
+    try {
+      await promptInteractiveArguments({
+        env: {},
+        config: {},
+        prompter: {
+          ask: () => Promise.reject(abort),
+          confirm: () => Promise.resolve(false),
+          choose,
+          close: () => undefined,
+        },
+        writeOutput: () => undefined,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(CliExitError);
+    expect(cliExitCode(thrown)).toBe(130);
+  });
+
+  it('drops OPEN_OCR_MODEL and OPEN_OCR_THINKING when another provider is chosen', async () => {
+    const calls: Array<{ question: string; values: string[]; defaultValue: string }> = [];
+    const choose: NonNullable<InteractivePrompter['choose']> = <T extends string>(
+      question: string,
+      choices: ReadonlyArray<{ value: T; label: string }>,
+      defaultValue: T,
+    ): Promise<T> => {
+      calls.push({ question, values: choices.map((choice) => choice.label), defaultValue });
+      if (question === 'Command') return Promise.resolve('extract' as T);
+      if (question === 'Provider') return Promise.resolve('kimi' as T);
+      return Promise.resolve(defaultValue);
+    };
+    const prompter = scriptedPrompter(['doc.pdf']);
+    prompter.choose = choose;
+
+    const result = await promptInteractiveArguments({
+      env: { OPEN_OCR_MODEL: 'gemini-3.8-flash', OPEN_OCR_THINKING: 'minimal' },
+      config: {},
+      prompter,
+      writeOutput: () => undefined,
+    });
+
+    expect(result).toEqual(expect.arrayContaining(['--provider', 'kimi', '--model', 'kimi-k3.1-pro']));
+    expect(result).not.toContain('gemini-3.8-flash');
+    const modelCall = calls.find((call) => call.question === 'Model');
+    expect(modelCall?.values.some((label) => label.includes('(configured)'))).toBe(false);
+    expect(calls.find((call) => call.question === 'Thinking level')?.defaultValue).toBe('max');
+  });
+
+  it('passes --thinking only for a level the person chose or one that was configured', async () => {
+    const run = (picked: string | undefined, env: Record<string, string> = {}) => {
+      const choose: NonNullable<InteractivePrompter['choose']> = <T extends string>(
+        question: string,
+        _choices: ReadonlyArray<{ value: T; label: string }>,
+        defaultValue: T,
+      ): Promise<T> => Promise.resolve((question === 'Thinking level' && picked ? picked : defaultValue) as T);
+      const prompter = scriptedPrompter(['doc.pdf']);
+      prompter.choose = choose;
+      return promptInteractiveArguments({
+        env,
+        config: { provider: 'openrouter', model: 'openai/gpt-4.1-mini', apiKeyEnv: 'OPENROUTER_API_KEY' },
+        prompter,
+        writeOutput: () => undefined,
+      });
+    };
+    // An unlisted OpenRouter route: accepting the offered default sends no
+    // reasoning field, picking a level does.
+    expect(await run(undefined)).not.toContain('--thinking');
+    expect(await run('high')).toEqual(expect.arrayContaining(['--thinking', 'high']));
+    // The environment set a level: the pick is passed even when it equals the
+    // default, so the environment cannot override it.
+    expect(await run('medium', { OPEN_OCR_PROVIDER: 'openrouter', OPEN_OCR_THINKING: 'high' }))
+      .toEqual(expect.arrayContaining(['--thinking', 'medium']));
+  });
+
+  it('keeps OPEN_OCR_MODEL and OPEN_OCR_THINKING for the ambient provider', async () => {
+    const calls: Array<{ question: string; defaultValue: string }> = [];
+    const choose: NonNullable<InteractivePrompter['choose']> = <T extends string>(
+      question: string,
+      _choices: ReadonlyArray<{ value: T; label: string }>,
+      defaultValue: T,
+    ): Promise<T> => {
+      calls.push({ question, defaultValue });
+      return Promise.resolve(defaultValue);
+    };
+    const prompter = scriptedPrompter(['doc.pdf']);
+    prompter.choose = choose;
+
+    const result = await promptInteractiveArguments({
+      env: { OPEN_OCR_PROVIDER: 'gemini', OPEN_OCR_MODEL: 'gemini-3.5-flash-lite', OPEN_OCR_THINKING: 'minimal' },
+      config: {},
+      prompter,
+      writeOutput: () => undefined,
+    });
+
+    expect(result).toEqual(expect.arrayContaining(['--model', 'gemini-3.5-flash-lite', '--thinking', 'minimal']));
+    expect(calls).toContainEqual({ question: 'Thinking level', defaultValue: 'minimal' });
   });
 });

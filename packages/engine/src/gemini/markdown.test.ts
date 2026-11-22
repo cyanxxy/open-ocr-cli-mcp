@@ -70,6 +70,23 @@ describe('simple Markdown mode preserves the model Markdown', () => {
   it('keeps indentation of a leading indented code block', () => {
     expect(normalizeModelMarkdown('\n\n    code line\n\ntext\n\n')).toBe('    code line\n\ntext');
   });
+
+  it('drops trailing blank lines but keeps the last line\'s trailing spaces', () => {
+    expect(normalizeModelMarkdown('text  \n \t\n  \n\t')).toBe('text  ');
+    expect(normalizeModelMarkdown('text  ')).toBe('text  ');
+    expect(normalizeModelMarkdown('a\n\nb\n')).toBe('a\n\nb');
+    expect(normalizeModelMarkdown(' \n\t\n')).toBe('');
+  });
+
+  it('normalizes a long blank-line run inside the output in linear time', () => {
+    for (const run of ['\n'.repeat(50_000), '\n '.repeat(50_000)]) {
+      const input = `a${run}b`;
+      const started = performance.now();
+      expect(normalizeModelMarkdown(input)).toBe(input);
+      // The old trailing regex took seconds here; linear work takes a few ms.
+      expect(performance.now() - started).toBeLessThan(200);
+    }
+  });
 });
 
 describe('section parser fences and code', () => {
