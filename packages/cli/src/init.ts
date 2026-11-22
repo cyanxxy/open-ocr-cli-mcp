@@ -1,5 +1,4 @@
 import { constants as fsConstants, promises as fs } from 'node:fs';
-import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -33,6 +32,7 @@ import {
   defaultCliThinkingLevel,
   mergeConfigLayers,
   readUserConfig,
+  userHomeDirectory,
 } from './config';
 import { asCliExitError, CliExitError } from './errors';
 import {
@@ -274,7 +274,7 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
   }
   const prompter = runtime.prompter ?? terminalPrompter();
   const configPath = flags.global
-    ? path.join(runtime.homeDirectory ?? homedir(), '.config', 'open-ocr-cli', 'config.json')
+    ? path.join(runtime.homeDirectory ?? userHomeDirectory(), '.config', 'open-ocr-cli', 'config.json')
     : path.join(cwd, '.open-ocr-cli.json');
   // A project file cannot choose where requests and credentials go (see
   // loadCliConfig), so project setup keeps the provider's own endpoint and key
@@ -511,8 +511,8 @@ export async function runInit(flags: InitFlags, runtime: InitRuntime = {}): Prom
       // A project that keeps the user configuration's provider inherits its
       // endpoint and key variable (see mergeConfigLayers); say so rather than
       // claiming the provider defaults apply.
-      const userPath = path.join(runtime.homeDirectory ?? homedir(), '.config', 'open-ocr-cli', 'config.json');
-      const user = await readUserConfig(runtime.homeDirectory ?? homedir()).catch(() => ({}));
+      const userPath = path.join(runtime.homeDirectory ?? userHomeDirectory(), '.config', 'open-ocr-cli', 'config.json');
+      const user = await readUserConfig(runtime.homeDirectory ?? userHomeDirectory()).catch(() => ({}));
       const effective = mergeConfigLayers(user, config);
       const inherited = [
         ...(effective.baseUrl !== undefined ? [`endpoint ${effective.baseUrl}`] : []),
