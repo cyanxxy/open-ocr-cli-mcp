@@ -29,8 +29,8 @@ This is an npm workspace with two packages and no web app:
 
 ## Local Setup
 
-Use Node.js 20.19+, 22.13+, or 24+; Node 24 is used for release builds, and CI
-also tests Node 26.
+Use Node.js 22.13+ or 24+; Node 24 is used for release builds, and CI also
+tests Node 26.
 The root `packageManager` field pins the npm version used by the release gate.
 
 ```bash

@@ -100,8 +100,9 @@ describe('custom JSON schemas', () => {
     expect(thrown.message).toBe(`Invalid JSON in schema ${schemaPath}`);
     await writeFile(schemaPath, '{"private_key": 1,}');
     const positioned = await loadCustomSchema(schemaPath, directory).catch((error: unknown) => error as Error);
-    expect(positioned.message).toMatch(/^Invalid JSON in schema \S+ \(at position \d+/u);
+    expect(positioned.message).toMatch(/^Invalid JSON in schema \S+/u);
     expect(positioned.message).not.toContain('private_key');
+    // The position V8 reports is checked on Node in schema.node.test.ts.
   });
 
   it('validates and clones inline schemas for machine requests', () => {

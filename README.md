@@ -178,7 +178,7 @@ reasoning effort only when you choose one with `--thinking`.
 
 ## Installation
 
-Requires Node.js 20.19+, 22.13+, or 24+. CI tests Node.js 20, 22, 24, and 26.
+Requires Node.js 22.13+ or 24+. CI tests Node.js 22, 24, and 26.
 
 **npm**
 

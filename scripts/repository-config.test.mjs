@@ -92,7 +92,7 @@ test('CI covers both advertised minimums and the Maintenance and Active LTS line
 
   const build = workflow.slice(workflow.indexOf('\n  build:\n'), workflow.indexOf('\n  container:\n'));
   assert.match(build, /^ {4}name: Build Application$/mu);
-  for (const [version, label] of [['20.19.0', '20'], ['26.x', '26']]) {
+  for (const [version, label] of [['22.13.0', '22'], ['26.x', '26']]) {
     const setup = build.indexOf(`node-version: '${version}'`);
     const smoke = build.indexOf(`- name: Smoke-test engine-strict CLI installation on Node ${label}\n        run: npm run cli:install-smoke\n`);
     assert.ok(setup !== -1 && smoke > setup, `Build Application must run the packed-install and MCP smoke on Node ${version}`);

@@ -3,8 +3,9 @@ name: CI Pipeline
 on:
   push:
     branches: [ main ]
+  # Every pull request, including one stacked on another branch: a stack's
+  # upper PRs otherwise get no feedback until the lower ones merge.
   pull_request:
-    branches: [ main ]
   merge_group:
     types: [ checks_requested ]
 
@@ -29,10 +30,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both advertised minimums, Node 24 (Maintenance LTS since
-        # 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
+        # Exercise the advertised minimum (22.13.0), Node 24 (Maintenance LTS
+        # since 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
         # static/coverage gates only need to run once on Node 24.
-        node-version: [20.19.0, 22.13.0, 24.x, 26.x]
+        node-version: [22.13.0, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
@@ -168,10 +169,10 @@ jobs:
       - name: Setup minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20.19.0'
+          node-version: '22.13.0'
           package-manager-cache: false
 
-      - name: Smoke-test engine-strict CLI installation on Node 20
+      - name: Smoke-test engine-strict CLI installation on Node 22
         run: npm run cli:install-smoke
 
       - name: Setup Active LTS Node.js
