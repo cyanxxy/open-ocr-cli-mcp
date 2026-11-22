@@ -83,8 +83,11 @@ test('the dockerignore matcher follows Docker anchoring rules', () => {
 test('CI covers both advertised minimums and the Maintenance and Active LTS lines', () => {
   const workflow = read('.github', 'workflows', 'ci.yml');
   const quality = workflow.slice(workflow.indexOf('\n  quality:\n'), workflow.indexOf('\n  build:\n'));
-  const matrix = /^ {8}node-version: \[([^\]]+)\]$/mu.exec(quality)?.[1].split(',').map((entry) => entry.trim());
-  assert.ok(matrix, 'the quality job must declare a node-version matrix');
+  const matrix = [...quality.matchAll(/^ {12}node-version: (\S+)$/gmu)].map((entry) => entry[1]);
+  assert.ok(matrix.length > 0, 'the quality job must declare a node-version matrix');
+  // Branch protection requires the lane-named checks.
+  assert.match(quality, /^ {4}name: Code Quality & Tests \(\$\{\{ matrix\.lane \}\}\)$/mu);
+  for (const lane of ['minimum', 'previous', 'current']) assert.match(quality, new RegExp(`- lane: ${lane}$`, 'mu'));
   const engines = JSON.parse(read('packages', 'cli', 'package.json')).engines.node;
   for (const minimum of engines.matchAll(/\^(\d+\.\d+\.\d+)/gu)) assert.ok(matrix.includes(minimum[1]), minimum[1]);
   // Node 24 has been Maintenance LTS since 2026-10-20; Node 26 Active LTS since 2026-10-28.

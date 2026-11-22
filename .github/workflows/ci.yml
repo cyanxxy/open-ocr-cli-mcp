@@ -23,17 +23,25 @@ jobs:
   # so the workspace's `npm ci` is reused instead of installing a second time in
   # a dedicated job (audit O-07).
   quality:
-    name: Code Quality & Tests
+    # Check names come from the lane, not the Node version, so branch
+    # protection keeps matching when a lane moves to a newer Node release.
+    name: Code Quality & Tests (${{ matrix.lane }})
     runs-on: ubuntu-latest
     # Hard cap so a hung test can never wedge the runner indefinitely (audit Q-01).
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        # Exercise the advertised minimum (22.13.0), Node 24 (Maintenance LTS
-        # since 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
-        # static/coverage gates only need to run once on Node 24.
-        node-version: [22.13.0, 24.x, 26.x]
+        # The advertised minimum (22.13.0), Node 24 (Maintenance LTS since
+        # 2026-10-20) and Node 26 (Active LTS since 2026-10-28). The expensive
+        # static/coverage gates run once, on the current lane.
+        include:
+          - lane: minimum
+            node-version: 22.13.0
+          - lane: previous
+            node-version: 24.x
+          - lane: current
+            node-version: 26.x
 
     steps:
       - name: Checkout repository
@@ -65,32 +73,32 @@ jobs:
           node scripts/extract-release-notes.mjs "v$VERSION" "$RUNNER_TEMP/release-notes.md"
 
       - name: Type check
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.lane == 'current' }}
         run: npm run typecheck
 
       - name: Lint code
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.lane == 'current' }}
         run: npm run lint
 
       - name: Run tests with coverage
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.lane == 'current' }}
         run: npm run test:coverage
 
       - name: Run tests
-        if: ${{ matrix.node-version != '24.x' }}
+        if: ${{ matrix.lane != 'current' }}
         run: npm test
 
       - name: Validate AI eval fixtures
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.lane == 'current' }}
         run: npm run evals:validate && npm run evals:matrix:check
 
       - name: Check for vulnerabilities
-        if: ${{ matrix.node-version == '24.x' }}
+        if: ${{ matrix.lane == 'current' }}
         run: npx audit-ci --config audit-ci.json
 
       - name: Upload coverage to Codecov
         # Only publish coverage from a single matrix leg to avoid duplicate uploads.
-        if: ${{ matrix.node-version == '24.x' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
+        if: ${{ matrix.lane == 'current' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
