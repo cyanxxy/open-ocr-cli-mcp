@@ -36,7 +36,7 @@ file, GitHub Release, container tag, Homebrew formula, and GitHub Action tag.
    ```bash
    npm ci
    npm run typecheck
-   npm run lint
+   bun lint
    npm run test:coverage
    node --test scripts/*.test.mjs
    npm run evals:validate

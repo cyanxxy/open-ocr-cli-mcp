@@ -85,6 +85,9 @@ function minSubstringDistance(needle: string, haystack: string): number {
   return substringDistances(needle, haystack).reduce((best, distance) => Math.min(best, distance), needle.length);
 }
 
+// Code points on purpose: they keep each surrogate pair in order, and the
+// offsets computed from the result count UTF-16 units of the original.
+// oxlint-disable-next-line typescript/no-misused-spread
 const reverse = (value: string): string => [...value].reverse().join('');
 
 /** Start offsets of approximate matches (distance <= limit), found by matching reversed strings. */

@@ -50,7 +50,6 @@
     "minimatch": "11.0.3"
   },
   "scripts": {
-    "lint": "eslint .",
     "typecheck": "bun check -b",
     "cli": "node --import tsx packages/cli/src/index.ts",
     "cli:build": "npm run build -w open-ocr-cli",
@@ -72,13 +71,11 @@
     "evals:validate": "node --import tsx evals/validate.ts"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
     "@modelcontextprotocol/client": "2.4.0",
     "@types/node": "^22.20.5",
     "@vitest/coverage-v8": "^4.1.12",
     "audit-ci": "^7.1.0",
     "eslint": "^10.8.1",
-    "globals": "^17.3.0",
     "tsx": "^4.20.5",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.3.0",

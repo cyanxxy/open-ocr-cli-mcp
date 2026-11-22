@@ -317,6 +317,8 @@ function looksLikeUtf8Text(bytes: Uint8Array): boolean {
     return false;
   }
   if (decoded.includes('\0')) return false;
+  // Code points on purpose: each control character is one code point.
+  // oxlint-disable-next-line typescript/no-misused-spread
   const disallowedControls = [...decoded].filter((character) => {
     const code = character.charCodeAt(0);
     return code < 0x20 && character !== '\t' && character !== '\n' && character !== '\r' && character !== '\f';

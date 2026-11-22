@@ -48,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run checks (types, lint, scripts, release notes, evals, audit)
+      - name: Run checks (types, lint, unused vars, scripts, release notes, evals, audit)
         run: node scripts/run-checks.mjs
 
   # The unit suite on every supported Node.js line. Coverage and its upload

@@ -54,7 +54,7 @@ Before opening a PR, run:
 
 ```bash
 npm run typecheck
-npm run lint
+bun lint
 npm run test:coverage
 node --test scripts/*.test.mjs
 npm run cli:smoke

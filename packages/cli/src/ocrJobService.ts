@@ -593,8 +593,10 @@ export class OcrJobService {
     // open every file at once. A cancel stops the pass: nothing after it
     // (recovery, resume checks, claims) runs, and every document is reported
     // as cancelled below.
-    const fingerprints = new Array<ManifestFingerprints>(inputs.length);
-    const possibleTargets = new Array<string[]>(inputs.length);
+    // Dense, not `new Array(n)`: map/filter/every skip the holes of a sparse
+    // array, which would hide a slot the passes below failed to fill.
+    const fingerprints = Array.from<ManifestFingerprints | undefined>({ length: inputs.length });
+    const possibleTargets = Array.from<string[] | undefined>({ length: inputs.length });
     if (manifest) {
       await forEachLimited(inputs, 8, async (input, index) => {
         let contentSha256: string;
@@ -694,8 +696,11 @@ export class OcrJobService {
     try {
       await Promise.all((cancelledBeforeWork ? [] : inputs).map(async (input, index) => {
         const key = input.absolutePath ?? STDIN_MANIFEST_KEY;
-        const completedEntry = resumeActive && !options.overwrite
-          ? await manifest?.completedEntry(key, fingerprints[index], input.relativePath)
+        const fingerprint = fingerprints[index];
+        // A document without a fingerprint cannot be shown unchanged, so it is
+        // never resumed (the same rule the claims below apply with `?? ''`).
+        const completedEntry = resumeActive && !options.overwrite && fingerprint
+          ? await manifest?.completedEntry(key, fingerprint, input.relativePath)
           : undefined;
         if (completedEntry) {
           resumableEntries.set(index, completedEntry);
@@ -784,7 +789,9 @@ export class OcrJobService {
       if (!options.dryRun) await manifest.flush();
     };
     try {
-      const results = new Array<OcrJobResult | undefined>(inputs.length);
+      // Dense so the missing-result guard below sees every unfilled slot:
+      // map() skips the holes of a sparse array.
+      const results = Array.from<OcrJobResult | undefined>({ length: inputs.length });
       let cursor = 0;
       let completed = 0;
       let failFastTriggered = false;

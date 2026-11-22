@@ -81,7 +81,7 @@ describe('CLI batch runner', () => {
     expect(summary.failed).toBe(1);
     expect(summary.skipped).toBe(1);
     const terminal = events.filter((event) => event.type.startsWith('document.') && event.document);
-    expect(terminal.map((event) => event.document?.status).sort()).toEqual(['failed', 'skipped']);
+    expect(terminal.map((event) => String(event.document?.status)).sort((a, b) => a.localeCompare(b))).toEqual(['failed', 'skipped']);
     expect(events.at(-1)?.type).toBe('run.completed');
     expect(JSON.stringify(events)).toContain('does not match its declared type');
   });

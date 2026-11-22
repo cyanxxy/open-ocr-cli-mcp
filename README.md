@@ -237,7 +237,7 @@ field F1, and unit-test pass rate per provider and model.
 
 ```bash
 npm ci
-npm run typecheck && npm run lint && npm run test:coverage
+npm run typecheck && bun lint && npm run test:coverage
 ```
 
 `packages/cli` is the published package; `packages/engine` is the shared OCR

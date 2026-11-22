@@ -108,7 +108,7 @@ test('no CI job waits on another, and the checks job runs every check', async ()
   const { CHECKS } = await import('./run-checks.mjs');
   assert.deepEqual(
     CHECKS.map((check) => check.name),
-    ['types', 'lint', 'scripts', 'release-notes', 'evals', 'audit'],
+    ['types', 'lint', 'unused-vars', 'scripts', 'release-notes', 'evals', 'audit'],
     'a check removed from run-checks.mjs must be removed on purpose',
   );
 });
