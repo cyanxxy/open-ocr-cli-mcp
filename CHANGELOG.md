@@ -9,6 +9,10 @@ field names, and template signs. Review the first section before upgrading.
 
 ### Changed (review before upgrading)
 
+- Node.js 20 is no longer supported: it reached end of life on 2026-04-30.
+  The CLI now requires Node.js 22.13+ or 24+, and npm refuses to install it
+  on Node.js 20 (`engines`). CI tests Node.js 22.13.0, 24 and 26. This is a
+  breaking change, so the next release is 5.0.0.
 - Configuration files are no longer merged key by key across a provider
   switch. A higher layer (project `.open-ocr-cli.json`, `--config`, or an MCP
   `configPath`) that sets another `provider` drops the lower layers' `model`,
