@@ -674,7 +674,7 @@ function parseAssistantMessage(rawMessage: Record<string, unknown>): OpenAIMessa
 function messageForWire(message: OpenAIMessage): Record<string, unknown> {
   if (message.role === 'assistant' && message.providerMessage) return message.providerMessage;
   return {
-    ...(message.providerFields ?? {}),
+    ...message.providerFields,
     role: message.role,
     content: message.content,
     ...(message.name ? { name: message.name } : {}),
@@ -711,7 +711,7 @@ function completionRequestBody(
     ? strictSchemaSupport(config, request.responseSchema)
     : undefined;
   const routeRequirements = Boolean(request.responseSchema || request.tools?.length);
-  const extraBody = { ...(request.extraBody ?? {}) };
+  const extraBody = { ...request.extraBody };
   if (config.provider === 'openrouter' && routeRequirements) {
     const existingProvider = isRecord(extraBody.provider) ? extraBody.provider : {};
     extraBody.provider = { ...existingProvider, require_parameters: true };

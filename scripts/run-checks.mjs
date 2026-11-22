@@ -21,7 +21,12 @@ const version = JSON.parse(readFileSync(path.join(root, 'packages', 'cli', 'pack
 export const CHECKS = [
   // TypeScript 7 semantics, every project in the root tsconfig references.
   { name: 'types', command: 'bun check -b' },
-  { name: 'lint', command: 'npm run -s lint' },
+  // .oxlintrc.json, type-aware (options.typeAware).
+  { name: 'lint', command: 'bun lint' },
+  // The one ESLint rule bun lint does not fully cover: its no-unused-vars
+  // counts `x += 1` as a read, so a variable only ever updated that way is
+  // not reported. No type information, so this stays a few seconds.
+  { name: 'unused-vars', command: 'npx --no-install eslint -c eslint.unused.config.js .' },
   { name: 'scripts', command: 'node --test scripts/*.test.mjs' },
   {
     name: 'release-notes',

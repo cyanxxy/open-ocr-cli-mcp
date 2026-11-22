@@ -159,7 +159,7 @@ jobs:
         run: npm run typecheck
 
       - name: Lint code
-        run: npm run lint
+        run: bun lint && npx --no-install eslint -c eslint.unused.config.js .
 
       - name: Run tests with coverage
         run: npm run test:coverage
